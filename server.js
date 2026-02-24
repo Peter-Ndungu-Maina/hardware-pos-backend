@@ -130,6 +130,7 @@ app.get('/api/reports/daily-summary', async (req, res) => {
 });
 
 // --- 6. DETAILED SALES REPORT ---
+// --- 6. DETAILED SALES REPORT (FIXED FILTERS) ---
 app.get('/api/reports/sales', async (req, res) => {
     const { role, date, month, year, method } = req.query;
     if (role?.toLowerCase() !== 'admin') return res.status(403).json({ success: false, message: "Unauthorized." });
@@ -137,12 +138,16 @@ app.get('/api/reports/sales', async (req, res) => {
     try {
         let query = supabase
             .from('Sales')
-          .select('*, payments(mpesa_code, amount, payment_method)')
+            .select('*, payments(mpesa_code, amount, payment_method)')
             .order('sale_date', { ascending: false });
 
-        if (date) {
-            query = query.gte('sale_date', `${date}T00:00:00Z`).lte('sale_date', `${date}T23:59:59Z`);
+        // Prioritize specific date. If date exists, ignore month/year.
+        if (date && date !== "") {
+            query = query
+                .gte('sale_date', `${date}T00:00:00Z`)
+                .lte('sale_date', `${date}T23:59:59Z`);
         } 
+        // Only apply month filter if specific date is NOT provided
         else if (month && year) {
             const startDate = `${year}-${month.padStart(2, '0')}-01T00:00:00Z`;
             const lastDay = new Date(year, month, 0).getDate();
@@ -167,7 +172,7 @@ app.get('/api/reports/sales', async (req, res) => {
 });
 
 // --- 7. PAYMENTS REPORT ---
-// --- 7. PAYMENTS REPORT ---
+// --- 7. PAYMENTS REPORT (FIXED FILTERS) ---
 app.get('/api/reports/payments', async (req, res) => {
     try {
         const { date, month, year, method } = req.query;
@@ -177,13 +182,13 @@ app.get('/api/reports/payments', async (req, res) => {
             .select(`*, Sales ( customer_name, item_name )`)
             .order('created_at', { ascending: false });
 
-        // 1. Filter by Specific Date
-        if (date) {
+        // 1. Filter by Specific Date (Highest Priority)
+        if (date && date !== "") {
             query = query
                 .gte('created_at', `${date}T00:00:00Z`)
                 .lte('created_at', `${date}T23:59:59Z`);
         } 
-        // 2. Filter by Month and Year
+        // 2. Filter by Month/Year (Only if date is empty)
         else if (month && year) {
             const startDate = `${year}-${month.padStart(2, '0')}-01T00:00:00Z`;
             const lastDay = new Date(year, month, 0).getDate();
@@ -191,27 +196,18 @@ app.get('/api/reports/payments', async (req, res) => {
             query = query.gte('created_at', startDate).lte('created_at', endDate);
         }
 
-        // 3. Filter by Payment Method
+        // 3. Filter by Method
         if (method && method !== "") {
             query = query.eq('payment_method', method);
         }
 
         const { data, error } = await query;
-
         if (error) throw error;
         res.json(data);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
-
-// --- 8. LOW STOCK ROUTE ---
-app.get('/api/reports/low-stock', async (req, res) => {
-    const { data, error } = await supabase.from('Inventory').select('*').lte('stock_quantity', 10);
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
-});
-
 // --- 9. DEBTORS ROUTE ---
 app.get('/api/reports/debtors', async (req, res) => {
     try {
