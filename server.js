@@ -91,68 +91,46 @@ app.put('/api/inventory/:id', async (req, res) => {
 // --- 5. DASHBOARD SUMMARY (FIXED) ---
 app.get('/api/reports/daily-summary', async (req, res) => {
     try {
-        // Create a date string for the start of the day in local time 
-        // then convert to ISO to match Supabase's timestamp format
-        const startOfDay = new Date();
-        startOfDay.setHours(0, 0, 0, 0);
+        // Create a date range that covers the entire current day in local time
+        const start = new Date();
+        start.setHours(0, 0, 0, 0);
         
-        const endOfDay = new Date();
-        endOfDay.setHours(23, 59, 59, 999);
+        const end = new Date();
+        end.setHours(23, 59, 59, 999);
 
-        // 1. Get Today's Sales and Profit
+        // 1. Get Today's Sales & Profit
         const { data: todaySales, error: salesError } = await supabase
             .from('Sales')
             .select('total_amount, profit')
-            .gte('sale_date', startOfDay.toISOString())
-            .lte('sale_date', endOfDay.toISOString());
+            .gte('sale_date', start.toISOString())
+            .lte('sale_date', end.toISOString());
 
         if (salesError) throw salesError;
 
-        // 2. Get TOTAL Market Debt (All time unpaid sales)
-        const { data: allUnpaidSales, error: debtError } = await supabase
+        // 2. Get All Unpaid Debt
+        const { data: allDebt, error: debtError } = await supabase
             .from('Sales')
             .select('total_amount, amount_paid')
-            .neq('payment_status', 'Paid'); 
+            .neq('payment_status', 'Paid');
 
         if (debtError) throw debtError;
 
-        let totalSales = 0;
-        let totalProfit = 0;
-        let totalOwed = 0;
+        let totalSales = 0, totalProfit = 0, totalOwed = 0;
 
-        // Sum up today's performance
-        if (todaySales) {
-            todaySales.forEach(sale => {
-                totalSales += parseFloat(sale.total_amount || 0);
-                totalProfit += parseFloat(sale.profit || 0);
-            });
-        }
-
-        // Sum up total debt across all records
-        if (allUnpaidSales) {
-            allUnpaidSales.forEach(sale => {
-                const total = parseFloat(sale.total_amount || 0);
-                const paid = parseFloat(sale.amount_paid || 0);
-                const balance = total - paid;
-                if (balance > 0) { 
-                    totalOwed += balance; 
-                }
-            });
-        }
-
-        // Return precisely the keys the frontend is looking for
-        res.json({ 
-            totalSales: Math.round(totalSales), 
-            totalProfit: Math.round(totalProfit), 
-            totalOwed: Math.round(totalOwed) 
+        todaySales?.forEach(s => {
+            totalSales += parseFloat(s.total_amount || 0);
+            totalProfit += parseFloat(s.profit || 0);
         });
 
+        allDebt?.forEach(s => {
+            totalOwed += (parseFloat(s.total_amount || 0) - parseFloat(s.amount_paid || 0));
+        });
+
+        res.json({ totalSales, totalProfit, totalOwed });
     } catch (err) {
-        console.error("Dashboard calculation error:", err);
         res.status(500).json({ error: err.message });
     }
 });
-
 // --- 6. DETAILED SALES REPORT ---
 // --- 6. DETAILED SALES REPORT (FIXED FILTERS) ---
 app.get('/api/reports/sales', async (req, res) => {
