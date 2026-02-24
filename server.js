@@ -54,11 +54,18 @@ app.post('/api/login', async (req, res) => {
 
 // --- 4. INVENTORY ROUTES ---
 app.get('/api/inventory', async (req, res) => {
-    const { data, error } = await supabase.from('Inventory').select('*').order('item_name');
+    const { role } = req.query;
+    
+    // If cashier, DO NOT send cost_price to frontend
+    let columns = '*';
+    if (role?.toLowerCase() !== 'admin') {
+        columns = 'id, item_name, category, price, stock_quantity, unit'; 
+    }
+
+    const { data, error } = await supabase.from('Inventory').select(columns).order('item_name');
     if (error) return res.status(500).json({ error: error.message });
     res.json(data);
 });
-
 // --- 4b. UPDATE INVENTORY ITEM (Full Edit) ---
 app.put('/api/inventory/:id', async (req, res) => {
     const { id } = req.params;
@@ -89,30 +96,42 @@ app.put('/api/inventory/:id', async (req, res) => {
 });
 
 // --- 5. DASHBOARD SUMMARY (FIXED) ---
+// --- 5. DASHBOARD SUMMARY (UPDATED FOR ROLE PERMISSIONS) ---
 app.get('/api/reports/daily-summary', async (req, res) => {
     try {
-        // Create a date range that covers the entire current day in local time
-        const start = new Date();
-        start.setHours(0, 0, 0, 0);
+        const { processedBy } = req.query; // Get the cashier name from the request
         
-        const end = new Date();
-        end.setHours(23, 59, 59, 999);
+        const now = new Date();
+        const offset = now.getTimezoneOffset() * 60000; 
+        const localISOTime = (new Date(now - offset)).toISOString().split('T')[0];
 
         // 1. Get Today's Sales & Profit
-        const { data: todaySales, error: salesError } = await supabase
+        let salesQuery = supabase
             .from('Sales')
             .select('total_amount, profit')
-            .gte('sale_date', start.toISOString())
-            .lte('sale_date', end.toISOString());
+            .filter('sale_date', 'gte', `${localISOTime}T00:00:00`)
+            .filter('sale_date', 'lte', `${localISOTime}T23:59:59`);
 
+        // IF processedBy is provided (Cashier), filter by their name
+        if (processedBy) {
+            salesQuery = salesQuery.eq('sold_by', processedBy);
+        }
+
+        const { data: todaySales, error: salesError } = await salesQuery;
         if (salesError) throw salesError;
 
-        // 2. Get All Unpaid Debt
-        const { data: allDebt, error: debtError } = await supabase
+        // 2. Get Unpaid Debt
+        let debtQuery = supabase
             .from('Sales')
             .select('total_amount, amount_paid')
             .neq('payment_status', 'Paid');
 
+        // IF processedBy is provided (Cashier), only show debts from their sales
+        if (processedBy) {
+            debtQuery = debtQuery.eq('sold_by', processedBy);
+        }
+
+        const { data: allDebt, error: debtError } = await debtQuery;
         if (debtError) throw debtError;
 
         let totalSales = 0, totalProfit = 0, totalOwed = 0;
@@ -123,11 +142,13 @@ app.get('/api/reports/daily-summary', async (req, res) => {
         });
 
         allDebt?.forEach(s => {
-            totalOwed += (parseFloat(s.total_amount || 0) - parseFloat(s.amount_paid || 0));
+            const owed = parseFloat(s.total_amount || 0) - parseFloat(s.amount_paid || 0);
+            if (owed > 0) totalOwed += owed;
         });
 
         res.json({ totalSales, totalProfit, totalOwed });
     } catch (err) {
+        console.error("Dashboard Error:", err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -210,23 +231,31 @@ app.get('/api/reports/payments', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-// --- 9. DEBTORS ROUTE ---
+// --- 9. DEBTORS ROUTE (UPDATED FOR ROLE PERMISSIONS) ---
 app.get('/api/reports/debtors', async (req, res) => {
     try {
-        const { data, error } = await supabase
+        const { processedBy } = req.query;
+
+        let query = supabase
             .from('Sales')
-            .select('id, customer_name, item_name, total_amount, amount_paid, sale_date')
+            .select('id, customer_name, item_name, total_amount, amount_paid, sale_date, sold_by')
             .neq('payment_status', 'Paid') 
             .order('sale_date', { ascending: false });
 
+        // Filter by cashier if parameter is passed
+        if (processedBy) {
+            query = query.eq('sold_by', processedBy);
+        }
+
+        const { data, error } = await query;
         if (error) throw error;
+
         const actualDebtors = data.filter(d => (parseFloat(d.total_amount) - parseFloat(d.amount_paid)) > 0);
         res.json(actualDebtors);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
-
 // --- 10. TRANSACTIONAL SALE ROUTE ---
 app.post('/api/sell', async (req, res) => {
     let { itemId, quantity, price, itemName, soldBy, paymentMethod, mpesaId, customerName, amountPaid } = req.body;
@@ -390,4 +419,3 @@ app.post('/api/inventory', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
-
