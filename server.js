@@ -231,7 +231,7 @@ app.get('/api/reports/payments', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-// --- 9. DEBTORS ROUTE (UPDATED FOR ROLE PERMISSIONS) ---
+// --- 9. DEBTORS ROUTE (FILTERED BY USER) ---
 app.get('/api/reports/debtors', async (req, res) => {
     try {
         const { processedBy } = req.query;
@@ -242,8 +242,8 @@ app.get('/api/reports/debtors', async (req, res) => {
             .neq('payment_status', 'Paid') 
             .order('sale_date', { ascending: false });
 
-        // Filter by cashier if parameter is passed
-        if (processedBy) {
+        // If a cashier name is passed, they only see their own debts
+        if (processedBy && processedBy !== "undefined") {
             query = query.eq('sold_by', processedBy);
         }
 
@@ -325,7 +325,12 @@ app.post('/api/sell', async (req, res) => {
 
 // --- 11. CLEAR DEBT ROUTE ---
 app.post('/api/payments/clear-debt', async (req, res) => {
-    const { saleId, paymentAmount, paymentMethod, mpesaId, processedBy } = req.body;
+    const { saleId, paymentAmount, paymentMethod, mpesaId, processedBy, role } = req.body;
+    
+    // STRICT SECURITY: Reject if not Admin
+    if (role?.toLowerCase() !== 'admin') {
+        return res.status(403).json({ success: false, message: "Unauthorized: Only Admins can collect debt payments." });
+    }
     
     try {
         const { data: sale, error: getErr } = await supabase.from('Sales').select('*').eq('id', saleId).single();
@@ -419,3 +424,4 @@ app.post('/api/inventory', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
+
