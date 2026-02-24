@@ -167,12 +167,36 @@ app.get('/api/reports/sales', async (req, res) => {
 });
 
 // --- 7. PAYMENTS REPORT ---
+// --- 7. PAYMENTS REPORT ---
 app.get('/api/reports/payments', async (req, res) => {
     try {
-        const { data, error } = await supabase
+        const { date, month, year, method } = req.query;
+        
+        let query = supabase
             .from('payments')
             .select(`*, Sales ( customer_name, item_name )`)
             .order('created_at', { ascending: false });
+
+        // 1. Filter by Specific Date
+        if (date) {
+            query = query
+                .gte('created_at', `${date}T00:00:00Z`)
+                .lte('created_at', `${date}T23:59:59Z`);
+        } 
+        // 2. Filter by Month and Year
+        else if (month && year) {
+            const startDate = `${year}-${month.padStart(2, '0')}-01T00:00:00Z`;
+            const lastDay = new Date(year, month, 0).getDate();
+            const endDate = `${year}-${month.padStart(2, '0')}-${lastDay}T23:59:59Z`;
+            query = query.gte('created_at', startDate).lte('created_at', endDate);
+        }
+
+        // 3. Filter by Payment Method
+        if (method && method !== "") {
+            query = query.eq('payment_method', method);
+        }
+
+        const { data, error } = await query;
 
         if (error) throw error;
         res.json(data);
