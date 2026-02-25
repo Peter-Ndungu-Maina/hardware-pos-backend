@@ -95,68 +95,72 @@ app.put('/api/inventory/:id', async (req, res) => {
     }
 });
 
-// --- 5. DASHBOARD SUMMARY (FIXED) ---
-// --- 5. DASHBOARD SUMMARY (UPDATED FOR ROLE PERMISSIONS) ---
+// // --- 5. DASHBOARD SUMMARY (UPDATED PERMISSIONS) ---
 app.get('/api/reports/daily-summary', async (req, res) => {
     try {
-        const { processedBy } = req.query; // Get the cashier name from the request
+        const { processedBy, role } = req.query; 
         
         const now = new Date();
         const offset = now.getTimezoneOffset() * 60000; 
         const localISOTime = (new Date(now - offset)).toISOString().split('T')[0];
 
-        // 1. Get Today's Sales & Profit
         let salesQuery = supabase
             .from('Sales')
             .select('total_amount, profit')
             .filter('sale_date', 'gte', `${localISOTime}T00:00:00`)
             .filter('sale_date', 'lte', `${localISOTime}T23:59:59`);
 
-        // IF processedBy is provided (Cashier), filter by their name
-        if (processedBy) {
+        if (processedBy && role?.toLowerCase() === 'cashier') {
             salesQuery = salesQuery.eq('sold_by', processedBy);
         }
 
         const { data: todaySales, error: salesError } = await salesQuery;
         if (salesError) throw salesError;
 
-        // 2. Get Unpaid Debt
-        let debtQuery = supabase
-            .from('Sales')
-            .select('total_amount, amount_paid')
-            .neq('payment_status', 'Paid');
+        let totalSales = 0, totalProfit = 0, totalOwed = 0;
 
-        // IF processedBy is provided (Cashier), only show debts from their sales
-        if (processedBy) {
+        todaySales?.forEach(s => {
+            totalSales += parseFloat(s.total_amount || 0);
+            // Only calculate profit if the requester is an Admin
+            if (role?.toLowerCase() === 'admin') {
+                totalProfit += parseFloat(s.profit || 0);
+            }
+        });
+
+        // Get Unpaid Debt
+        let debtQuery = supabase.from('Sales').select('total_amount, amount_paid').neq('payment_status', 'Paid');
+        if (processedBy && role?.toLowerCase() === 'cashier') {
             debtQuery = debtQuery.eq('sold_by', processedBy);
         }
 
         const { data: allDebt, error: debtError } = await debtQuery;
         if (debtError) throw debtError;
 
-        let totalSales = 0, totalProfit = 0, totalOwed = 0;
-
-        todaySales?.forEach(s => {
-            totalSales += parseFloat(s.total_amount || 0);
-            totalProfit += parseFloat(s.profit || 0);
-        });
-
         allDebt?.forEach(s => {
             const owed = parseFloat(s.total_amount || 0) - parseFloat(s.amount_paid || 0);
             if (owed > 0) totalOwed += owed;
         });
 
-        res.json({ totalSales, totalProfit, totalOwed });
+        // If not admin, totalProfit returns null (frontend handles this as "Locked")
+        res.json({ 
+            totalSales, 
+            totalProfit: role?.toLowerCase() === 'admin' ? totalProfit : null, 
+            totalOwed 
+        });
     } catch (err) {
-        console.error("Dashboard Error:", err.message);
         res.status(500).json({ error: err.message });
     }
 });
-// --- 6. DETAILED SALES REPORT ---
-// --- 6. DETAILED SALES REPORT (FIXED FILTERS) ---
+
+// --- 6. DETAILED SALES REPORT (FIXED FOR MANAGER ACCESS) ---
 app.get('/api/reports/sales', async (req, res) => {
     const { role, date, month, year, method } = req.query;
-    if (role?.toLowerCase() !== 'admin') return res.status(403).json({ success: false, message: "Unauthorized." });
+    
+    // ALLOW BOTH ADMIN AND MANAGER HERE
+    const authorized = ['admin', 'manager'];
+    if (!authorized.includes(role?.toLowerCase())) {
+        return res.status(403).json({ success: false, message: "Unauthorized access." });
+    }
 
     try {
         let query = supabase
@@ -164,14 +168,9 @@ app.get('/api/reports/sales', async (req, res) => {
             .select('*, payments(mpesa_code, amount, payment_method)')
             .order('sale_date', { ascending: false });
 
-        // Prioritize specific date. If date exists, ignore month/year.
         if (date && date !== "") {
-            query = query
-                .gte('sale_date', `${date}T00:00:00Z`)
-                .lte('sale_date', `${date}T23:59:59Z`);
-        } 
-        // Only apply month filter if specific date is NOT provided
-        else if (month && year) {
+            query = query.gte('sale_date', `${date}T00:00:00Z`).lte('sale_date', `${date}T23:59:59Z`);
+        } else if (month && year) {
             const startDate = `${year}-${month.padStart(2, '0')}-01T00:00:00Z`;
             const lastDay = new Date(year, month, 0).getDate();
             const endDate = `${year}-${month.padStart(2, '0')}-${lastDay}T23:59:59Z`;
@@ -193,8 +192,6 @@ app.get('/api/reports/sales', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
-// --- 7. PAYMENTS REPORT ---
 // --- 7. PAYMENTS REPORT (FIXED FILTERS) ---
 app.get('/api/reports/payments', async (req, res) => {
     try {
@@ -234,7 +231,7 @@ app.get('/api/reports/payments', async (req, res) => {
 // --- 9. DEBTORS ROUTE (FILTERED BY USER) ---
 app.get('/api/reports/debtors', async (req, res) => {
     try {
-        const { processedBy } = req.query;
+        const { processedBy, role } = req.query;
 
         let query = supabase
             .from('Sales')
@@ -242,8 +239,9 @@ app.get('/api/reports/debtors', async (req, res) => {
             .neq('payment_status', 'Paid') 
             .order('sale_date', { ascending: false });
 
-        // If a cashier name is passed, they only see their own debts
-        if (processedBy && processedBy !== "undefined") {
+        // CASHIER: Only see their own sales/debts
+        // MANAGER/ADMIN: See everything
+        if (role?.toLowerCase() === 'cashier' && processedBy) {
             query = query.eq('sold_by', processedBy);
         }
 
@@ -256,19 +254,31 @@ app.get('/api/reports/debtors', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-// --- 10. TRANSACTIONAL SALE ROUTE ---
+// --- 10. TRANSACTIONAL SALE ROUTE (UPDATED FOR STOCK ALERTS) ---
 app.post('/api/sell', async (req, res) => {
     let { itemId, quantity, price, itemName, soldBy, paymentMethod, mpesaId, customerName, amountPaid } = req.body;
     
     try {
-        const { data: item, error: fetchError } = await supabase.from('Inventory').select('stock_quantity, cost_price').eq('id', itemId).single();
-        if (fetchError || !item) throw new Error(`Item not found.`);
-        if (item.stock_quantity < quantity) return res.status(400).json({ success: false, message: "Insufficient stock!" });
+        // 1. Fetch current stock and cost price
+        const { data: item, error: fetchError } = await supabase
+            .from('Inventory')
+            .select('stock_quantity, cost_price')
+            .eq('id', itemId)
+            .single();
 
+        if (fetchError || !item) throw new Error(`Item not found.`);
+        
+        // Check if there is enough stock before proceeding
+        if (item.stock_quantity < quantity) {
+            return res.status(400).json({ success: false, message: "Insufficient stock!" });
+        }
+
+        const newStockQuantity = item.stock_quantity - quantity;
         const totalAmount = quantity * price;
         const paidNow = parseFloat(amountPaid) || 0;
         const totalCost = parseFloat(item.cost_price) * quantity;
         
+        // Calculate profit based on what was actually paid
         const profitMargin = totalAmount > 0 ? ((totalAmount - totalCost) / totalAmount) : 0;
         const earnedProfit = Math.max(0, paidNow * profitMargin);
 
@@ -281,12 +291,15 @@ app.post('/api/sell', async (req, res) => {
             status = paymentMethod || 'Cash'; 
         }
 
+        // 2. Update Inventory Stock
         const { error: stockErr } = await supabase
             .from('Inventory')
-            .update({ stock_quantity: item.stock_quantity - quantity })
+            .update({ stock_quantity: newStockQuantity })
             .eq('id', itemId);
+
         if (stockErr) throw stockErr;
         
+        // 3. Record the Sale
         const { data: saleData, error: insertError } = await supabase
             .from('Sales')
             .insert([{
@@ -306,6 +319,7 @@ app.post('/api/sell', async (req, res) => {
         if (insertError) throw insertError;
         const newSaleId = saleData[0].id;
 
+        // 4. Record the Payment record (if any money was paid)
         if (paidNow > 0) {
             await supabase.from('payments').insert([{
                 sale_id: newSaleId,
@@ -317,111 +331,198 @@ app.post('/api/sell', async (req, res) => {
             }]);
         }
 
-        res.json({ success: true, message: `Sale recorded as ${status}!` });
+        // 5. SUCCESS RESPONSE: Include the new stock level for frontend alerts
+        res.json({ 
+            success: true, 
+            message: `Sale recorded as ${status}!`,
+            newStock: newStockQuantity // <--- This is used by the frontend to trigger alerts
+        });
+
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// --- 11. CLEAR DEBT ROUTE ---
+// --- 11. CLEAR DEBT ROUTE (COMPLETED) ---
 app.post('/api/payments/clear-debt', async (req, res) => {
     const { saleId, paymentAmount, paymentMethod, mpesaId, processedBy, role } = req.body;
     
-    // STRICT SECURITY: Reject if not Admin
-    if (role?.toLowerCase() !== 'admin') {
-        return res.status(403).json({ success: false, message: "Unauthorized: Only Admins can collect debt payments." });
+    // 1. Authorization Check (Allow Admin and Manager)
+    const authorized = ['admin', 'manager'];
+    if (!authorized.includes(role?.toLowerCase())) {
+        return res.status(403).json({ success: false, message: "Unauthorized. Managers/Admins only." });
     }
-    
+
     try {
-        const { data: sale, error: getErr } = await supabase.from('Sales').select('*').eq('id', saleId).single();
+        // 2. Fetch the current sale record
+        const { data: sale, error: getErr } = await supabase
+            .from('Sales')
+            .select('*')
+            .eq('id', saleId)
+            .single();
+        
         if (getErr || !sale) throw new Error("Sale record not found.");
 
-        const { data: item } = await supabase.from('Inventory').select('cost_price').eq('item_name', sale.item_name).single();
-        
-        const amountToPayNow = parseFloat(paymentAmount);
         const totalAmount = parseFloat(sale.total_amount);
-        const qtySold = parseFloat(sale.quantity_sold);
-        const unitCost = item ? parseFloat(item.cost_price) : 0;
+        const alreadyPaid = parseFloat(sale.amount_paid || 0);
+        const newPayment = parseFloat(paymentAmount || 0);
+        const updatedTotalPaid = alreadyPaid + newPayment;
 
-        const totalPotentialProfit = (parseFloat(sale.unit_price) - unitCost) * qtySold;
-        const profitFromThisPayment = (amountToPayNow / totalAmount) * totalPotentialProfit;
+        if (alreadyPaid >= totalAmount) {
+            return res.status(400).json({ success: false, message: "This debt has already been cleared." });
+        }
 
-        const updatedPaid = (parseFloat(sale.amount_paid) || 0) + amountToPayNow;
-        const newTotalProfit = (parseFloat(sale.profit) || 0) + profitFromThisPayment;
+        // 3. Calculate New Profit
+        // We calculate profit proportionally based on the new payment
+        const { data: item } = await supabase.from('Inventory').select('cost_price').eq('item_name', sale.item_name).single();
+        const costPrice = item ? parseFloat(item.cost_price) : 0;
+        const totalCost = costPrice * sale.quantity_sold;
+        
+        const profitMargin = totalAmount > 0 ? ((totalAmount - totalCost) / totalAmount) : 0;
+        const additionalProfit = newPayment * profitMargin;
+        const updatedProfit = (parseFloat(sale.profit || 0)) + additionalProfit;
 
-        const { error: updateErr } = await supabase.from('Sales').update({ 
-            amount_paid: updatedPaid, 
-            payment_status: updatedPaid >= totalAmount ? paymentMethod : 'Partial', 
-            profit: newTotalProfit, 
-            sale_date: new Date().toISOString()
-        }).eq('id', saleId);
+        // 4. Determine New Status
+        let newStatus = updatedTotalPaid >= totalAmount ? 'Paid' : 'Partial';
+
+        // 5. Update the Sales Table
+        const { error: updateErr } = await supabase
+            .from('Sales')
+            .update({ 
+                amount_paid: updatedTotalPaid, 
+                payment_status: newStatus,
+                profit: updatedProfit 
+            })
+            .eq('id', saleId);
 
         if (updateErr) throw updateErr;
 
+        // 6. Record the payment in the Payments Audit table
         await supabase.from('payments').insert([{
             sale_id: saleId,
-            amount: amountToPayNow,
-            payment_method: paymentMethod, 
+            amount: newPayment,
+            payment_method: paymentMethod || 'Cash',
             mpesa_code: mpesaId || null,
             received_by: processedBy,
             created_at: new Date().toISOString()
         }]);
 
-        res.json({ success: true, message: `Payment received. Profit updated.` });
-        
+        // 7. SEND SUCCESS RESPONSE (Crucial to stop frontend "Processing" hang)
+        res.json({ 
+            success: true, 
+            message: `Payment of Ksh ${newPayment} recorded. Status: ${newStatus}` 
+        });
+
     } catch (err) {
+        console.error("Debt Clearing Error:", err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// --- 12. INVENTORY MANAGEMENT (STOCK UPDATE) ---
-
-// THIS IS THE UPDATED ROUTE TO HANDLE THE QUICK RESTOCK
+// INVENTORY MANAGEMENT (STOCK UPDATE) with Audit Logging
 app.patch('/api/inventory/:id', async (req, res) => {
     const { id } = req.params;
-    const { stock_quantity, role } = req.body; // Changed from newQuantity to stock_quantity
+    const { added_quantity, role, userName } = req.body; 
     
-    if (role?.toLowerCase() !== 'admin') {
-        return res.status(403).json({ success: false, message: "Admin only." });
+    const authorizedRoles = ['admin', 'manager'];
+    if (!authorizedRoles.includes(role?.toLowerCase())) {
+        return res.status(403).json({ success: false, message: "Unauthorized." });
     }
     
     try {
-        const { data, error } = await supabase
+        const { data: item, error: fetchError } = await supabase
             .from('Inventory')
-            .update({ stock_quantity: parseInt(stock_quantity) })
+            .select('item_name, stock_quantity')
             .eq('id', id)
-            .select();
+            .single();
 
-        if (error) throw error;
-        res.json({ success: true, message: "Stock updated successfully!", data });
+        if (fetchError || !item) throw new Error("Item not found");
+
+        const currentStock = parseInt(item.stock_quantity) || 0;
+        const addQty = parseInt(added_quantity) || 0;
+        const newTotal = currentStock + addQty;
+
+        const { error: updateError } = await supabase
+            .from('Inventory')
+            .update({ stock_quantity: newTotal })
+            .eq('id', id);
+
+        if (updateError) throw updateError;
+
+        // LOG THE ACTION
+        await supabase.from('audit_logs').insert([{
+            performed_by: userName || 'Unknown Staff',
+            action: 'RESTOCK',
+            details: `Added ${addQty} units to ${item.item_name}. New total: ${newTotal}`,
+            timestamp: new Date().toISOString()
+        }]);
+
+        res.json({ success: true, message: `Added ${addQty}. Total: ${newTotal}` });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
+// DELETE ITEM ROUTE with Audit Logging
 app.delete('/api/inventory/:id', async (req, res) => {
     const { id } = req.params;
-    const { role } = req.query;
-    if (role?.toLowerCase() !== 'admin') return res.status(403).json({ success: false, message: "Unauthorized." });
-    
-    const { error } = await supabase.from('Inventory').delete().eq('id', id);
-    if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true });
-});
+    const { role, userName } = req.query; // Capture userName from frontend
 
-app.post('/api/inventory', async (req, res) => {
-    const { item_name, category, price, cost_price, stock_quantity, unit, role } = req.body;
-    if (role?.toLowerCase() !== 'admin') return res.status(403).json({ success: false, message: "Unauthorized." });
+    const authorizedRoles = ['admin', 'manager'];
+    if (!authorizedRoles.includes(role?.toLowerCase())) {
+        return res.status(403).json({ success: false, message: "Unauthorized." });
+    }
 
     try {
-        const { data, error } = await supabase.from('Inventory').insert([{ 
-            item_name, category: category || "General", price: parseFloat(price) || 0, 
-            cost_price: parseFloat(cost_price) || 0, stock_quantity: parseInt(stock_quantity) || 0, unit: unit || "pcs"
-        }]).select();
+        // 1. Get item details before deleting to log the name
+        const { data: item } = await supabase
+            .from('Inventory')
+            .select('item_name')
+            .eq('id', id)
+            .single();
+
+        // 2. Perform the deletion
+        const { error } = await supabase.from('Inventory').delete().eq('id', id);
         if (error) throw error;
-        res.json({ success: true, data });
-    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+
+        // 3. LOG THE ACTION to audit_logs
+        await supabase.from('audit_logs').insert([{
+            performed_by: userName || 'Unknown Staff',
+            action: 'DELETE',
+            details: `Permanently removed item: ${item?.item_name || 'Unknown'} (ID: ${id})`,
+            timestamp: new Date().toISOString()
+        }]);
+
+        res.json({ success: true, message: "Item deleted and logged." });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+// --- 13. ADD EMPLOYEE ROUTE (NEW) ---
+app.post('/api/employees', async (req, res) => {
+    const { name, employeeId, pin, role, requesterRole } = req.body;
+
+    if (requesterRole?.toLowerCase() !== 'admin') {
+        return res.status(403).json({ success: false, message: "Unauthorized: Admin only." });
+    }
+
+    try {
+        const { data, error } = await supabase
+            .from('employees')
+            .insert([{ 
+                name, 
+                emp_id: employeeId.toUpperCase(), 
+                pin, 
+                role 
+            }]);
+
+        if (error) throw error;
+        res.json({ success: true, message: "Staff created!" });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "ID already exists or Database error." });
+    }
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
+
+
 
