@@ -66,35 +66,68 @@ app.get('/api/inventory', async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
     res.json(data);
 });
-// --- 4b. UPDATE INVENTORY ITEM (Full Edit) ---
-app.put('/api/inventory/:id', async (req, res) => {
-    const { id } = req.params;
-    const { item_name, category, price, cost_price, stock_quantity, unit, role } = req.body;
-
+/// --- 4. INVENTORY ROUTES ---
+app.get('/api/inventory', async (req, res) => {
+    const { role } = req.query;
+    let columns = '*';
     if (role?.toLowerCase() !== 'admin') {
-        return res.status(403).json({ success: false, message: "Unauthorized. Admin only." });
+        columns = 'id, item_name, category, price, stock_quantity, unit'; 
+    }
+    const { data, error } = await supabase.from('Inventory').select(columns).order('item_name');
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+});
+
+// NEW: REGISTER NEW PRODUCT ROUTE
+app.post('/api/inventory', async (req, res) => {
+    const { itemName, category, unit, costPrice, sellingPrice, stockQty, role } = req.body;
+
+    if (role?.toLowerCase() !== 'admin' && role?.toLowerCase() !== 'manager') {
+        return res.status(403).json({ success: false, message: "Unauthorized." });
     }
 
     try {
         const { error } = await supabase
             .from('Inventory')
-            .update({ 
-                item_name, 
+            .insert([{ 
+                item_name: itemName, 
                 category, 
-                price: parseFloat(price), 
-                cost_price: parseFloat(cost_price), 
-                stock_quantity: parseInt(stock_quantity), 
-                unit 
-            })
-            .eq('id', id);
+                unit, 
+                cost_price: parseFloat(costPrice), 
+                price: parseFloat(sellingPrice), 
+                stock_quantity: parseInt(stockQty) 
+            }]);
 
         if (error) throw error;
-        res.json({ success: true, message: "Item updated successfully!" });
+        res.json({ success: true, message: "Product registered!" });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
+// --- UPDATE INVENTORY ITEM (Full Edit) ---
+// UPDATE INVENTORY ITEM (FIXED: ADMIN ONLY)
+app.put('/api/inventory/:id', async (req, res) => {
+    const { id } = req.params;
+    const { item_name, category, price, cost_price, stock_quantity, unit, role } = req.body;
+
+    // CHANGE: Ensure 'manager' cannot access this
+    if (role?.toLowerCase() !== 'admin') {
+        return res.status(403).json({ success: false, message: "Unauthorized. Admins only." });
+    }
+
+    try {
+        const { error } = await supabase
+            .from('Inventory')
+            .update({ item_name, category, price, cost_price, stock_quantity, unit })
+            .eq('id', id);
+
+        if (error) throw error;
+        res.json({ success: true, message: "Item updated!" });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
 // // --- 5. DASHBOARD SUMMARY (UPDATED PERMISSIONS) ---
 app.get('/api/reports/daily-summary', async (req, res) => {
     try {
@@ -467,7 +500,7 @@ app.delete('/api/inventory/:id', async (req, res) => {
     const { id } = req.params;
     const { role, userName } = req.query; // Capture userName from frontend
 
-    const authorizedRoles = ['admin', 'manager'];
+    const authorizedRoles = ['admin'];
     if (!authorizedRoles.includes(role?.toLowerCase())) {
         return res.status(403).json({ success: false, message: "Unauthorized." });
     }
