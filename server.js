@@ -185,22 +185,25 @@ app.get('/api/reports/daily-summary', async (req, res) => {
     }
 });
 
-// --- 6. DETAILED SALES REPORT (FIXED FOR MANAGER ACCESS) ---
+// --- 6. DETAILED SALES REPORT (WITH NET PROFIT CALCULATION) ---
+// --- 6. DETAILED SALES REPORT (CASH-BASED NET PROFIT) ---
 app.get('/api/reports/sales', async (req, res) => {
     const { role, date, month, year, method } = req.query;
     
-    // ALLOW BOTH ADMIN AND MANAGER HERE
+    // Authorization: Only Admin and Manager can view reports
     const authorized = ['admin', 'manager'];
     if (!authorized.includes(role?.toLowerCase())) {
         return res.status(403).json({ success: false, message: "Unauthorized access." });
     }
 
     try {
+        // We select everything from Sales, including the cost_price snapshot we saved during the sale
         let query = supabase
             .from('Sales')
             .select('*, payments(mpesa_code, amount, payment_method)')
             .order('sale_date', { ascending: false });
 
+        // Apply Filters
         if (date && date !== "") {
             query = query.gte('sale_date', `${date}T00:00:00Z`).lte('sale_date', `${date}T23:59:59Z`);
         } else if (month && year) {
@@ -220,8 +223,36 @@ app.get('/api/reports/sales', async (req, res) => {
 
         const { data, error } = await query;
         if (error) throw error;
-        res.json(data);
+
+        // --- PROFIT CALCULATION LOGIC ---
+        const reportsWithCalculations = data.map(sale => {
+            const totalRevenue = parseFloat(sale.total_amount || 0);
+            const amountPaid = parseFloat(sale.amount_paid || 0);
+            const quantity = parseInt(sale.quantity_sold || 0);
+            const unitCost = parseFloat(sale.cost_price || 0);
+            
+            // 1. Calculate Total Potential Profit (If fully paid)
+            const totalCostOfGoods = unitCost * quantity;
+            const totalPotentialProfit = totalRevenue - totalCostOfGoods;
+
+            // 2. Calculate Realized Profit (Based on cash in hand)
+            // If they paid 0 (Credit), realized profit is 0.
+            // If they paid 100% (Cash/Mpesa), realized profit is 100%.
+            const paymentRatio = totalRevenue > 0 ? (amountPaid / totalRevenue) : 0;
+            const realizedProfit = totalPotentialProfit * paymentRatio;
+
+            return {
+                ...sale,
+                // We send 'profit' to the frontend so the existing table works
+                profit: Math.max(0, realizedProfit), 
+                total_cost: totalCostOfGoods,
+                remaining_balance: totalRevenue - amountPaid
+            };
+        });
+
+        res.json(reportsWithCalculations);
     } catch (err) {
+        console.error("Report Generation Error:", err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
@@ -287,52 +318,66 @@ app.get('/api/reports/debtors', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-// --- 10. TRANSACTIONAL SALE ROUTE (UPDATED FOR STOCK ALERTS) ---
-app.post('/api/sell', async (req, res) => {
-    let { itemId, quantity, price, itemName, soldBy, paymentMethod, mpesaId, customerName, amountPaid } = req.body;
-    
+// --- GET PENDING DEBTS (STATUS REPORT) ---
+// --- GET PENDING DEBTS (ROLE-BASED STATUS REPORT) ---
+// --- GET PENDING DEBTS (FIXED DATE FILTER) ---
+app.get('/api/reports/debt-status', async (req, res) => {
+    const { role, date } = req.query; 
+    const authorized = ['admin', 'manager'];
+
+    if (!role || !authorized.includes(role.toLowerCase())) {
+        return res.status(403).json({ success: false, message: "Unauthorized." });
+    }
+
     try {
-        // 1. Fetch current stock and cost price
+        let query = supabase
+            .from('Sales')
+            .select('*')
+            .or('payment_status.eq.Credit,payment_status.eq.Partial');
+
+        // FIXED: Filter using a range to catch today's transactions regardless of time
+        if (date && date !== "") {
+            query = query
+                .gte('sale_date', `${date}T00:00:00.000Z`)
+                .lte('sale_date', `${date}T23:59:59.999Z`);
+        }
+
+        const { data, error } = await query.order('sale_date', { ascending: false });
+
+        if (error) throw error;
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/// --- 10. TRANSACTIONAL SALE ROUTE (UPDATED FOR STOCK ALERTS & COST SNAPSHOT) ---
+app.post('/api/sell', async (req, res) => {
+    let { itemId, quantity, price, itemName, soldBy, paymentMethod, mpesaId, mpesaCode, customerName, amountPaid } = req.body;
+    
+    if (paymentMethod === 'M-Pesa' && (!mpesaCode || mpesaCode.trim() === "")) {
+        return res.status(400).json({ success: false, message: "M-Pesa Code is required." });
+    }
+
+    try {
+        // 1. Fetch current details from Inventory
         const { data: item, error: fetchError } = await supabase
             .from('Inventory')
-            .select('stock_quantity, cost_price')
+            .select('stock_quantity, cost_price, item_name')
             .eq('id', itemId)
             .single();
 
         if (fetchError || !item) throw new Error(`Item not found.`);
         
-        // Check if there is enough stock before proceeding
-        if (item.stock_quantity < quantity) {
-            return res.status(400).json({ success: false, message: "Insufficient stock!" });
-        }
-
-        const newStockQuantity = item.stock_quantity - quantity;
         const totalAmount = quantity * price;
         const paidNow = parseFloat(amountPaid) || 0;
-        const totalCost = parseFloat(item.cost_price) * quantity;
         
-        // Calculate profit based on what was actually paid
-        const profitMargin = totalAmount > 0 ? ((totalAmount - totalCost) / totalAmount) : 0;
-        const earnedProfit = Math.max(0, paidNow * profitMargin);
+        // --- COST PRICE SNAPSHOT LOGIC ---
+        const unitCost = parseFloat(item.cost_price || 0);
+        const totalCostOfSale = unitCost * quantity;
+        const totalProfitOnSale = totalAmount - totalCostOfSale;
 
-        let status = '';
-        if (paidNow <= 0) {
-            status = 'Credit';
-        } else if (paidNow < totalAmount) {
-            status = 'Partial';
-        } else {
-            status = paymentMethod || 'Cash'; 
-        }
-
-        // 2. Update Inventory Stock
-        const { error: stockErr } = await supabase
-            .from('Inventory')
-            .update({ stock_quantity: newStockQuantity })
-            .eq('id', itemId);
-
-        if (stockErr) throw stockErr;
-        
-        // 3. Record the Sale
+        // 2. RECORD SALE (Added cost_price column here)
         const { data: saleData, error: insertError } = await supabase
             .from('Sales')
             .insert([{
@@ -341,53 +386,65 @@ app.post('/api/sell', async (req, res) => {
                 unit_price: price, 
                 total_amount: totalAmount,
                 amount_paid: paidNow, 
-                payment_status: status, 
-                customer_name: customerName || "Walking Customer",
-                profit: earnedProfit, 
+                cost_price: unitCost,      // <--- THIS SAVES THE COST PERMANENTLY
+                profit: totalProfitOnSale, // Optional: stores pre-calculated total profit
+                payment_status: paidNow >= totalAmount ? 'Paid' : (paidNow > 0 ? 'Partial' : 'Credit'), 
+                customer_name: customerName,
+                customer_phone: mpesaId, 
                 sold_by: soldBy, 
                 sale_date: new Date().toISOString()
             }])
             .select();
 
         if (insertError) throw insertError;
-        const newSaleId = saleData[0].id;
 
-        // 4. Record the Payment record (if any money was paid)
+        // 3. RECORD PAYMENT
         if (paidNow > 0) {
             await supabase.from('payments').insert([{
-                sale_id: newSaleId,
+                sale_id: saleData[0].id,
                 amount: paidNow,
                 payment_method: paymentMethod || 'Cash',
-                mpesa_code: mpesaId || null,
+                mpesa_code: mpesaCode || null, 
                 received_by: soldBy,
                 created_at: new Date().toISOString()
             }]);
         }
 
-        // 5. SUCCESS RESPONSE: Include the new stock level for frontend alerts
-        res.json({ 
-            success: true, 
-            message: `Sale recorded as ${status}!`,
-            newStock: newStockQuantity // <--- This is used by the frontend to trigger alerts
-        });
+        // 4. Update Stock & TRIGGER ALERT
+        const newStockLevel = item.stock_quantity - quantity;
+        await supabase.from('Inventory').update({ stock_quantity: newStockLevel }).eq('id', itemId);
 
+        // --- STOCK ALERT LOGIC ---
+        if (newStockLevel <= 10) { // Threshold: 5 units
+            const mailOptions = {
+                from: 'your-email@gmail.com',
+                to: 'karayapeter2@gmail.com', // Change to your actual admin email
+                subject: `⚠️ LOW STOCK ALERT: ${item.item_name}`,
+                text: `The stock for "${item.item_name}" is critically low.\nRemaining: ${newStockLevel} units.\nPlease restock soon.`
+            };
+            
+            transporter.sendMail(mailOptions, (error, info) => {
+                if (error) console.error("Email Alert Failed:", error);
+                else console.log("Stock Alert Sent:", info.response);
+            });
+        }
+
+        res.json({ success: true, message: `Sale recorded. Stock: ${newStockLevel}` });
     } catch (err) {
+        console.error("Sale Error:", err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
+// --- 11. CLEAR DEBT ROUTE (SYNCHRONIZED WITH DB) ---
+app.post('/api/clear-debt', async (req, res) => {
+    const { saleId, paymentAmount, paymentMethod, mpesaId, processedBy } = req.body;
 
-// --- 11. CLEAR DEBT ROUTE (COMPLETED) ---
-app.post('/api/payments/clear-debt', async (req, res) => {
-    const { saleId, paymentAmount, paymentMethod, mpesaId, processedBy, role } = req.body;
-    
-    // 1. Authorization Check (Allow Admin and Manager)
-    const authorized = ['admin', 'manager'];
-    if (!authorized.includes(role?.toLowerCase())) {
-        return res.status(403).json({ success: false, message: "Unauthorized. Managers/Admins only." });
+    if (!saleId || !paymentAmount) {
+        return res.status(400).json({ success: false, message: "Missing Sale ID or Amount" });
     }
 
     try {
-        // 2. Fetch the current sale record
+        // 1. Fetch existing sale to calculate balance
         const { data: sale, error: getErr } = await supabase
             .from('Sales')
             .select('*')
@@ -396,62 +453,60 @@ app.post('/api/payments/clear-debt', async (req, res) => {
         
         if (getErr || !sale) throw new Error("Sale record not found.");
 
+        const amountToPay = parseFloat(paymentAmount);
+        const currentPaid = parseFloat(sale.amount_paid || 0);
         const totalAmount = parseFloat(sale.total_amount);
-        const alreadyPaid = parseFloat(sale.amount_paid || 0);
-        const newPayment = parseFloat(paymentAmount || 0);
-        const updatedTotalPaid = alreadyPaid + newPayment;
-
-        if (alreadyPaid >= totalAmount) {
-            return res.status(400).json({ success: false, message: "This debt has already been cleared." });
-        }
-
-        // 3. Calculate New Profit
-        // We calculate profit proportionally based on the new payment
-        const { data: item } = await supabase.from('Inventory').select('cost_price').eq('item_name', sale.item_name).single();
-        const costPrice = item ? parseFloat(item.cost_price) : 0;
-        const totalCost = costPrice * sale.quantity_sold;
-        
-        const profitMargin = totalAmount > 0 ? ((totalAmount - totalCost) / totalAmount) : 0;
-        const additionalProfit = newPayment * profitMargin;
-        const updatedProfit = (parseFloat(sale.profit || 0)) + additionalProfit;
-
-        // 4. Determine New Status
+        const updatedTotalPaid = currentPaid + amountToPay;
         let newStatus = updatedTotalPaid >= totalAmount ? 'Paid' : 'Partial';
 
-        // 5. Update the Sales Table
+        // 2. Update the main Sales record
         const { error: updateErr } = await supabase
             .from('Sales')
             .update({ 
                 amount_paid: updatedTotalPaid, 
-                payment_status: newStatus,
-                profit: updatedProfit 
+                payment_status: newStatus 
             })
             .eq('id', saleId);
 
         if (updateErr) throw updateErr;
 
-        // 6. Record the payment in the Payments Audit table
-        await supabase.from('payments').insert([{
+        // 3. Register in 'payments' table (Global Audit)
+        // Uses column name: 'amount'
+        const { error: payErr } = await supabase.from('payments').insert([{
             sale_id: saleId,
-            amount: newPayment,
-            payment_method: paymentMethod || 'Cash',
+            amount: amountToPay, 
+            payment_method: paymentMethod,
             mpesa_code: mpesaId || null,
             received_by: processedBy,
+            customer_name: sale.customer_name,
             created_at: new Date().toISOString()
         }]);
 
-        // 7. SEND SUCCESS RESPONSE (Crucial to stop frontend "Processing" hang)
+        if (payErr) throw payErr;
+
+        // 4. Register in 'debt_payments' table
+const { error: debtErr } = await supabase.from('debt_payments').insert([{
+    sale_id: saleId,
+    amount_paid: amountToPay, 
+    payment_method: paymentMethod,
+    mpesa_id: mpesaId || null,
+    processed_by: processedBy,
+    customer_name: sale.customer_name, // Add this line
+    payment_date: new Date().toISOString()
+}]);
+
+        if (debtErr) throw debtErr;
+
         res.json({ 
             success: true, 
-            message: `Payment of Ksh ${newPayment} recorded. Status: ${newStatus}` 
+            message: `Success! KES ${amountToPay} recorded in both ledgers.` 
         });
 
     } catch (err) {
-        console.error("Debt Clearing Error:", err);
+        console.error("Critical Payment Error:", err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
 // INVENTORY MANAGEMENT (STOCK UPDATE) with Audit Logging
 app.patch('/api/inventory/:id', async (req, res) => {
     const { id } = req.params;
@@ -554,7 +609,30 @@ app.post('/api/employees', async (req, res) => {
         res.status(500).json({ success: false, message: "ID already exists or Database error." });
     }
 });
+// --- 14. DEBT REPAYMENT AUDIT LOGS ---
+app.get('/api/reports/debt-logs', async (req, res) => {
+    const { date } = req.query;
+    try {
+        let query = supabase
+            .from('debt_payments')
+            .select('*')
+            .order('payment_date', { ascending: false });
 
+        if (date && date !== "") {
+            // Filter for the specific day selected in the frontend
+            query = query
+                .gte('payment_date', `${date}T00:00:00.000Z`)
+                .lte('payment_date', `${date}T23:59:59.999Z`);
+        }
+
+        const { data, error } = await query;
+        if (error) throw error;
+        res.json(data);
+    } catch (err) {
+        console.error("Debt Log Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
 app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
 
 
