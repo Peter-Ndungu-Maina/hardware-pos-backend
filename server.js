@@ -78,53 +78,32 @@ app.use(log.middleware);          // structured JSON request logging
 app.use(sanitizeQuery);           // strip PostgREST injection chars from all query params
 app.use(express.json({ limit: '2mb' })); // Body size cap — prevents oversized bulk import abuse
 
-// Define paths clearly
-const frontendPath = path.resolve(__dirname, '..', 'frontend');
-const pagesPath    = path.resolve(__dirname, '..', 'frontend', 'src', 'pages');
 
-// ============================================================
-//  CLEANED API ROUTES (Replacing static file serving)
-// ============================================================
 
-// 1. Remove Static Assets & Pages (Netlify handles these now)
-// We no longer need app.use(express.static(frontendPath)) or pagesPath.
 
-// 2. Root Route - This is your "Health Check"
-// When you visit https://hardware-pos-backend.onrender.com/, you'll see this JSON.
-app.get('/', (req, res) => {
-    res.json({ 
-        status: "success", 
-        message: "Elite Hardware POS API is live and running! 🚀",
-        version: "1.0.0",
-        timestamp: new Date().toISOString()
+
+
+
+// ── 3. Explicit "Shallow" Routes (The Fix) ──────────────────────────────────
+// This allows you to navigate to 'http://localhost:5001/inventory.html' 
+// even though the file is buried in /src/pages/
+const HTML_PAGES = [
+    'inventory', 'suppliers','purchase_orders', 'add_product', 'stock_audit', 'stock_movement',
+    'stock_valuation', 'expenses', 'profit_loss', 'debt_status',
+    'debtors_report', 'reports', 'debts_repayment', 'payments_report', 'returns_audit'
+];
+HTML_PAGES.forEach(page => {
+    app.get(`/${page}.html`, (req, res) => {
+        const file = path.join(pagesPath, `${page}.html`);
+        if (require('fs').existsSync(file)) {
+            res.sendFile(file);
+        } else {
+            res.status(404).send(`Page ${page} not found at ${file}`);
+        }
     });
 });
 
-// 3. Optional: Explicit /index.html redirect (to avoid 404s if old links exist)
-app.get('/index.html', (req, res) => {
-    res.redirect(301, '/');
-});
-
-// ============================================================
-//  CORS & PORT SETUP (Crucial for Render)
-// ============================================================
-
-// Ensure your CORS uses the split method we discussed earlier
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim());
-
-app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            log.warn(`CORS blocked for origin: ${origin}`);
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
-    credentials: true
-}));
-
-
+// ── 4. Root Routes ──────────────────────────────────────────────────────────
 
 
 // ============================================================
