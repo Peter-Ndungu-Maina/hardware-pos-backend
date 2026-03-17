@@ -1334,15 +1334,43 @@ app.get('/api/purchase-orders/:id/activity', requireAuth, async (req, res) => {
 
 app.get('/api/reports/daily-summary', requireAuth, async (req, res) => {
     try {
-        const { processedBy } = req.query;
+        const { processedBy, date, from, to, month, year } = req.query;
         const role = req.user.role;
         const isPrivileged = ['admin', 'manager'].includes(role?.toLowerCase());
-        let salesQuery = supabase.from('Sales').select('total_amount, cost_price, quantity_sold, amount_paid, sold_by, payment_status').eq('is_voided', false);
+
+        let salesQuery = supabase.from('Sales')
+            .select('total_amount, cost_price, quantity_sold, amount_paid, sold_by, payment_status, sale_date')
+            .eq('is_voided', false);
+
+        // Apply period filter
+        if (date) {
+            salesQuery = salesQuery.gte('sale_date', `${date}T00:00:00Z`).lte('sale_date', `${date}T23:59:59Z`);
+        } else if (from && to) {
+            salesQuery = salesQuery.gte('sale_date', `${from}T00:00:00Z`).lte('sale_date', `${to}T23:59:59Z`);
+        } else if (month && year) {
+            const mm = month.padStart(2,'0'), lastDay = new Date(year, month, 0).getDate();
+            salesQuery = salesQuery.gte('sale_date', `${year}-${mm}-01T00:00:00Z`).lte('sale_date', `${year}-${mm}-${lastDay}T23:59:59Z`);
+        }
+        // if none → all time (no filter)
+
         if (!isPrivileged && processedBy) salesQuery = salesQuery.eq('sold_by', processedBy);
+
         const { data: allSales, error: salesError } = await salesQuery;
         if (salesError) throw salesError;
-        const { data: allExpenses, error: expError } = await supabase.from('expenses').select('amount');
+
+        // Expenses — also filter by period
+        let expQuery = supabase.from('expenses').select('amount');
+        if (date) {
+            expQuery = expQuery.gte('expense_date', `${date}T00:00:00Z`).lte('expense_date', `${date}T23:59:59Z`);
+        } else if (from && to) {
+            expQuery = expQuery.gte('expense_date', `${from}T00:00:00Z`).lte('expense_date', `${to}T23:59:59Z`);
+        } else if (month && year) {
+            const mm = month.padStart(2,'0'), lastDay = new Date(year, month, 0).getDate();
+            expQuery = expQuery.gte('expense_date', `${year}-${mm}-01T00:00:00Z`).lte('expense_date', `${year}-${mm}-${lastDay}T23:59:59Z`);
+        }
+        const { data: allExpenses, error: expError } = await expQuery;
         if (expError) throw expError;
+
         let realizedSales = 0, realizedCogs = 0, totalOwed = 0, totalExpenses = 0;
         allSales?.forEach(s => {
             const total = parseFloat(s.total_amount || 0), paid = parseFloat(s.amount_paid || 0);
@@ -1353,6 +1381,7 @@ app.get('/api/reports/daily-summary', requireAuth, async (req, res) => {
             else if (paid > 0 && total > 0) realizedCogs += cost * (paid / total);
         });
         allExpenses?.forEach(e => { totalExpenses += parseFloat(e.amount || 0); });
+
         const txCount = allSales?.length || 0;
         const avgTx   = txCount > 0 ? realizedSales / txCount : 0;
         res.json({ totalSales: realizedSales, totalExpenses, netProfit: isPrivileged ? (realizedSales - realizedCogs - totalExpenses) : null, totalOwed, txCount, avgTx, totalCogs: realizedCogs });
@@ -1360,7 +1389,6 @@ app.get('/api/reports/daily-summary', requireAuth, async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-
 app.get('/api/reports/sales', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
     const { date, month, year, method } = req.query;
     try {
