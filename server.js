@@ -201,24 +201,27 @@ async function registerItemWithEtims(item) {
         const digitaxItemId = data?.id || data?.item_id || null;
         log.info('[eTIMS] ✅ Item registered with DigiTax', { item: item.itemName, digitaxItemId, item_class_code: itemClassCode });
 
-        // Step 2: Submit opening stock as a purchase to DigiTax.
-        // DigiTax tracks stock via purchases (stock-in) and sales (stock-out).
-        // Without this, the item shows 0 stock in DigiTax even after registration.
+        // Step 2: Submit opening stock via DigiTax stock-in endpoint.
+        // DigiTax Kenya tracks stock via stock-ins (purchases) and sales.
+        // Without this the item shows 0 qty even after registration.
         const openingQty = parseFloat(item.stockQty) || 0;
         if (digitaxItemId && openingQty > 0) {
             try {
-                const now          = new Date();
-                const purchaseDate = now.toISOString().split('T')[0];
-                const unitCost     = parseFloat(item.costPrice) || parseFloat(item.sellingPrice) || 0;
-                const totalCost    = parseFloat((unitCost * openingQty).toFixed(2));
+                const now       = new Date();
+                const stockDate = now.toISOString().split('T')[0];
+                const unitCost  = parseFloat(item.costPrice) || parseFloat(item.sellingPrice) || 0;
+                const totalCost = parseFloat((unitCost * openingQty).toFixed(2));
 
-                const purchasePayload = {
+                // Try both endpoint variants — DigiTax Kenya uses stock-ins for opening stock.
+                // Attempt 1: /stock-ins (preferred for opening stock)
+                const stockInPayload = {
                     trader_invoice_number: `INIT-${barCode}-${Date.now()}`,
                     invoice_number:        Math.abs(parseInt(barCode.slice(-8))) || 1,
-                    receipt_type_code:     'P',
+                    receipt_type_code:     'P',      // P = Purchase/Stock-in
                     payment_type_code:     '01',
                     invoice_status_code:   '02',
-                    purchase_date:         purchaseDate,
+                    sale_date:             stockDate, // some endpoints use sale_date
+                    purchase_date:         stockDate,
                     items: [{
                         item_name:             item.itemName,
                         item_class_code:       itemClassCode,
@@ -237,20 +240,37 @@ async function registerItemWithEtims(item) {
                     }]
                 };
 
-                const pRes  = await fetch(`${DIGITAX_BASE_URL}/purchases-with-items`, {
+                // Try /stock-ins first, fall back to /purchases-with-items
+                let pRes = await fetch(`${DIGITAX_BASE_URL}/stock-ins`, {
                     method:  'POST',
                     headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
-                    body:    JSON.stringify(purchasePayload),
+                    body:    JSON.stringify(stockInPayload),
                     signal:  AbortSignal.timeout(10000)
                 });
-                const pData = await pRes.json();
+                let pData = await pRes.json();
+                let usedEndpoint = 'stock-ins';
+
+                // If stock-ins fails, try purchases-with-items
+                if (!pRes.ok) {
+                    log.warn('[eTIMS] /stock-ins rejected, trying /purchases-with-items', {
+                        status: pRes.status, body: JSON.stringify(pData)
+                    });
+                    pRes = await fetch(`${DIGITAX_BASE_URL}/purchases-with-items`, {
+                        method:  'POST',
+                        headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                        body:    JSON.stringify(stockInPayload),
+                        signal:  AbortSignal.timeout(10000)
+                    });
+                    pData = await pRes.json();
+                    usedEndpoint = 'purchases-with-items';
+                }
 
                 if (pRes.ok) {
-                    log.info('[eTIMS] ✅ Opening stock purchase submitted to DigiTax', {
+                    log.info(`[eTIMS] ✅ Opening stock submitted via /${usedEndpoint}`, {
                         item: item.itemName, qty: openingQty, unitCost
                     });
                 } else {
-                    log.warn('[eTIMS] Opening stock purchase rejected by DigiTax', {
+                    log.warn('[eTIMS] Opening stock rejected by DigiTax on both endpoints', {
                         status: pRes.status, item: item.itemName, body: JSON.stringify(pData)
                     });
                 }
