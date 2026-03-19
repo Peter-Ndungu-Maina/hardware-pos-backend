@@ -55,63 +55,56 @@ async function submitSaleToEtims(saleData) {
             .replace(/\D/g, '').slice(-8))
         ) || 1;
 
+        const baseInvoice = {
+            trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
+            invoice_number:        invoiceNum,
+            receipt_type_code:     'S',
+            payment_type_code:     payMap[saleData.paymentMethod] || '01',
+            invoice_status_code:   '02',
+            sale_date:             saleDate,
+        };
+
         let endpoint, payload;
 
         if (saleData.digitaxItemId) {
-            // Item is registered — use /sales with item ID (stock tracked correctly)
+            // Item registered — use /sales with item ID (stock tracked correctly)
             endpoint = `${DIGITAX_BASE_URL}/sales`;
-            payload  = {
-                trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
-                invoice_number:        invoiceNum,
-                receipt_type_code:     'S',
-                payment_type_code:     payMap[saleData.paymentMethod] || '01',
-                invoice_status_code:   '02',
-                sale_date:             saleDate,
-                items: [{
-                    id:            saleData.digitaxItemId,
-                    quantity:      quantity,
-                    unit_price:    unitPrice,
-                    total_amount:  totalAmount,
-                    tax_type_code: 'A',
-                    discount_rate: 0
-                }]
-            };
+            payload  = { ...baseInvoice, items: [{
+                id:            saleData.digitaxItemId,
+                quantity:      quantity,
+                unit_price:    unitPrice,
+                total_amount:  totalAmount,
+                tax_type_code: 'A',
+                discount_rate: 0
+            }]};
         } else {
-            // Item not registered — use /sales-with-items as fallback
+            // Item not yet registered — use /sales-with-items as fallback
             endpoint = `${DIGITAX_BASE_URL}/sales-with-items`;
-            payload  = {
-                trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
-                invoice_number:        invoiceNum,
-                receipt_type_code:     'S',
-                payment_type_code:     payMap[saleData.paymentMethod] || '01',
-                invoice_status_code:   '02',
-                sale_date:             saleDate,
-                items: [{
-                    item_name:             saleData.itemName,
-                    item_class_code:       '44121700',
-                    item_type_code:        '2',
-                    item_bar_code:         barCode,
-                    item_tax_type_code:    'A',
-                    quantity:              quantity,
-                    quantity_unit_code:    'U',
-                    package_unit_code:     'NT',
-                    package_unit_quantity: 1,
-                    unit_price:            unitPrice,
-                    total_amount:          totalAmount,
-                    tax_type_code:         'A',
-                    discount_rate:         0,
-                    origin_nation_code:    'KE'
-                }]
-            };
+            payload  = { ...baseInvoice, items: [{
+                item_name:             saleData.itemName,
+                item_class_code:       '44121700',
+                item_type_code:        '2',
+                item_bar_code:         barCode,
+                item_tax_type_code:    'A',
+                quantity:              quantity,
+                quantity_unit_code:    'U',
+                package_unit_code:     'NT',
+                package_unit_quantity: 1,
+                unit_price:            unitPrice,
+                total_amount:          totalAmount,
+                tax_type_code:         'A',
+                discount_rate:         0,
+                origin_nation_code:    'KE'
+            }]};
         }
 
         log.info('[eTIMS] Submitting to DigiTax', {
-            invoice:    payload.trader_invoice_number,
-            item:       saleData.itemName,
-            itemId:     saleData.digitaxItemId || 'unregistered',
-            total:      totalAmount,
-            sale_date:  saleDate,
-            endpoint:   saleData.digitaxItemId ? '/sales' : '/sales-with-items'
+            invoice:   baseInvoice.trader_invoice_number,
+            item:      saleData.itemName,
+            itemId:    saleData.digitaxItemId || 'unregistered',
+            total:     totalAmount,
+            sale_date: saleDate,
+            endpoint:  saleData.digitaxItemId ? '/sales' : '/sales-with-items'
         });
 
         const res  = await fetch(endpoint, {
@@ -151,24 +144,27 @@ async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
       const classCodeMap = {
-    'Hardware':            '31162800',
-    'Tools':               '27111700',
-    'Paint':               '31211700',
-    'Electrical':          '39121400',
-    'Plumbing':            '40171700',
-    'Building Materials':  '30101700',
-    'Fasteners':           '31161500',
-    'Safety':              '46181500',
-    'Cement':              '30111700',
-    'General':             '44121700',
+    'hardware':           '31162800',
+    'tools':              '27111700',
+    'paint':              '31211700',
+    'electrical':         '39121400',
+    'plumbing':           '40171700',
+    'building materials': '30101700',
+    'fasteners':          '31161500',
+    'safety':             '46181500',
+    'cement':             '30111700',
+    'general':            '44121700',
 };
+        // Normalise category to lowercase for case-insensitive match
+        const categoryKey = (item.category || 'general').toLowerCase().trim();
+        const itemClassCode = classCodeMap[categoryKey] || '44121700'; // 44121700 = General merchandise (confirmed working)
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
         const payload = {
             item_name:          item.itemName,
-            item_class_code:    classCodeMap[item.category] || '44121700',
+            item_class_code:    itemClassCode,
             item_type_code:     '2',
             item_bar_code:      barCode,
             tax_type_code:      'A',
@@ -199,6 +195,31 @@ async function registerItemWithEtims(item) {
     } catch (err) {
         log.warn('[eTIMS] Item registration failed (product still saved):', err.message);
         return null;
+    }
+}
+
+// ── Sync stock quantity to DigiTax after item registration ────────────────────
+async function syncStockWithEtims(digitaxItemId, quantity) {
+    if (!DIGITAX_API_KEY || !digitaxItemId || !quantity) return;
+    try {
+        const res = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+            method:  'PUT',
+            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+            body:    JSON.stringify({
+                item_id:       digitaxItemId,
+                quantity:      parseFloat(quantity),
+                stock_io_code: '06'  // 06 = INCOMING ADJUSTMENT
+            }),
+            signal: AbortSignal.timeout(10000)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            log.warn('[eTIMS] Stock sync failed', { digitaxItemId, body: JSON.stringify(data) });
+        } else {
+            log.info('[eTIMS] ✅ Stock synced to DigiTax', { digitaxItemId, quantity });
+        }
+    } catch (err) {
+        log.warn('[eTIMS] Stock sync error:', err.message);
     }
 }
 
@@ -436,6 +457,7 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
             await supabase.from('Inventory')
                 .update({ digitax_item_id: digitaxItemId, kra_registered: true })
                 .eq('id', newItem.id);
+            await syncStockWithEtims(digitaxItemId, parseInt(stockQty));
         }
         res.json({
             success:       true,
@@ -2049,6 +2071,7 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                 await supabase.from('Inventory')
                     .update({ digitax_item_id: bulkEtimsId, kra_registered: true })
                     .eq('id', newItem.id);
+                await syncStockWithEtims(bulkEtimsId, qty);
             }
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
