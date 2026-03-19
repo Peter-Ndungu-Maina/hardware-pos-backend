@@ -37,23 +37,52 @@ const DIGITAX_API_KEY  = process.env.DIGITAX_API_KEY  || '';
 async function submitSaleToEtims(saleData) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
     try {
-        const now  = new Date();
-        const date = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
-        const time = now.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
-        const payMap = { 'Cash':'01', 'M-Pesa':'05', 'Credit':'01' };
+        const now      = new Date();
+        // DigiTax expects sale_date as YYYY-MM-DD
+        const saleDate = now.toISOString().split('T')[0];
+        const payMap   = { 'Cash':'01', 'M-Pesa':'05', 'Credit':'01' };
+
         const payload = {
             trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
-            date, time,
-            payment_type_code: payMap[saleData.paymentMethod] || '01',
-            customer_pin:  saleData.customerPin  || null,
-            customer_name: saleData.customerName || null,
-            sale_items: [{ item_name: saleData.itemName, quantity: saleData.quantity, unit_price: saleData.unitPrice, tax_type_code: 'A', discount_rate: 0 }]
+            sale_date:             saleDate,                          // ← required field
+            invoice_status_code:   '1',                               // ← required: 1=original
+            payment_type_code:     payMap[saleData.paymentMethod] || '01',
+            customer_pin:          saleData.customerPin  || null,
+            customer_name:         saleData.customerName || null,
+            items: [{                                                  // ← "items" not "sale_items"
+                item_name:     saleData.itemName,
+                quantity:      saleData.quantity,
+                unit_price:    saleData.unitPrice,
+                tax_type_code: 'A',                                   // A=16% VAT
+                discount_rate: 0
+            }]
         };
-        const res  = await fetch(`${DIGITAX_BASE_URL}/sales`, { method:'POST', headers:{ 'x-api-key': DIGITAX_API_KEY, 'Content-Type':'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
+
+        log.info('[eTIMS] Submitting sale to DigiTax', { invoice: payload.trader_invoice_number, sale_date: saleDate });
+
+        const res  = await fetch(`${DIGITAX_BASE_URL}/sales`, {
+            method:  'POST',
+            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(10000)
+        });
         const data = await res.json();
-        if (!res.ok) { log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: data }); return null; }
-        log.info('[eTIMS] ✅ Sale submitted to KRA', { invoice: saleData.invoiceNumber, kraReceiptNo: data?.data?.receipt_number });
-        return { kraReceiptNo: data?.data?.receipt_number || null, kraQrUrl: data?.data?.etims_url || null };
+
+        if (!res.ok) {
+            log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: data });
+            return null;
+        }
+
+        log.info('[eTIMS] ✅ Sale submitted to KRA', {
+            invoice:      payload.trader_invoice_number,
+            kraReceiptNo: data?.data?.receipt_number,
+            kraQrUrl:     data?.data?.etims_url
+        });
+
+        return {
+            kraReceiptNo: data?.data?.receipt_number || null,
+            kraQrUrl:     data?.data?.etims_url      || null
+        };
     } catch (err) {
         log.warn('[eTIMS] DigiTax call failed (sale still saved):', err.message);
         return null;
@@ -2486,25 +2515,25 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
         try {
             const now      = new Date();
             const date     = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
-            const time     = now.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
+            const saleDate  = now.toISOString().split('T')[0];
             const returnRef = `RET-${Date.now()}`;
 
             // Credit note for customer return; debit note for damaged goods
-            const noteType = returnReason === 'damaged' ? 'debit_note' : 'credit_note';
+            const noteType     = returnReason === 'damaged' ? 'debit_note' : 'credit_note';
             const sellingPrice = parseFloat(sellingPriceOriginal || retItem.cost_price || 0);
 
             const payload = {
-                trader_invoice_number: returnRef,
+                trader_invoice_number:   returnRef,
                 original_invoice_number: originalReceipt || null,
-                note_type:   noteType,
-                date,
-                time,
+                sale_date:               saleDate,         // ← required
+                invoice_status_code:     '3',              // ← 3 = credit/debit note
+                note_type:               noteType,
                 reason:      returnReason === 'damaged'    ? 'Damaged goods write-off'
                            : returnReason === 'wrong_item' ? 'Wrong item returned'
                            : 'Customer return',
                 customer_pin:  null,
                 customer_name: customerName || null,
-                sale_items: [{
+                items: [{                                   // ← "items" not "sale_items"
                     item_name:     retItem.item_name,
                     quantity:      retQty,
                     unit_price:    sellingPrice,
