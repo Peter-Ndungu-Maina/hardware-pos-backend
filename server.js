@@ -37,50 +37,79 @@ const DIGITAX_API_KEY  = process.env.DIGITAX_API_KEY  || '';
 async function submitSaleToEtims(saleData) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
     try {
-        const now  = new Date();
-        const date = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
-        const time = now.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
-        const payMap = { 'Cash':'01', 'M-Pesa':'05', 'Credit':'01' };
-
+        const now        = new Date();
         const unitPrice  = parseFloat(saleData.unitPrice) || 0;
         const quantity   = parseFloat(saleData.quantity)  || 1;
         const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
 
+        // invoice_number must be a number — extract digits from receipt/invoice ref
+        const invoiceRef    = saleData.invoiceNumber || saleData.receiptNumber || 'REC-1';
+        const invoiceNumInt = parseInt(invoiceRef.replace(/\D/g, '').slice(-8)) || 1;
+
+        // Payment type codes per DigiTax docs:
+        // 01=Cash, 02=Credit, 03=Cash/Credit, 04=Bank Cheque, 05=Debit&Credit Card, 06=Mobile Money, 07=Other
+        const payMap = { 'Cash': '01', 'M-Pesa': '06', 'Credit': '02' };
+
         const payload = {
-            trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
-            date, time,
-            payment_type_code: payMap[saleData.paymentMethod] || '01',
-            customer_pin:      saleData.customerPin  || null,
-            customer_name:     saleData.customerName || null,
-            sale_items: [{
-                id:            saleData.digitaxItemId || null,
-                item_name:     saleData.itemName,
-                quantity:      quantity,
-                unit_price:    unitPrice,
-                total_amount:  totalAmount,
-                tax_type_code: 'A',
-                discount_rate: 0
+            trader_invoice_number: invoiceRef,
+            invoice_number:        invoiceNumInt,
+            receipt_type_code:     'S',   // S = Sale
+            payment_type_code:     payMap[saleData.paymentMethod] || '01',
+            invoice_status_code:   '02',  // 02 = Approved
+            items: [{
+                item_name:          saleData.itemName,
+                item_class_code:    '5020230600', // General Hardware / Building Materials
+                item_type_code:     '2',           // 2 = Finished Product
+                quantity:           quantity,
+                quantity_unit_code: 'U',           // U = Unit
+                package_unit_code:  'NT',          // NT = Each
+                unit_price:         unitPrice,
+                total_amount:       totalAmount,
+                tax_type_code:      'A',           // A = 16% VAT standard rate
+                discount_rate:      0,
+                origin_nation_code: 'KE'
             }]
         };
 
         log.info('[eTIMS] Submitting sale to DigiTax', {
-            invoice:   payload.trader_invoice_number,
+            endpoint:  '/sales-with-items',
+            invoice:   invoiceRef,
             item:      saleData.itemName,
-            itemId:    saleData.digitaxItemId || 'not-registered',
+            qty:       quantity,
             total:     totalAmount,
-            sale_date: now.toISOString().split('T')[0]
+            payment:   saleData.paymentMethod
         });
 
-        const res  = await fetch(`${DIGITAX_BASE_URL}/sales`, { method:'POST', headers:{ 'x-api-key': DIGITAX_API_KEY, 'Content-Type':'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
+        const res  = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
+            method:  'POST',
+            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(15000)
+        });
         const data = await res.json();
-        if (!res.ok) { log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: data }); return null; }
-        log.info('[eTIMS] ✅ Sale submitted to KRA', { invoice: saleData.invoiceNumber, kraReceiptNo: data?.data?.receipt_number });
-        return { kraReceiptNo: data?.data?.receipt_number || null, kraQrUrl: data?.data?.etims_url || null };
+
+        if (!res.ok) {
+            log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: JSON.stringify(data) });
+            return null;
+        }
+
+        log.info('[eTIMS] ✅ Sale submitted to KRA', {
+            invoice:      invoiceRef,
+            kraReceiptNo: data?.data?.receipt_number,
+            kraQrUrl:     data?.data?.etims_url
+        });
+
+        return {
+            kraReceiptNo: data?.data?.receipt_number || null,
+            kraQrUrl:     data?.data?.etims_url       || null
+        };
+
     } catch (err) {
         log.warn('[eTIMS] DigiTax call failed (sale still saved):', err.message);
         return null;
     }
 }
+
 
 // ============================================================
 //  2. EMAIL CONFIGURATION
