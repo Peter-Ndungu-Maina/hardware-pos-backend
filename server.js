@@ -37,54 +37,63 @@ const DIGITAX_API_KEY  = process.env.DIGITAX_API_KEY  || '';
 async function submitSaleToEtims(saleData) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
     try {
-        const now        = new Date();
-        const unitPrice  = parseFloat(saleData.unitPrice) || 0;
-        const quantity   = parseFloat(saleData.quantity)  || 1;
+        const now         = new Date();
+        // Confirmed working date format: DD/MM/YYYY
+        const saleDate    = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
+        // DigiTax payment codes: 01=Cash, 02=Credit, 06=Mobile Money (M-Pesa)
+        const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
+        const unitPrice   = parseFloat(saleData.unitPrice) || 0;
+        const quantity    = parseFloat(saleData.quantity)  || 1;
         const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
 
-        // invoice_number must be a number — extract digits from receipt/invoice ref
-        const invoiceRef    = saleData.invoiceNumber || saleData.receiptNumber || 'REC-1';
-        const invoiceNumInt = parseInt(invoiceRef.replace(/\D/g, '').slice(-8)) || 1;
+        // Generate numeric barcode from item name (DigiTax requires item_bar_code)
+        const barCode = String(
+            saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
+        ).padStart(8, '0');
 
-        // Payment type codes per DigiTax docs:
-        // 01=Cash, 02=Credit, 03=Cash/Credit, 04=Bank Cheque, 05=Debit&Credit Card, 06=Mobile Money, 07=Other
-        const payMap = { 'Cash': '01', 'M-Pesa': '06', 'Credit': '02' };
+        // Numeric invoice number only (strip letters, max 8 digits)
+        const invoiceNum = Math.abs(
+            parseInt((saleData.invoiceNumber || saleData.receiptNumber || '1')
+            .replace(/\D/g, '').slice(-8))
+        ) || 1;
 
         const payload = {
-            trader_invoice_number: invoiceRef,
-            invoice_number:        invoiceNumInt,
-            receipt_type_code:     'S',   // S = Sale
+            trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
+            invoice_number:        invoiceNum,
+            receipt_type_code:     'S',    // S = Sale
             payment_type_code:     payMap[saleData.paymentMethod] || '01',
-            invoice_status_code:   '02',  // 02 = Approved
+            invoice_status_code:   '02',   // 02 = Approved
+            sale_date:             saleDate,
             items: [{
-                item_name:          saleData.itemName,
-                item_class_code:    '5020230600', // General Hardware / Building Materials
-                item_type_code:     '2',           // 2 = Finished Product
-                quantity:           quantity,
-                quantity_unit_code: 'U',           // U = Unit
-                package_unit_code:  'NT',          // NT = Each
-                unit_price:         unitPrice,
-                total_amount:       totalAmount,
-                tax_type_code:      'A',           // A = 16% VAT standard rate
-                discount_rate:      0,
-                origin_nation_code: 'KE'
+                item_name:             saleData.itemName,
+                item_class_code:       '5020230600',  // General Hardware
+                item_type_code:        '2',            // 2 = Finished Product
+                item_bar_code:         barCode,
+                item_tax_type_code:    'B',            // B = 16% VAT (confirmed from DigiTax response)
+                quantity:              quantity,
+                quantity_unit_code:    'U',            // U = Unit
+                package_unit_code:     'NT',           // NT = Each
+                package_unit_quantity: 1,
+                unit_price:            unitPrice,
+                total_amount:          totalAmount,
+                tax_type_code:         'B',            // B = 16% VAT
+                discount_rate:         0,
+                origin_nation_code:    'KE'
             }]
         };
 
-        log.info('[eTIMS] Submitting sale to DigiTax', {
-            endpoint:  '/sales-with-items',
-            invoice:   invoiceRef,
+        log.info('[eTIMS] Submitting to DigiTax', {
+            invoice:   payload.trader_invoice_number,
             item:      saleData.itemName,
-            qty:       quantity,
             total:     totalAmount,
-            payment:   saleData.paymentMethod
+            sale_date: saleDate
         });
 
         const res  = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
             method:  'POST',
             headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
             body:    JSON.stringify(payload),
-            signal:  AbortSignal.timeout(15000)
+            signal:  AbortSignal.timeout(10000)
         });
         const data = await res.json();
 
@@ -93,23 +102,30 @@ async function submitSaleToEtims(saleData) {
             return null;
         }
 
-        log.info('[eTIMS] ✅ Sale submitted to KRA', {
-            invoice:      invoiceRef,
-            kraReceiptNo: data?.data?.receipt_number,
-            kraQrUrl:     data?.data?.etims_url
+        // Sale accepted — status is PENDING until KRA approves your eTIMS service request
+        // Once approved: etims_url and receipt_number will populate automatically
+        // Until then: use offline_url as QR (DigiTax hosted receipt) + serial_number as ref
+        const kraReceiptNo = data?.serial_number || data?.id || null;
+        const kraQrUrl     = (data?.etims_url && data.etims_url !== '')
+                           ? data.etims_url      // ← live KRA QR (after approval)
+                           : (data?.offline_url || null); // ← DigiTax hosted fallback
+
+        log.info('[eTIMS] ✅ Sale accepted by DigiTax', {
+            invoice:      payload.trader_invoice_number,
+            status:       data?.status,
+            serialNumber: data?.serial_number,
+            offlineUrl:   data?.offline_url,
+            kraReceiptNo,
+            kraQrUrl
         });
 
-        return {
-            kraReceiptNo: data?.data?.receipt_number || null,
-            kraQrUrl:     data?.data?.etims_url       || null
-        };
+        return { kraReceiptNo, kraQrUrl };
 
     } catch (err) {
         log.warn('[eTIMS] DigiTax call failed (sale still saved):', err.message);
         return null;
     }
 }
-
 
 // ============================================================
 //  2. EMAIL CONFIGURATION
@@ -1979,7 +1995,7 @@ app.post('/api/sell', requireAuth, validateBody({
     }
     try {
         // Fetch item details for price and name (read-only — safe before the atomic decrement)
-        const { data: item, error: fetchError } = await supabase.from('Inventory').select('stock_quantity, item_name, price, digitax_item_id').eq('id', itemId).single();
+        const { data: item, error: fetchError } = await supabase.from('Inventory').select('stock_quantity, item_name, price').eq('id', itemId).single();
         if (fetchError || !item) throw new Error('Item not found.');
 
         // Use server-side values only
@@ -2077,7 +2093,7 @@ app.post('/api/sell', requireAuth, validateBody({
 
         // ── Submit to KRA via DigiTax (non-blocking) ──
         let kraReceiptNo = null, kraQrUrl = null;
-        const etims = await submitSaleToEtims({ invoiceNumber: invoiceNumber || receiptNumber, receiptNumber, itemName, quantity, unitPrice: item.price, paymentMethod, customerName: customerName || null, customerPin: null, digitaxItemId: item.digitax_item_id || null });
+        const etims = await submitSaleToEtims({ invoiceNumber: invoiceNumber || receiptNumber, receiptNumber, itemName, quantity, unitPrice: item.price, paymentMethod, customerName: customerName || null, customerPin: null });
         if (etims) {
             kraReceiptNo = etims.kraReceiptNo;
             kraQrUrl     = etims.kraQrUrl;
