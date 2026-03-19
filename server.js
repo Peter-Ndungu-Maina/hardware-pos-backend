@@ -229,7 +229,7 @@ if (openingQty > 0) {
     const stockPayload = {
         item_id:       digitaxItemId,
         quantity:      openingQty,
-        action:        "add",         // <--- MISSING FIELD CAUSING THE 400 ERROR
+        action:        "ADD",         // <--- MISSING FIELD CAUSING THE 400 ERROR
         movement_type: "04",          // "04" = Incoming Other
         remarks:       "Initial System Upload"
     };
