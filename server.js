@@ -201,24 +201,35 @@ async function registerItemWithEtims(item) {
         const digitaxItemId = data?.id || data?.item_id || null;
         log.info('[eTIMS] ✅ Item registered with DigiTax', { item: item.itemName, digitaxItemId, item_class_code: itemClassCode });
 
-        // Step 2: Submit opening stock to DigiTax so qty shows correctly.
-        // DigiTax tracks stock via sales-with-items (stock out) and purchases-with-items (stock in).
+        // Step 2: Submit opening stock to DigiTax via Purchases endpoint.
+        // DigiTax KE tracks stock qty through the Purchases module (stock-in transactions).
+        // This is what appears in DigiTax under Purchases → shows Purchase No, Receipt No, Amount, Supplier.
         const openingQty = parseFloat(item.stockQty) || 0;
         if (digitaxItemId && openingQty > 0) {
             try {
-                const now       = new Date();
-                const stockDate = now.toISOString().split('T')[0];
-                const unitCost  = parseFloat(item.costPrice) || parseFloat(item.sellingPrice) || 0;
-                const totalCost = parseFloat((unitCost * openingQty).toFixed(2));
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 10000);
 
-                const stockInPayload = {
-                    trader_invoice_number: `INIT-${barCode}-${Date.now()}`,
-                    invoice_number:        Math.abs(parseInt(barCode.slice(-8))) || 1,
-                    receipt_type_code:     'P',
-                    payment_type_code:     '01',
-                    invoice_status_code:   '02',
-                    sale_date:             stockDate,
+                const now        = new Date();
+                const stockDate  = now.toISOString().split('T')[0]; // YYYY-MM-DD
+                const unitCost   = parseFloat(item.costPrice) || parseFloat(item.sellingPrice) || 0;
+                const totalCost  = parseFloat((unitCost * openingQty).toFixed(2));
+                const invoiceRef = `INIT-${barCode}-${Date.now()}`;
+
+                // DigiTax KE v2 purchase payload — matches Purchases table columns:
+                // Purchase No = trader_invoice_number
+                // Receipt No  = invoice_number
+                // Amount      = total_amount
+                // Supplier    = supplier_name (optional)
+                const purchasePayload = {
+                    trader_invoice_number: invoiceRef,
+                    invoice_number:        invoiceRef,
+                    receipt_type_code:     'P',          // P = Purchase
+                    payment_type_code:     '01',         // 01 = Cash
+                    invoice_status_code:   '02',         // 02 = Approved
                     purchase_date:         stockDate,
+                    supplier_name:         'Opening Stock',
+                    supplier_pin:          '',
                     items: [{
                         item_name:             item.itemName,
                         item_class_code:       itemClassCode,
@@ -237,52 +248,68 @@ async function registerItemWithEtims(item) {
                     }]
                 };
 
-                // Helper — no AbortSignal to avoid Node version issues
-                const tryEndpoint = async (endpoint) => {
-                    const controller = new AbortController();
-                    const timer = setTimeout(() => controller.abort(), 10000);
-                    try {
-                        const r = await fetch(`${DIGITAX_BASE_URL}/${endpoint}`, {
-                            method:  'POST',
-                            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
-                            body:    JSON.stringify(stockInPayload),
-                            signal:  controller.signal
-                        });
-                        clearTimeout(timer);
-                        const text = await r.text();
-                        let d = {};
-                        try { d = JSON.parse(text); } catch (_) { d = { raw: text }; }
-                        return { ok: r.ok, status: r.status, data: d };
-                    } catch (e) {
-                        clearTimeout(timer);
-                        throw e;
-                    }
-                };
+                // Try the correct DigiTax KE v2 purchases endpoint
+                const pRes = await fetch(`${DIGITAX_BASE_URL}/purchases`, {
+                    method:  'POST',
+                    headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                    body:    JSON.stringify(purchasePayload),
+                    signal:  controller.signal
+                });
+                clearTimeout(timer);
+                const pText = await pRes.text();
+                let pData = {};
+                try { pData = JSON.parse(pText); } catch (_) { pData = { raw: pText }; }
 
-                // Try purchases-with-items (confirmed working DigiTax KE endpoint)
-                let result = await tryEndpoint('purchases-with-items');
-                log.info('[eTIMS] /purchases-with-items response', {
-                    item: item.itemName, status: result.status, body: JSON.stringify(result.data)
+                log.info('[eTIMS] POST /purchases response', {
+                    item: item.itemName, qty: openingQty,
+                    status: pRes.status, body: JSON.stringify(pData)
                 });
 
-                if (result.ok) {
-                    log.info('[eTIMS] ✅ Opening stock submitted to DigiTax', {
+                if (pRes.ok) {
+                    log.info('[eTIMS] ✅ Opening stock purchase created in DigiTax', {
                         item: item.itemName, qty: openingQty, unitCost
                     });
+                } else if (pRes.status === 404) {
+                    // Try with -with-items suffix
+                    const controller2 = new AbortController();
+                    const timer2 = setTimeout(() => controller2.abort(), 10000);
+                    const pRes2 = await fetch(`${DIGITAX_BASE_URL}/purchases-with-items`, {
+                        method:  'POST',
+                        headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                        body:    JSON.stringify(purchasePayload),
+                        signal:  controller2.signal
+                    });
+                    clearTimeout(timer2);
+                    const pText2 = await pRes2.text();
+                    let pData2 = {};
+                    try { pData2 = JSON.parse(pText2); } catch (_) { pData2 = { raw: pText2 }; }
+                    log.info('[eTIMS] POST /purchases-with-items response', {
+                        item: item.itemName, status: pRes2.status, body: JSON.stringify(pData2)
+                    });
+                    if (pRes2.ok) {
+                        log.info('[eTIMS] ✅ Opening stock created via /purchases-with-items', {
+                            item: item.itemName, qty: openingQty
+                        });
+                    } else {
+                        log.warn('[eTIMS] Opening stock failed on both /purchases endpoints', {
+                            item: item.itemName,
+                            purchases_status: pRes.status,
+                            purchases_with_items_status: pRes2.status,
+                            body: JSON.stringify(pData2)
+                        });
+                    }
                 } else {
-                    log.warn('[eTIMS] Opening stock rejected — DigiTax response', {
+                    log.warn('[eTIMS] Opening stock purchase rejected', {
                         item: item.itemName, qty: openingQty,
-                        status: result.status, body: JSON.stringify(result.data)
+                        status: pRes.status, body: JSON.stringify(pData)
                     });
                 }
             } catch (stockErr) {
-                // Log full error so we can see exactly what went wrong
                 log.warn('[eTIMS] Opening stock exception', {
                     item:    item.itemName,
                     error:   String(stockErr),
                     message: stockErr.message || '(no message)',
-                    name:    stockErr.name,
-                    stack:   (stockErr.stack || '').split('\n').slice(0, 3).join(' | ')
+                    name:    stockErr.name
                 });
             }
         }
