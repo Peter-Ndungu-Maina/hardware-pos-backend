@@ -64,7 +64,7 @@ async function submitSaleToEtims(saleData) {
             sale_date:             saleDate,
             items: [{
                 item_name:             saleData.itemName,
-                item_class_code:       '99010000',  // Goods — valid DigiTax default for all physical products
+                item_class_code:       '5020230600',
                 item_type_code:        '2',
                 item_bar_code:         barCode,
                 item_tax_type_code:    'A',
@@ -123,27 +123,25 @@ async function submitSaleToEtims(saleData) {
 async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
-      // Valid UNSPSC item class codes confirmed by DigiTax
-      // Source: ke.docs.digitax.tech/docs/which-item-class-code-should-i-use
       const classCodeMap = {
-        'Hardware':           '27110000',  // Tools and General Machinery
-        'Tools':              '27110000',  // Hand tools
-        'Paint':              '31210000',  // Coatings and sealants
-        'Electrical':         '39120000',  // Electrical components
-        'Plumbing':           '40170000',  // Plumbing fixtures
-        'Building Materials': '30100000',  // Structures and building components
-        'Fasteners':          '31160000',  // Fasteners and hardware
-        'Safety':             '46180000',  // Safety equipment
-        'Cement':             '30110000',  // Construction materials
-        'General':            '99010000',  // Goods — safe default
-      };
+    'Hardware':            '31162800',
+    'Tools':               '27111700',
+    'Paint':               '31211700',
+    'Electrical':          '39121400',
+    'Plumbing':            '40171700',
+    'Building Materials':  '30101700',
+    'Fasteners':           '31161500',
+    'Safety':              '46181500',
+    'Cement':              '30111700',
+    'General':             '44121700',
+};
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
         const payload = {
             item_name:          item.itemName,
-            item_class_code:    classCodeMap[item.category] || '99010000',
+            item_class_code:    classCodeMap[item.category] || '5020230600',
             item_type_code:     '2',
             item_bar_code:      barCode,
             tax_type_code:      'A',
@@ -174,6 +172,34 @@ async function registerItemWithEtims(item) {
     } catch (err) {
         log.warn('[eTIMS] Item registration failed (product still saved):', err.message);
         return null;
+    }
+}
+
+// ── Sync stock quantity to DigiTax after item registration ────────────────────
+// DigiTax starts every item at 0 stock. We must tell it how much stock we have.
+// Uses PUT /stock/adjust with type 06 (INCOMING ADJUSTMENT)
+async function syncStockWithEtims(digitaxItemId, quantity) {
+    if (!DIGITAX_API_KEY || !digitaxItemId || !quantity) return;
+    try {
+        const res = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+            method:  'PUT',
+            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+            body:    JSON.stringify({
+                item_id:              digitaxItemId,
+                quantity:             parseFloat(quantity),
+                stock_io_code:        '06',   // 06 = INCOMING ADJUSTMENT (initial stock)
+                adjustment_reference: 'INITIAL_STOCK_SYNC'
+            }),
+            signal: AbortSignal.timeout(10000)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            log.warn('[eTIMS] Stock sync failed', { digitaxItemId, body: JSON.stringify(data) });
+        } else {
+            log.info('[eTIMS] ✅ Stock synced to DigiTax', { digitaxItemId, quantity });
+        }
+    } catch (err) {
+        log.warn('[eTIMS] Stock sync error (sale still works):', err.message);
     }
 }
 
@@ -411,6 +437,8 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
             await supabase.from('Inventory')
                 .update({ digitax_item_id: digitaxItemId, kra_registered: true })
                 .eq('id', newItem.id);
+            // ── Sync initial stock quantity to DigiTax ──────────────────────
+            await syncStockWithEtims(digitaxItemId, parseInt(stockQty));
         }
         res.json({
             success:       true,
@@ -433,7 +461,7 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
         if (existing) return res.status(400).json({ success: false, message: `DN "${delivery_number}" already exists.` });
 
         const { data: item, error: fetchErr } = await supabase.from('Inventory')
-            .select('item_name, stock_quantity').eq('id', inventory_id).single();
+            .select('item_name, stock_quantity, digitax_item_id').eq('id', inventory_id).single();
         if (fetchErr) throw fetchErr;
 
         const oldStock = parseInt(item.stock_quantity) || 0;
@@ -464,6 +492,11 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
             timestamp: new Date().toISOString()
         }]);
         if (auditErr2) console.error('Audit log error (RESTOCK_FIFO):', auditErr2.message);
+
+        // ── Sync added stock to DigiTax (code 02 = INCOMING PURCHASE) ──────
+        if (item.digitax_item_id) {
+            await syncStockWithEtims(item.digitax_item_id, added);
+        }
         res.json({ success: true, message: 'Restock successful!' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2024,6 +2057,8 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                 await supabase.from('Inventory')
                     .update({ digitax_item_id: bulkEtimsId, kra_registered: true })
                     .eq('id', newItem.id);
+                // ── Sync initial stock quantity to DigiTax ──────────────────
+                await syncStockWithEtims(bulkEtimsId, qty);
             }
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
