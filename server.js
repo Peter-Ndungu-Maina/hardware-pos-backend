@@ -29,6 +29,38 @@ if (!supabaseUrl || !supabaseKey || !JWT_SECRET) {
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // ============================================================
+//  eTIMS — DigiTax Integration
+// ============================================================
+const DIGITAX_BASE_URL = process.env.DIGITAX_BASE_URL || 'https://api.digitax.tech/ke/v2';
+const DIGITAX_API_KEY  = process.env.DIGITAX_API_KEY  || '';
+
+async function submitSaleToEtims(saleData) {
+    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
+    try {
+        const now  = new Date();
+        const date = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
+        const time = now.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
+        const payMap = { 'Cash':'01', 'M-Pesa':'05', 'Credit':'01' };
+        const payload = {
+            trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
+            date, time,
+            payment_type_code: payMap[saleData.paymentMethod] || '01',
+            customer_pin:  saleData.customerPin  || null,
+            customer_name: saleData.customerName || null,
+            sale_items: [{ item_name: saleData.itemName, quantity: saleData.quantity, unit_price: saleData.unitPrice, tax_type_code: 'A', discount_rate: 0 }]
+        };
+        const res  = await fetch(`${DIGITAX_BASE_URL}/sales`, { method:'POST', headers:{ 'x-api-key': DIGITAX_API_KEY, 'Content-Type':'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
+        const data = await res.json();
+        if (!res.ok) { log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: data }); return null; }
+        log.info('[eTIMS] ✅ Sale submitted to KRA', { invoice: saleData.invoiceNumber, kraReceiptNo: data?.data?.receipt_number });
+        return { kraReceiptNo: data?.data?.receipt_number || null, kraQrUrl: data?.data?.etims_url || null };
+    } catch (err) {
+        log.warn('[eTIMS] DigiTax call failed (sale still saved):', err.message);
+        return null;
+    }
+}
+
+// ============================================================
 //  2. EMAIL CONFIGURATION
 // ============================================================
 const transporter = nodemailer.createTransport({
@@ -1992,7 +2024,18 @@ app.post('/api/sell', requireAuth, validateBody({
 
         if (newStock <= 10) transporter.sendMail({ from: process.env.EMAIL_USER, to: process.env.EMAIL_USER, subject: `⚠️ LOW STOCK: ${itemName}`, text: `${itemName} is down to ${newStock} units.` }, e => { if (e) log.warn('Stock alert email failed', e); });
 
-        res.json({ success: true, message: `Sale recorded. Stock: ${newStock}`, receiptNumber, invoiceNumber, dnNumber, saleId: saleData[0].id });
+        // ── Submit to KRA via DigiTax (non-blocking) ──
+        let kraReceiptNo = null, kraQrUrl = null;
+        const etims = await submitSaleToEtims({ invoiceNumber: invoiceNumber || receiptNumber, receiptNumber, itemName, quantity, unitPrice: item.price, paymentMethod, customerName: customerName || null, customerPin: null });
+        if (etims) {
+            kraReceiptNo = etims.kraReceiptNo;
+            kraQrUrl     = etims.kraQrUrl;
+            if (kraReceiptNo || kraQrUrl) {
+                await supabase.from('Sales').update({ kra_receipt_no: kraReceiptNo || null, kra_qr_url: kraQrUrl || null }).eq('id', saleData[0].id);
+            }
+        }
+
+        res.json({ success: true, message: `Sale recorded. Stock: ${newStock}`, receiptNumber, invoiceNumber, dnNumber, saleId: saleData[0].id, kraReceiptNo, kraQrUrl });
     } catch (err) {
         log.error('Sale error', err);
         res.status(500).json({ success: false, message: err.message });
@@ -2436,11 +2479,74 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
         }]).select('id').single();
         if (recErr) throw recErr;
 
+        // ── Notify KRA via DigiTax eTIMS ────────────────────────────────────
+        // Credit Note  → customer return (wrong_item / other) — reverses original sale
+        // Debit Note   → damaged goods write-off — notifies KRA of stock loss
+        let kraReturnRef = null, kraReturnQrUrl = null;
+        try {
+            const now      = new Date();
+            const date     = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
+            const time     = now.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
+            const returnRef = `RET-${Date.now()}`;
+
+            // Credit note for customer return; debit note for damaged goods
+            const noteType = returnReason === 'damaged' ? 'debit_note' : 'credit_note';
+            const sellingPrice = parseFloat(sellingPriceOriginal || retItem.cost_price || 0);
+
+            const payload = {
+                trader_invoice_number: returnRef,
+                original_invoice_number: originalReceipt || null,
+                note_type:   noteType,
+                date,
+                time,
+                reason:      returnReason === 'damaged'    ? 'Damaged goods write-off'
+                           : returnReason === 'wrong_item' ? 'Wrong item returned'
+                           : 'Customer return',
+                customer_pin:  null,
+                customer_name: customerName || null,
+                sale_items: [{
+                    item_name:     retItem.item_name,
+                    quantity:      retQty,
+                    unit_price:    sellingPrice,
+                    tax_type_code: 'A',
+                    discount_rate: 0
+                }]
+            };
+
+            const etimsRes = await fetch(`${DIGITAX_BASE_URL}/${noteType === 'credit_note' ? 'credit-notes' : 'debit-notes'}`, {
+                method:  'POST',
+                headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                body:    JSON.stringify(payload),
+                signal:  AbortSignal.timeout(10000)
+            });
+            const etimsData = await etimsRes.json();
+
+            if (etimsRes.ok) {
+                kraReturnRef   = etimsData?.data?.receipt_number || returnRef;
+                kraReturnQrUrl = etimsData?.data?.etims_url      || null;
+
+                // Save KRA ref back to returns_log
+                await supabase.from('returns_log')
+                    .update({ kra_return_ref: kraReturnRef, kra_return_qr_url: kraReturnQrUrl })
+                    .eq('id', rec.id);
+
+                log.info(`[eTIMS] ✅ ${noteType} submitted to KRA`, { ref: kraReturnRef, reason: returnReason });
+            } else {
+                log.warn('[eTIMS] Return note rejected by DigiTax', { status: etimsRes.status, body: etimsData });
+            }
+        } catch (etimsErr) {
+            log.warn('[eTIMS] Return eTIMS submission failed (return still saved):', etimsErr.message);
+        }
+
         res.json({
             success: true,
             message: 'Exchange processed. ' + retItem.item_name + ' replaced with ' + repItem.item_name + '.' +
                      (returnReason === 'damaged' ? ' KES ' + costWrittenOff + ' written off as expense.' : ''),
-            returnId: rec && rec.id, expenseId
+            returnId:      rec && rec.id,
+            expenseId,
+            kraReturnRef,
+            kraReturnQrUrl,
+            etimsSubmitted: !!kraReturnRef
         });
     } catch (err) {
         log.error('[RETURNS] Exchange error:', err);
