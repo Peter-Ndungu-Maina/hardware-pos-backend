@@ -37,59 +37,69 @@ const DIGITAX_API_KEY  = process.env.DIGITAX_API_KEY  || '';
 async function submitSaleToEtims(saleData) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
     try {
-        const now         = new Date();
-        // Confirmed working date format: DD/MM/YYYY
-        const saleDate    = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
-        // DigiTax payment codes: 01=Cash, 02=Credit, 06=Mobile Money (M-Pesa)
-        const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
-        const unitPrice   = parseFloat(saleData.unitPrice) || 0;
-        const quantity    = parseFloat(saleData.quantity)  || 1;
-        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
-
-        // Generate numeric barcode from item name (DigiTax requires item_bar_code)
-        const barCode = String(
-            saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
-        ).padStart(8, '0');
-
-        // Numeric invoice number only (strip letters, max 8 digits)
-        const invoiceNum = Math.abs(
-            parseInt((saleData.invoiceNumber || saleData.receiptNumber || '1')
-            .replace(/\D/g, '').slice(-8))
-        ) || 1;
-
+        const now  = new Date();
+        const date = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
+        const time = now.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
+        const payMap = { 'Cash':'01', 'M-Pesa':'05', 'Credit':'01' };
         const payload = {
             trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
-            invoice_number:        invoiceNum,
-            receipt_type_code:     'S',    // S = Sale
-            payment_type_code:     payMap[saleData.paymentMethod] || '01',
-            invoice_status_code:   '02',   // 02 = Approved
-            sale_date:             saleDate,
-            items: [{
-                item_name:             saleData.itemName,
-                item_class_code:       '5020230600',  // General Hardware
-                item_type_code:        '2',            // 2 = Finished Product
-                item_bar_code:         barCode,
-                item_tax_type_code:    'B',            // B = 16% VAT (confirmed from DigiTax response)
-                quantity:              quantity,
-                quantity_unit_code:    'U',            // U = Unit
-                package_unit_code:     'NT',           // NT = Each
-                package_unit_quantity: 1,
-                unit_price:            unitPrice,
-                total_amount:          totalAmount,
-                tax_type_code:         'B',            // B = 16% VAT
-                discount_rate:         0,
-                origin_nation_code:    'KE'
-            }]
+            date, time,
+            payment_type_code: payMap[saleData.paymentMethod] || '01',
+            customer_pin:  saleData.customerPin  || null,
+            customer_name: saleData.customerName || null,
+            sale_items: [{ item_name: saleData.itemName, quantity: saleData.quantity, unit_price: saleData.unitPrice, tax_type_code: 'A', discount_rate: 0 }]
+        };
+        const res  = await fetch(`${DIGITAX_BASE_URL}/sales`, { method:'POST', headers:{ 'x-api-key': DIGITAX_API_KEY, 'Content-Type':'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
+        const data = await res.json();
+        if (!res.ok) { log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: data }); return null; }
+        log.info('[eTIMS] ✅ Sale submitted to KRA', { invoice: saleData.invoiceNumber, kraReceiptNo: data?.data?.receipt_number });
+        return { kraReceiptNo: data?.data?.receipt_number || null, kraQrUrl: data?.data?.etims_url || null };
+    } catch (err) {
+        log.warn('[eTIMS] DigiTax call failed (sale still saved):', err.message);
+        return null;
+    }
+}
+
+// ── Register a new product with DigiTax/KRA ──────────────────────────────────
+// Called when a product is added to inventory (single add + bulk import).
+// Uses /items endpoint — registers the item in KRA's system.
+// Returns the DigiTax item ID to store in the Inventory table.
+async function registerItemWithEtims(item) {
+    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
+    try {
+        // Map POS categories to KRA item class codes
+        const classCodeMap = {
+            'Hardware':          '5020230600',
+            'Tools':             '5020230600',
+            'Paint':             '3116150000',
+            'Electrical':        '3912100000',
+            'Plumbing':          '3018150000',
+            'Building Materials':'3010150000',
+            'Fasteners':         '3116160000',
+            'Safety':            '4618150000',
+            'General':           '5020230600',
+        };
+        const itemClassCode = classCodeMap[item.category] || '5020230600';
+
+        // Generate numeric barcode from item name
+        const barCode = String(
+            item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
+        ).padStart(8, '0');
+
+        const payload = {
+            item_name:          item.itemName,
+            item_class_code:    itemClassCode,
+            item_type_code:     '2',            // 2 = Finished Product
+            item_bar_code:      barCode,
+            tax_type_code:      'A',            // A = 16% VAT
+            default_unit_price: parseFloat(item.sellingPrice) || 0,
+            quantity_unit_code: 'U',            // U = Unit
+            package_unit_code:  'NT',           // NT = Each
+            origin_nation_code: 'KE',
+            active:             true
         };
 
-        log.info('[eTIMS] Submitting to DigiTax', {
-            invoice:   payload.trader_invoice_number,
-            item:      saleData.itemName,
-            total:     totalAmount,
-            sale_date: saleDate
-        });
-
-        const res  = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
+        const res  = await fetch(`${DIGITAX_BASE_URL}/items`, {
             method:  'POST',
             headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
             body:    JSON.stringify(payload),
@@ -98,31 +108,16 @@ async function submitSaleToEtims(saleData) {
         const data = await res.json();
 
         if (!res.ok) {
-            log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: JSON.stringify(data) });
+            log.warn('[eTIMS] Item registration rejected', { status: res.status, item: item.itemName, body: JSON.stringify(data) });
             return null;
         }
 
-        // Sale accepted — status is PENDING until KRA approves your eTIMS service request
-        // Once approved: etims_url and receipt_number will populate automatically
-        // Until then: use offline_url as QR (DigiTax hosted receipt) + serial_number as ref
-        const kraReceiptNo = data?.serial_number || data?.id || null;
-        const kraQrUrl     = (data?.etims_url && data.etims_url !== '')
-                           ? data.etims_url      // ← live KRA QR (after approval)
-                           : (data?.offline_url || null); // ← DigiTax hosted fallback
-
-        log.info('[eTIMS] ✅ Sale accepted by DigiTax', {
-            invoice:      payload.trader_invoice_number,
-            status:       data?.status,
-            serialNumber: data?.serial_number,
-            offlineUrl:   data?.offline_url,
-            kraReceiptNo,
-            kraQrUrl
-        });
-
-        return { kraReceiptNo, kraQrUrl };
+        const digitaxItemId = data?.id || data?.item_id || null;
+        log.info('[eTIMS] ✅ Item registered with DigiTax', { item: item.itemName, digitaxItemId });
+        return digitaxItemId;
 
     } catch (err) {
-        log.warn('[eTIMS] DigiTax call failed (sale still saved):', err.message);
+        log.warn('[eTIMS] Item registration failed (product still saved):', err.message);
         return null;
     }
 }
@@ -349,7 +344,28 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
             timestamp: new Date().toISOString()
         }]);
         if (auditErr1) console.error('Audit log error (INITIAL_STOCK):', auditErr1.message);
-        res.json({ success: true, message: 'Product registered successfully!' });
+
+        // ── Register item with DigiTax/KRA (non-blocking) ──────────────────
+        let digitaxItemId = null;
+        const etimsItem = await registerItemWithEtims({
+            itemName:     itemName,
+            category:     category || 'General',
+            sellingPrice: sellingPrice,
+            unit:         unit || 'PCS'
+        });
+        if (etimsItem) {
+            digitaxItemId = etimsItem;
+            await supabase.from('Inventory')
+                .update({ digitax_item_id: digitaxItemId, kra_registered: true })
+                .eq('id', newItem.id);
+        }
+
+        res.json({
+            success:      true,
+            message:      'Product registered successfully!' + (digitaxItemId ? ' ✅ KRA item registered.' : ' ⚠️ KRA registration pending.'),
+            kraRegistered: !!digitaxItemId,
+            digitaxItemId
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -1945,7 +1961,20 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                 timestamp:    new Date().toISOString()
             }]);
 
-            results.success.push({ itemName, dn });
+            // ── Register item with DigiTax/KRA (non-blocking) ──────────────
+            const etimsBulkItemId = await registerItemWithEtims({
+                itemName:     itemName.trim(),
+                category:     category || 'General',
+                sellingPrice: price,
+                unit:         unit || 'PCS'
+            });
+            if (etimsBulkItemId) {
+                await supabase.from('Inventory')
+                    .update({ digitax_item_id: etimsBulkItemId, kra_registered: true })
+                    .eq('id', newItem.id);
+            }
+
+            results.success.push({ itemName, dn, kraRegistered: !!etimsBulkItemId });
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
         }
