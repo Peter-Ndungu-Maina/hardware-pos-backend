@@ -123,14 +123,25 @@ async function submitSaleToEtims(saleData) {
 async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
-      // ── DIAGNOSTIC: log exact payload before sending ──
+      const classCodeMap = {
+    'Hardware':            '31162800',
+    'Tools':               '27111700',
+    'Paint':               '31211700',
+    'Electrical':          '39121400',
+    'Plumbing':            '40171700',
+    'Building Materials':  '30101700',
+    'Fasteners':           '31161500',
+    'Safety':              '46181500',
+    'Cement':              '30111700',
+    'General':             '44121700',
+};
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
         const payload = {
             item_name:          item.itemName,
-            item_class_code:    '5059690800',  // Exact example from DigiTax docs
+            item_class_code:    5059690800,  // integer — DigiTax requires number not string
             item_type_code:     '2',
             item_bar_code:      barCode,
             tax_type_code:      'A',
@@ -141,7 +152,6 @@ async function registerItemWithEtims(item) {
             active:             true
         };
 
-        log.info('[eTIMS] Item registration payload', { payload: JSON.stringify(payload) });
         const res  = await fetch(`${DIGITAX_BASE_URL}/items`, {
             method:  'POST',
             headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
