@@ -64,7 +64,7 @@ async function submitSaleToEtims(saleData) {
             sale_date:             saleDate,
             items: [{
                 item_name:             saleData.itemName,
-                item_class_code:       '5020230600',
+                item_class_code:       '99010000',  // Goods — valid DigiTax default for all physical products
                 item_type_code:        '2',
                 item_bar_code:         barCode,
                 item_tax_type_code:    'A',
@@ -123,25 +123,27 @@ async function submitSaleToEtims(saleData) {
 async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
+      // Valid UNSPSC item class codes confirmed by DigiTax
+      // Source: ke.docs.digitax.tech/docs/which-item-class-code-should-i-use
       const classCodeMap = {
-    'Hardware':            '31162800',
-    'Tools':               '27111700',
-    'Paint':               '31211700',
-    'Electrical':          '39121400',
-    'Plumbing':            '40171700',
-    'Building Materials':  '30101700',
-    'Fasteners':           '31161500',
-    'Safety':              '46181500',
-    'Cement':              '30111700',
-    'General':             '44121700',
-};
+        'Hardware':           '27110000',  // Tools and General Machinery
+        'Tools':              '27110000',  // Hand tools
+        'Paint':              '31210000',  // Coatings and sealants
+        'Electrical':         '39120000',  // Electrical components
+        'Plumbing':           '40170000',  // Plumbing fixtures
+        'Building Materials': '30100000',  // Structures and building components
+        'Fasteners':          '31160000',  // Fasteners and hardware
+        'Safety':             '46180000',  // Safety equipment
+        'Cement':             '30110000',  // Construction materials
+        'General':            '99010000',  // Goods — safe default
+      };
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
         const payload = {
             item_name:          item.itemName,
-            item_class_code:    5059690800,  // integer — DigiTax requires number not string
+            item_class_code:    classCodeMap[item.category] || '99010000',
             item_type_code:     '2',
             item_bar_code:      barCode,
             tax_type_code:      'A',
