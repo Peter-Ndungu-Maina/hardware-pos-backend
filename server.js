@@ -175,7 +175,9 @@ async function registerItemWithEtims(item) {
             quantity_unit_code: 'U',
             package_unit_code:  'NT',
             origin_nation_code: 'KE',
-            active:             true
+            active:             true,
+            // stock_quantity tells DigiTax the opening stock on registration
+            quantity:           parseFloat(item.stockQty) || 0
         };
 
         log.info('[eTIMS] Registering item with DigiTax', {
@@ -436,7 +438,8 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
         let digitaxItemId = null;
         const etimsItem = await registerItemWithEtims({
             itemName: itemName, category: category || 'General',
-            sellingPrice: sellingPrice, unit: unit || 'PCS'
+            sellingPrice: sellingPrice, unit: unit || 'PCS',
+            stockQty: stockQty || 0
         });
         if (etimsItem) {
             digitaxItemId = etimsItem;
@@ -2046,6 +2049,18 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
             }]);
 
             results.success.push({ itemName, dn });
+
+            // ── Register item with DigiTax/KRA (non-blocking) ──────────────
+            const bulkEtimsId = await registerItemWithEtims({
+                itemName: itemName.trim(), category: category || 'General',
+                sellingPrice: price, unit: unit || 'PCS',
+                stockQty: qty
+            });
+            if (bulkEtimsId) {
+                await supabase.from('Inventory')
+                    .update({ digitax_item_id: bulkEtimsId, kra_registered: true })
+                    .eq('id', newItem.id);
+            }
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
         }
