@@ -169,11 +169,12 @@ async function registerItemWithEtims(item) {
                 const ctl2 = new AbortController();
                 const t2   = setTimeout(() => ctl2.abort(), 10000);
 
+                // DigiTax V2 PUT /stock/adjust requires "action" field (not adjust_type)
                 const adjustPayload = {
                     item_id:       digitaxItemId,
                     quantity:      openingQty,
-                    movement_type: '04',   // "04" = Incoming Other / Opening Stock (V2 code)
-                    adjust_type:   'add',
+                    movement_type: '04',   // "04" = Incoming Other / Opening Stock
+                    action:        'add',  // REQUIRED field — "add" or "remove"
                 };
 
                 const adjRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
@@ -201,7 +202,7 @@ async function registerItemWithEtims(item) {
                     // Fallback: try movement_type "02" (Purchase) instead of "04"
                     const ctl3 = new AbortController();
                     const t3   = setTimeout(() => ctl3.abort(), 10000);
-                    const fallbackPayload = { ...adjustPayload, movement_type: '02' };
+                    const fallbackPayload = { ...adjustPayload, movement_type: '02', action: 'add' };
                     const adjRes2 = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
                         method:  'PUT',
                         headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
