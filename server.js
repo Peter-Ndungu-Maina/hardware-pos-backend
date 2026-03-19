@@ -165,6 +165,9 @@ async function registerItemWithEtims(item) {
 
         const itemClassCode = getEtimsClassCode(item.itemName, item.category);
 
+        // Step 1: Register the item with DigiTax
+        // NOTE: DigiTax /items does NOT accept a quantity field.
+        // Stock is tracked via purchase submissions (step 2), not item registration.
         const payload = {
             item_name:          item.itemName,
             item_class_code:    itemClassCode,
@@ -175,9 +178,7 @@ async function registerItemWithEtims(item) {
             quantity_unit_code: 'U',
             package_unit_code:  'NT',
             origin_nation_code: 'KE',
-            active:             true,
-            // stock_quantity tells DigiTax the opening stock on registration
-            quantity:           parseFloat(item.stockQty) || 0
+            active:             true
         };
 
         log.info('[eTIMS] Registering item with DigiTax', {
@@ -199,6 +200,65 @@ async function registerItemWithEtims(item) {
 
         const digitaxItemId = data?.id || data?.item_id || null;
         log.info('[eTIMS] ✅ Item registered with DigiTax', { item: item.itemName, digitaxItemId, item_class_code: itemClassCode });
+
+        // Step 2: Submit opening stock as a purchase to DigiTax.
+        // DigiTax tracks stock via purchases (stock-in) and sales (stock-out).
+        // Without this, the item shows 0 stock in DigiTax even after registration.
+        const openingQty = parseFloat(item.stockQty) || 0;
+        if (digitaxItemId && openingQty > 0) {
+            try {
+                const now          = new Date();
+                const purchaseDate = now.toISOString().split('T')[0];
+                const unitCost     = parseFloat(item.costPrice) || parseFloat(item.sellingPrice) || 0;
+                const totalCost    = parseFloat((unitCost * openingQty).toFixed(2));
+
+                const purchasePayload = {
+                    trader_invoice_number: `INIT-${barCode}-${Date.now()}`,
+                    invoice_number:        Math.abs(parseInt(barCode.slice(-8))) || 1,
+                    receipt_type_code:     'P',
+                    payment_type_code:     '01',
+                    invoice_status_code:   '02',
+                    purchase_date:         purchaseDate,
+                    items: [{
+                        item_name:             item.itemName,
+                        item_class_code:       itemClassCode,
+                        item_type_code:        '2',
+                        item_bar_code:         barCode,
+                        item_tax_type_code:    'A',
+                        quantity:              openingQty,
+                        quantity_unit_code:    'U',
+                        package_unit_code:     'NT',
+                        package_unit_quantity: 1,
+                        unit_price:            unitCost,
+                        total_amount:          totalCost,
+                        tax_type_code:         'A',
+                        discount_rate:         0,
+                        origin_nation_code:    'KE'
+                    }]
+                };
+
+                const pRes  = await fetch(`${DIGITAX_BASE_URL}/purchases-with-items`, {
+                    method:  'POST',
+                    headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                    body:    JSON.stringify(purchasePayload),
+                    signal:  AbortSignal.timeout(10000)
+                });
+                const pData = await pRes.json();
+
+                if (pRes.ok) {
+                    log.info('[eTIMS] ✅ Opening stock purchase submitted to DigiTax', {
+                        item: item.itemName, qty: openingQty, unitCost
+                    });
+                } else {
+                    log.warn('[eTIMS] Opening stock purchase rejected by DigiTax', {
+                        status: pRes.status, item: item.itemName, body: JSON.stringify(pData)
+                    });
+                }
+            } catch (stockErr) {
+                log.warn('[eTIMS] Opening stock submission failed (item still registered):', stockErr.message);
+            }
+        }
+
         return digitaxItemId;
 
     } catch (err) {
@@ -438,8 +498,8 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
         let digitaxItemId = null;
         const etimsItem = await registerItemWithEtims({
             itemName: itemName, category: category || 'General',
-            sellingPrice: sellingPrice, unit: unit || 'PCS',
-            stockQty: stockQty || 0
+            sellingPrice: sellingPrice, costPrice: costPrice || 0,
+            unit: unit || 'PCS', stockQty: stockQty || 0
         });
         if (etimsItem) {
             digitaxItemId = etimsItem;
@@ -2053,8 +2113,8 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
             // ── Register item with DigiTax/KRA (non-blocking) ──────────────
             const bulkEtimsId = await registerItemWithEtims({
                 itemName: itemName.trim(), category: category || 'General',
-                sellingPrice: price, unit: unit || 'PCS',
-                stockQty: qty
+                sellingPrice: price, costPrice: cost || 0,
+                unit: unit || 'PCS', stockQty: qty
             });
             if (bulkEtimsId) {
                 await supabase.from('Inventory')
