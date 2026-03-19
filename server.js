@@ -220,42 +220,41 @@ async function registerItemWithEtims(item) {
 
         log.info('[eTIMS] ✅ Identity registered', { digitaxItemId });
 
-        // --- STEP 2: SYNC STOCK QUANTITY (THE FIX) ---
-        const openingQty = parseFloat(item.stockQty) || 0;
+        // --- STEP 2: SYNC STOCK QUANTITY (THE FINAL FIX) ---
+const openingQty = parseFloat(item.stockQty) || 0;
 
-        if (openingQty > 0) {
-            log.info(`[eTIMS] Step 2: Pushing opening stock (${openingQty} units)`);
+if (openingQty > 0) {
+    log.info(`[eTIMS] Step 2: Pushing opening stock (${openingQty} units)`);
 
-            // Movement Type "04" = Incoming (Opening Stock/Internal Movement)
-            const stockPayload = {
-                item_id:       digitaxItemId,
-                quantity:      openingQty,
-                movement_type: "04", 
-                remarks:       "Elite Hardware Opening Stock"
-            };
+    const stockPayload = {
+        item_id:       digitaxItemId,
+        quantity:      openingQty,
+        action:        "add",         // <--- MISSING FIELD CAUSING THE 400 ERROR
+        movement_type: "04",          // "04" = Incoming Other
+        remarks:       "Initial System Upload"
+    };
 
-            const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
-                method: 'PUT', // V2 requires PUT for adjustments
-                headers: { 
-                    'x-api-key':    DIGITAX_API_KEY, 
-                    'Content-Type': 'application/json' 
-                },
-                body: JSON.stringify(stockPayload),
-                signal: AbortSignal.timeout(10000)
-            });
+    const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+        method: 'PUT',
+        headers: { 
+            'x-api-key':    DIGITAX_API_KEY, 
+            'Content-Type': 'application/json' 
+        },
+        body: JSON.stringify(stockPayload),
+        signal: AbortSignal.timeout(10000)
+    });
 
-            const stockText = await stockRes.text();
-            
-            if (stockRes.ok) {
-                log.info(`[eTIMS] ✅ Stock qty successfully synced to ${openingQty}`);
-            } else {
-                // This will catch the 405 error if you accidentally used POST
-                log.warn(`[eTIMS] ❌ Stock sync rejected`, { 
-                    status: stockRes.status, 
-                    response: stockText 
-                });
-            }
-        }
+    const stockText = await stockRes.text();
+    
+    if (stockRes.ok) {
+        log.info(`[eTIMS] ✅ Stock qty successfully synced to ${openingQty}`);
+    } else {
+        log.warn(`[eTIMS] ❌ Stock sync rejected`, { 
+            status: stockRes.status, 
+            response: stockText 
+        });
+    }
+}
 
         return digitaxItemId;
 
