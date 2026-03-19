@@ -67,7 +67,7 @@ async function submitSaleToEtims(saleData) {
         let endpoint, payload;
 
         if (saleData.digitaxItemId) {
-            // Item registered — use /sales with item ID (stock tracked correctly)
+            // Item is registered — use /sales with item ID (DigiTax tracks its stock)
             endpoint = `${DIGITAX_BASE_URL}/sales`;
             payload  = { ...baseInvoice, items: [{
                 id:            saleData.digitaxItemId,
@@ -78,11 +78,11 @@ async function submitSaleToEtims(saleData) {
                 discount_rate: 0
             }]};
         } else {
-            // Item not yet registered — use /sales-with-items as fallback
+            // Item not registered — use /sales-with-items as fallback
             endpoint = `${DIGITAX_BASE_URL}/sales-with-items`;
             payload  = { ...baseInvoice, items: [{
                 item_name:             saleData.itemName,
-                item_class_code:       '44121700',
+                item_class_code:       '5059690800',
                 item_type_code:        '2',
                 item_bar_code:         barCode,
                 item_tax_type_code:    'A',
@@ -103,7 +103,6 @@ async function submitSaleToEtims(saleData) {
             item:      saleData.itemName,
             itemId:    saleData.digitaxItemId || 'unregistered',
             total:     totalAmount,
-            sale_date: saleDate,
             endpoint:  saleData.digitaxItemId ? '/sales' : '/sales-with-items'
         });
 
@@ -143,28 +142,15 @@ async function submitSaleToEtims(saleData) {
 async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
-      const classCodeMap = {
-    'hardware':           '31162800',
-    'tools':              '27111700',
-    'paint':              '31211700',
-    'electrical':         '39121400',
-    'plumbing':           '40171700',
-    'building materials': '30101700',
-    'fasteners':          '31161500',
-    'safety':             '46181500',
-    'cement':             '30111700',
-    'general':            '44121700',
-};
-        // Normalise category to lowercase for case-insensitive match
-        const categoryKey = (item.category || 'general').toLowerCase().trim();
-        const itemClassCode = classCodeMap[categoryKey] || '44121700'; // 44121700 = General merchandise (confirmed working)
+      // 5059690800 is the confirmed working code from DigiTax docs example
+      // ke.docs.digitax.tech/docs/item-attributes-items
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
         const payload = {
             item_name:          item.itemName,
-            item_class_code:    itemClassCode,
+            item_class_code:    '5059690800',
             item_type_code:     '2',
             item_bar_code:      barCode,
             tax_type_code:      'A',
@@ -208,7 +194,7 @@ async function syncStockWithEtims(digitaxItemId, quantity) {
             body:    JSON.stringify({
                 item_id:       digitaxItemId,
                 quantity:      parseFloat(quantity),
-                stock_io_code: '06'  // 06 = INCOMING ADJUSTMENT
+                stock_io_code: '06'  // 06 = INCOMING ADJUSTMENT (sets opening stock)
             }),
             signal: AbortSignal.timeout(10000)
         });
