@@ -172,7 +172,7 @@ async function registerItemWithEtims(item) {
             origin_nation_code: 'KE',
             active:             true
         };
-
+        
         const res  = await fetch(`${DIGITAX_BASE_URL}/items`, {
             method:  'POST',
             headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
@@ -186,47 +186,83 @@ async function registerItemWithEtims(item) {
             return null;
         }
 
-        const digitaxItemId = data?.id || data?.item_id || null;
-        log.info('[eTIMS] ✅ Item registered with DigiTax', { item: item.itemName, digitaxItemId });
+        const digitaxItemId = data?.id || data?.item_id || data?.data?.id || null;
+        log.info('[eTIMS] ✅ Identity registered', { item: item.itemName, digitaxItemId });
+
+        // ════════ PHASE 2: IMMEDIATELY UPLOAD STOCK QUANTITY ════════
+        // We use the ID from Phase 1 to push the stock count so KRA doesn't show 0
+        const stockQty = parseFloat(item.stockQty || item.stock_quantity) || 0;
+
+        if (digitaxItemId && stockQty > 0) {
+            log.info(`[eTIMS] Uploading initial stock: ${stockQty} units for ${item.itemName}`);
+
+            const stockPayload = {
+                item_id:       digitaxItemId,
+                quantity:      stockQty,
+                movement_type: '04', // 04 = Opening Stock/Incoming
+                action:        'ADD',
+                remarks:       'Initial System Upload'
+            };
+
+            const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+                method:  'PUT',
+                headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                body:    JSON.stringify(stockPayload),
+                signal:  AbortSignal.timeout(10000)
+            });
+
+            if (stockRes.ok) {
+                log.info('[eTIMS] ✅ Stock quantity successfully uploaded');
+            } else {
+                const stockData = await stockRes.json();
+                log.warn('[eTIMS] ❌ Identity created, but stock upload failed', { body: stockData });
+            }
+        }
+
         return digitaxItemId;
 
     } catch (err) {
-        log.warn('[eTIMS] Item registration failed (product still saved):', err.message);
+        log.warn('[eTIMS] Critical failure during registration/stock push:', err.message);
         return null;
     }
 }
-async function syncStockWithEtims(digitaxItemId, quantity, reason) {
+async function syncStockWithEtims(digitaxItemId, quantity, reason, movementType = '04') {
     if (!DIGITAX_API_KEY || !digitaxItemId) return null;
+    
     try {
         const payload = {
             item_id:       digitaxItemId,
             quantity:      parseFloat(quantity) || 0,
-            movement_type: '04',          // 04 = Stock Increase (opening / restock)
-            action:        'ADD',
-            remarks:       reason || 'Initial System Upload'
+            movement_type: movementType, // '04' for restock/opening, '01' for purchase
+            action:        'ADD',         // Tells KRA to + this to the current balance
+            remarks:       reason || 'Stock Update'
         };
- 
-        const res  = await fetch(`${DIGITAX_BASE_URL}/stock-adjustments`, {
-            method:  'PUT',
-            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+
+        // Use the dedicated stock adjust endpoint
+        const res = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+            method:  'PUT', 
+            headers: { 
+                'x-api-key': DIGITAX_API_KEY, 
+                'Content-Type': 'application/json' 
+            },
             body:    JSON.stringify(payload),
             signal:  AbortSignal.timeout(10000)
         });
+
         const data = await res.json();
- 
+
         if (!res.ok) {
-            log.warn('[eTIMS] Stock sync rejected', { digitaxItemId, quantity, body: JSON.stringify(data) });
+            log.warn('[eTIMS] Stock adjustment rejected', { digitaxItemId, body: data });
             return null;
         }
- 
-        log.info('[eTIMS] ✅ Stock synced with DigiTax', { digitaxItemId, quantity, reason });
+
+        log.info('[eTIMS] ✅ Stock balance updated in DigiTax');
         return data;
     } catch (err) {
-        log.warn('[eTIMS] Stock sync failed (stock still saved):', err.message);
+        log.warn('[eTIMS] Stock sync exception:', err.message);
         return null;
     }
 }
- 
 // ============================================================
 //  2. EMAIL CONFIGURATION
 // ============================================================
