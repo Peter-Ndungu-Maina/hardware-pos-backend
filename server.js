@@ -335,7 +335,10 @@ HTML_PAGES.forEach(page => {
 // ── 4. Root Routes ──────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-    res.sendFile(path.join(pagesPath, 'index.html'));
+    res.status(200).json({ 
+        message: "Elite Hardware POS API is running", 
+        status: "Live" 
+    });
 });
 // ============================================================
 //  4. AUTH MIDDLEWARE
