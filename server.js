@@ -49,18 +49,14 @@ async function submitSaleToEtims(saleData) {
             saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
-        // Numeric invoice number — strip letters then append last 5 digits of ms timestamp
-        // This prevents 409 "trader_invoice_number already used" from DigiTax
-        // e.g. REC-20260320-0001 → base 200260320 + ts suffix 16032 → 20026032016032
-        const baseNum = parseInt(
-            (saleData.invoiceNumber || saleData.receiptNumber || '1')
-            .replace(/\D/g, '').slice(-8)
+        // Numeric invoice number only (strip letters)
+        const invoiceNum = Math.abs(
+            parseInt((saleData.invoiceNumber || saleData.receiptNumber || '1')
+            .replace(/\D/g, '').slice(-8))
         ) || 1;
-        const tsSuffix = String(Date.now()).slice(-5); // last 5 ms digits, unique per call
-        const invoiceNum = parseInt(String(Math.abs(baseNum)) + tsSuffix);
 
         const payload = {
-            trader_invoice_number: (saleData.invoiceNumber || saleData.receiptNumber) + '-' + Date.now(),
+            trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
             invoice_number:        invoiceNum,
             receipt_type_code:     'S',
             payment_type_code:     payMap[saleData.paymentMethod] || '01',
@@ -68,17 +64,17 @@ async function submitSaleToEtims(saleData) {
             sale_date:             saleDate,
             items: [{
                 item_name:             saleData.itemName,
-                item_class_code:       '99010000',
+                item_class_code:       '5020230600',
                 item_type_code:        '2',
                 item_bar_code:         barCode,
-                item_tax_type_code:    'B',  // B = 16% VAT
+                item_tax_type_code:    'A',
                 quantity:              quantity,
                 quantity_unit_code:    'U',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
                 unit_price:            unitPrice,
                 total_amount:          totalAmount,
-                tax_type_code:         'B',  // B = 16% VAT
+                tax_type_code:         'A',
                 discount_rate:         0,
                 origin_nation_code:    'KE'
             }]
@@ -128,33 +124,16 @@ async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
       const classCodeMap = {
-    // Verified against ke.docs.digitax.tech/docs/items-item-classification-table
-    'Hardware':            '27110000',  // Hand tools
-    'Tools':               '27110000',  // Hand tools
-    'Power Tools':         '27110000',  // Tools and General Machinery
-    'Welding':             '27110000',  // Tools and General Machinery
-    'Hydraulics':          '27120000',  // Hydraulic machinery and equipment
-    'Paint':               '31210000',  // Paints and primers and finishes
-    'Electrical':          '39120000',  // Electrical equipment and components and supplies
-    'Lighting':            '39110000',  // Lighting Fixtures and Accessories
-    'Plumbing':            '40170000',  // Pipe piping and pipe fittings
-    'Water Storage':       '40170000',  // Pipe piping and pipe fittings
-    'Building Materials':  '30110000',  // Concrete and cement and plaster
-    'Cement':              '30110000',  // Concrete and cement and plaster
-    'Steel & Metal':       '30100000',  // Structural components and basic shapes
-    'Timber & Wood':       '30130000',  // Structural building products
-    'Fencing':             '30130000',  // Structural building products
-    'Roofing':             '30150000',  // Exterior finishing materials
-    'Tiles & Flooring':    '30160000',  // Interior finishing materials
-    'Insulation':          '30140000',  // Insulation
-    'Doors & Windows':     '30170000',  // Doors and windows and glass
-    'Ladders':             '30190000',  // Construction and maintenance support equipment
-    'Scaffolding':         '30190000',  // Construction and maintenance support equipment
-    'Fasteners':           '31160000',  // Hardware — screws, bolts, nails
-    'Adhesives':           '31200000',  // Adhesives and sealants
-    'Safety':              '46180000',  // Personal safety and protection
-    'Cleaning':            '47130000',  // Cleaning and janitorial supplies
-    'General':             '99010000',  // Goods — safe default
+    'Hardware':            '31162800',
+    'Tools':               '27111700',
+    'Paint':               '31211700',
+    'Electrical':          '39121400',
+    'Plumbing':            '40171700',
+    'Building Materials':  '30101700',
+    'Fasteners':           '31161500',
+    'Safety':              '46181500',
+    'Cement':              '30111700',
+    'General':             '44121700',
 };
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
@@ -162,10 +141,10 @@ async function registerItemWithEtims(item) {
 
         const payload = {
             item_name:          item.itemName,
-            item_class_code:    classCodeMap[item.category] || '99010000',
+            item_class_code:    classCodeMap[item.category] || '5020230600',
             item_type_code:     '2',
             item_bar_code:      barCode,
-            tax_type_code:      'B',  // B = 16% VAT
+            tax_type_code:      'A',
             default_unit_price: parseFloat(item.sellingPrice) || 0,
             quantity_unit_code: 'U',
             package_unit_code:  'NT',
@@ -192,6 +171,42 @@ async function registerItemWithEtims(item) {
 
     } catch (err) {
         log.warn('[eTIMS] Item registration failed (product still saved):', err.message);
+        return null;
+    }
+}
+
+// ── Sync stock quantity with DigiTax/KRA after registration or restock ──────
+// DigiTax endpoint: POST /stock-adjustments
+// Called after registerItemWithEtims succeeds (opening stock)
+// and after every restock (FIFO / bulk) so KRA stock matches POS stock.
+async function syncStockWithEtims(digitaxItemId, quantity, reason) {
+    if (!DIGITAX_API_KEY || !digitaxItemId) return null;
+    try {
+        const payload = {
+            item_id:       digitaxItemId,
+            quantity:      parseFloat(quantity) || 0,
+            movement_type: '04',          // 04 = Stock Increase (opening / restock)
+            action:        'ADD',
+            remarks:       reason || 'Initial System Upload'
+        };
+
+        const res  = await fetch(`${DIGITAX_BASE_URL}/stock-adjustments`, {
+            method:  'POST',
+            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(10000)
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+            log.warn('[eTIMS] Stock sync rejected', { digitaxItemId, quantity, body: JSON.stringify(data) });
+            return null;
+        }
+
+        log.info('[eTIMS] ✅ Stock synced with DigiTax', { digitaxItemId, quantity, reason });
+        return data;
+    } catch (err) {
+        log.warn('[eTIMS] Stock sync failed (stock still saved):', err.message);
         return null;
     }
 }
@@ -430,10 +445,12 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
             await supabase.from('Inventory')
                 .update({ digitax_item_id: digitaxItemId, kra_registered: true })
                 .eq('id', newItem.id);
+            // Sync opening stock quantity with KRA
+            await syncStockWithEtims(digitaxItemId, parseInt(stockQty), 'Initial System Upload');
         }
         res.json({
             success:       true,
-            message:       'Product registered successfully!' + (digitaxItemId ? ' ✅ KRA item registered.' : ' ⚠️ KRA registration pending.'),
+            message:       'Product registered successfully!' + (digitaxItemId ? ' ✅ KRA item registered + stock synced.' : ' ⚠️ KRA registration pending.'),
             kraRegistered: !!digitaxItemId,
             digitaxItemId
         });
@@ -483,6 +500,14 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
             timestamp: new Date().toISOString()
         }]);
         if (auditErr2) console.error('Audit log error (RESTOCK_FIFO):', auditErr2.message);
+
+        // ── Sync restocked quantity with KRA/DigiTax ──────────────────────
+        const { data: restockedItem } = await supabase
+            .from('Inventory').select('digitax_item_id').eq('id', inventory_id).single();
+        if (restockedItem?.digitax_item_id) {
+            await syncStockWithEtims(restockedItem.digitax_item_id, added, `Restock — DN: ${delivery_number}`);
+        }
+
         res.json({ success: true, message: 'Restock successful!' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2043,6 +2068,8 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                 await supabase.from('Inventory')
                     .update({ digitax_item_id: bulkEtimsId, kra_registered: true })
                     .eq('id', newItem.id);
+                // Sync opening stock quantity with KRA
+                await syncStockWithEtims(bulkEtimsId, qty, 'Initial System Upload');
             }
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
@@ -2544,7 +2571,7 @@ app.patch('/api/employees/:id/reset-pin', requireAuth, requireRole('admin'), asy
 // ============================================================
 
 app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
-    const { originalReceipt, kraInvoiceNumber, originalSaleId, customerName, customerPhone,
+    const { originalReceipt, originalSaleId, customerName, customerPhone,
             returnedItemId, returnedQuantity, returnReason,
             replacementItemId, replacementQuantity,
             sellingPriceOriginal, notes } = req.body;
@@ -2660,7 +2687,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
 
             const payload = {
                 trader_invoice_number: returnRef,
-                original_invoice_number: kraInvoiceNumber || originalReceipt || null,
+                original_invoice_number: originalReceipt || null,
                 note_type:   noteType,
                 date,
                 time,
@@ -2673,7 +2700,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
                     item_name:     retItem.item_name,
                     quantity:      retQty,
                     unit_price:    sellingPrice,
-                    tax_type_code: 'B',  // B = 16% VAT
+                    tax_type_code: 'A',
                     discount_rate: 0
                 }]
             };
@@ -2772,7 +2799,7 @@ app.get('/api/returns/search-sale', requireAuth, requireRole('admin', 'manager')
     if (!q) return res.status(400).json({ success: false, message: 'Query q is required.' });
     try {
         const { data, error } = await supabase.from('Sales')
-            .select('id,receipt_number,invoice_number,kra_receipt_no,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
+            .select('id,receipt_number,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
             .or(`customer_name.ilike.%${q}%,customer_phone.ilike.%${q}%,receipt_number.ilike.%${q}%`)
             .eq('is_voided', false)
             .order('sale_date', { ascending: false })
