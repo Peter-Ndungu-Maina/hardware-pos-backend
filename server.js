@@ -207,7 +207,7 @@ async function syncStockWithEtims(digitaxItemId, quantity, reason) {
         };
  
         const res  = await fetch(`${DIGITAX_BASE_URL}/stock-adjustments`, {
-            method:  'POST',
+            method:  'PUT',
             headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
             body:    JSON.stringify(payload),
             signal:  AbortSignal.timeout(10000)
