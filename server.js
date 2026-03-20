@@ -73,16 +73,22 @@ async function submitSaleToEtims(saleData) {
         const saleDate    = now.toISOString().split('T')[0];
         const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
         
-        // --- 16% VAT MATH ---
-        // Assume unitPrice is inclusive (e.g. 1200)
+            // --- 16% VAT MATH FIX ---
         const unitPriceInclusive = parseFloat(saleData.unitPrice) || 0;
         const quantity           = parseFloat(saleData.quantity)  || 1;
-        const totalAmount        = parseFloat((unitPriceInclusive * quantity).toFixed(2));
 
-        // Calculate Tax Breakdown
+        // 1. Get the exclusive unit price and ROUND IT FIRST
         const unitPriceExclusive = parseFloat((unitPriceInclusive / 1.16).toFixed(2));
-        const taxableAmount      = parseFloat((totalAmount / 1.16).toFixed(2));
-        const taxAmount          = parseFloat((totalAmount - taxableAmount).toFixed(2));
+
+        // 2. Calculate the total taxable amount based on the rounded unit price
+        const taxableAmount      = parseFloat((unitPriceExclusive * quantity).toFixed(2));
+
+        // 3. Calculate the tax amount (16% of the taxable amount)
+        const taxAmount          = parseFloat((taxableAmount * 0.16).toFixed(2));
+
+        // 4. THE TOTAL AMOUNT must be the sum of the two rounded figures
+        // This ensures: total_amount === (unit_price * quantity) + tax
+        const totalAmount        = parseFloat((taxableAmount + taxAmount).toFixed(2));
 
         const barCode = String(
             saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
