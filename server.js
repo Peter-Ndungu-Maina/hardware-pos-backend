@@ -65,7 +65,65 @@ function getEtimsClassCode(itemName, category) {
     if (h.includes('helmet') || h.includes('glove')  || h.includes('safety'))  return '46180000';
     return '99010000'; // safe default — Goods
 }
+/**
+ * Submits a Credit Note (Tax Reversal) to DigiTax/KRA
+ * @param {Object} data - Contains originalInvoiceNumber, itemName, quantity, unitPrice, reason
+ */
+async function submitCreditNoteToEtims(data) {
+    if (!process.env.DIGITAX_API_KEY) {
+        console.warn('[eTIMS] No API Key found, skipping Credit Note submission');
+        return { kraReceiptNo: 'OFFLINE-CN-' + Date.now() }; 
+    }
 
+    try {
+        const payload = {
+            // A unique reference for your local system
+            trader_invoice_number: `CN-${Date.now()}`, 
+            // CRITICAL: The exact SCU Invoice No from the original receipt
+            original_invoice_number: data.originalInvoiceNumber, 
+            // 'C' tells KRA this is a Credit Note (Reversal)
+            receipt_type_code: 'C', 
+            invoice_status_code: '02', // 02 = Simplified/Standard
+            sale_date: new Date().toISOString().split('T')[0],
+            items: [{
+                item_name: data.itemName,
+                item_class_code: "40141615", // Default for Hardware/Valves or use your helper
+                item_type_code: '2',         // 2 = Finished Goods
+                item_tax_type_code: 'B',     // B = 16% VAT
+                quantity: data.quantity,
+                unit_price: data.unitPrice,
+                total_amount: parseFloat((data.unitPrice * data.quantity).toFixed(2)),
+                tax_type_code: 'B',
+                tax_rate: 16,
+                origin_nation_code: 'KE'
+            }]
+        };
+
+        const response = await fetch(`${process.env.DIGITAX_BASE_URL}/sales-with-items`, {
+            method: 'POST',
+            headers: { 
+                'x-api-key': process.env.DIGITAX_API_KEY, 
+                'Content-Type': 'application/json' 
+            },
+            body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            console.error('[eTIMS] DigiTax Error:', result);
+            return null;
+        }
+
+        return { 
+            kraReceiptNo: result.serial_number || result.id, // The new Credit Note Number
+            signature: result.signature 
+        };
+    } catch (err) {
+        console.error('[eTIMS] Network Error during Credit Note:', err.message);
+        return null;
+    }
+}
 async function submitSaleToEtims(saleData) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
     try {
@@ -2819,7 +2877,7 @@ app.get('/api/returns/search-sale', requireAuth, requireRole('admin', 'manager')
     if (!q) return res.status(400).json({ success: false, message: 'Query q is required.' });
     try {
         const { data, error } = await supabase.from('Sales')
-            .select('id,receipt_number,invoice_number,kra_receipt_no,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
+            .select('id,receipt_number,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
             .or(`customer_name.ilike.%${q}%,customer_phone.ilike.%${q}%,receipt_number.ilike.%${q}%`)
             .eq('is_voided', false)
             .order('sale_date', { ascending: false })
