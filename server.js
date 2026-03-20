@@ -49,14 +49,18 @@ async function submitSaleToEtims(saleData) {
             saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
-        // Numeric invoice number only (strip letters)
-        const invoiceNum = Math.abs(
-            parseInt((saleData.invoiceNumber || saleData.receiptNumber || '1')
-            .replace(/\D/g, '').slice(-8))
+        // Numeric invoice number — strip letters then append last 5 digits of ms timestamp
+        // This prevents 409 "trader_invoice_number already used" from DigiTax
+        // e.g. REC-20260320-0001 → base 200260320 + ts suffix 16032 → 20026032016032
+        const baseNum = parseInt(
+            (saleData.invoiceNumber || saleData.receiptNumber || '1')
+            .replace(/\D/g, '').slice(-8)
         ) || 1;
+        const tsSuffix = String(Date.now()).slice(-5); // last 5 ms digits, unique per call
+        const invoiceNum = parseInt(String(Math.abs(baseNum)) + tsSuffix);
 
         const payload = {
-            trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
+            trader_invoice_number: (saleData.invoiceNumber || saleData.receiptNumber) + '-' + Date.now(),
             invoice_number:        invoiceNum,
             receipt_type_code:     'S',
             payment_type_code:     payMap[saleData.paymentMethod] || '01',
@@ -67,12 +71,12 @@ async function submitSaleToEtims(saleData) {
                 item_class_code:       '99010000',
                 item_type_code:        '2',
                 item_bar_code:         barCode,
-                item_tax_type_code:    'B',  // B = 16% VAT (standard rate for hardware goods)
+                item_tax_type_code:    'B',  // B = 16% VAT
                 quantity:              quantity,
                 quantity_unit_code:    'U',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
-                unit_price:            unitPrice,   // VAT-inclusive price (KRA expects inclusive pricing)
+                unit_price:            unitPrice,
                 total_amount:          totalAmount,
                 tax_type_code:         'B',  // B = 16% VAT
                 discount_rate:         0,
@@ -161,7 +165,7 @@ async function registerItemWithEtims(item) {
             item_class_code:    classCodeMap[item.category] || '99010000',
             item_type_code:     '2',
             item_bar_code:      barCode,
-            tax_type_code:      'B',  // B = 16% VAT (standard rate for hardware goods)
+            tax_type_code:      'B',  // B = 16% VAT
             default_unit_price: parseFloat(item.sellingPrice) || 0,
             quantity_unit_code: 'U',
             package_unit_code:  'NT',
@@ -2669,7 +2673,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
                     item_name:     retItem.item_name,
                     quantity:      retQty,
                     unit_price:    sellingPrice,
-                    tax_type_code: 'A',
+                    tax_type_code: 'B',  // B = 16% VAT
                     discount_rate: 0
                 }]
             };
