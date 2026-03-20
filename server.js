@@ -34,8 +34,102 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const DIGITAX_BASE_URL = process.env.DIGITAX_BASE_URL || 'https://api.digitax.tech/ke/v2';
 const DIGITAX_API_KEY  = process.env.DIGITAX_API_KEY  || '';
 
-// Valid UNSPSC item class codes confirmed by DigiTax
-// Source: ke.docs.digitax.tech/docs/which-item-class-code-should-i-use
+async function submitSaleToEtims(saleData) {
+    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
+    try {
+        const now         = new Date();
+        const saleDate    = now.toISOString().split('T')[0]; // YYYY-MM-DD ← confirmed working format
+        const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
+        const unitPrice   = parseFloat(saleData.unitPrice) || 0;
+        const quantity    = parseFloat(saleData.quantity)  || 1;
+        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
+
+        // Generate numeric barcode from item name (DigiTax requires item_bar_code)
+        const barCode = String(
+            saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
+        ).padStart(8, '0');
+
+        // Numeric invoice number only (strip letters)
+        const invoiceNum = Math.abs(
+            parseInt((saleData.invoiceNumber || saleData.receiptNumber || '1')
+            .replace(/\D/g, '').slice(-8))
+        ) || 1;
+
+        const baseInvoice = {
+            trader_invoice_number: `${saleData.invoiceNumber || saleData.receiptNumber}-${Date.now()}`,
+            invoice_number:        invoiceNum,
+            receipt_type_code:     'S',
+            payment_type_code:     payMap[saleData.paymentMethod] || '01',
+            invoice_status_code:   '02',
+            sale_date:             saleDate,
+        };
+
+        let endpoint, payload;
+        if (saleData.digitaxItemId) {
+            endpoint = `${DIGITAX_BASE_URL}/sales`;
+            payload  = { ...baseInvoice, items: [{
+                id:            saleData.digitaxItemId,
+                quantity:      quantity,
+                unit_price:    unitPrice,
+                total_amount:  totalAmount,
+                tax_type_code: 'A',
+                discount_rate: 0
+            }]};
+        } else {
+            endpoint = `${DIGITAX_BASE_URL}/sales-with-items`;
+            payload  = { ...baseInvoice, items: [{
+                item_name:             saleData.itemName,
+                item_class_code:       getEtimsClassCode(saleData.itemName, saleData.category),
+                item_type_code:        '2',
+                item_bar_code:         barCode,
+                item_tax_type_code:    'A',
+                quantity:              quantity,
+                quantity_unit_code:    'U',
+                package_unit_code:     'NT',
+                package_unit_quantity: 1,
+                unit_price:            unitPrice,
+                total_amount:          totalAmount,
+                tax_type_code:         'A',
+                discount_rate:         0,
+                origin_nation_code:    'KE'
+            }]};
+        }
+
+        log.info('[eTIMS] Submitting sale', { endpoint: saleData.digitaxItemId ? '/sales' : '/sales-with-items', item: saleData.itemName, total: totalAmount })
+        const res  = await fetch(endpoint, {
+            method:  'POST',
+            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(10000)
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+            log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: JSON.stringify(data) });
+            return null;
+        }
+
+        // Use etims_url when KRA approved, offline_url while still PENDING
+        const kraQrUrl     = (data?.etims_url && data.etims_url !== '') ? data.etims_url : (data?.offline_url || null);
+        const kraReceiptNo = data?.serial_number || data?.id || null;
+
+        log.info('[eTIMS] ✅ Sale accepted by DigiTax', {
+            invoice:      payload.trader_invoice_number,
+            status:       data?.status,
+            kraReceiptNo,
+            offlineUrl:   data?.offline_url
+        });
+
+        return { kraReceiptNo, kraQrUrl };
+
+    } catch (err) {
+        log.warn('[eTIMS] DigiTax call failed (sale still saved):', err.message);
+        return null;
+    }
+}
+
+// ── Register a new product with DigiTax/KRA ──────────────────────────────────
+// Keyword-based item class code lookup — covers all hardware store categories
 const ETIMS_CLASS_CODE_MAP = {
     'Hardware':           '27110000',
     'Tools':              '27110000',
@@ -49,208 +143,87 @@ const ETIMS_CLASS_CODE_MAP = {
     'General':            '99010000',
 };
 
-// Returns the correct DigiTax item_class_code for a given item name + category
 function getEtimsClassCode(itemName, category) {
-    // 1. Exact category match
     if (category && ETIMS_CLASS_CODE_MAP[category]) return ETIMS_CLASS_CODE_MAP[category];
-    // 2. Keyword scan on item name + category
     const h = ((itemName || '') + ' ' + (category || '')).toLowerCase();
-    if (h.includes('cement') || h.includes('concrete')) return '30110000';
-    if (h.includes('paint')  || h.includes('primer') || h.includes('varnish')) return '31210000';
-    if (h.includes('pipe')   || h.includes('plumb')  || h.includes('tap'))     return '40170000';
-    if (h.includes('wire')   || h.includes('cable')  || h.includes('socket') || h.includes('switch') || h.includes('electric')) return '39120000';
-    if (h.includes('nail')   || h.includes('bolt')   || h.includes('screw')  || h.includes('fastener')) return '31160000';
-    if (h.includes('hammer') || h.includes('drill')  || h.includes('tool')   || h.includes('hardware')) return '27110000';
-    if (h.includes('timber') || h.includes('wood')   || h.includes('tile')   || h.includes('roofing'))  return '30100000';
-    if (h.includes('helmet') || h.includes('glove')  || h.includes('safety'))  return '46180000';
-    return '99010000'; // safe default — Goods
+    if (h.includes('cement') || h.includes('concrete'))                                    return '30110000';
+    if (h.includes('paint')  || h.includes('primer')   || h.includes('varnish'))           return '31210000';
+    if (h.includes('pipe')   || h.includes('plumb')    || h.includes('tap'))               return '40170000';
+    if (h.includes('wire')   || h.includes('cable')    || h.includes('socket') ||
+        h.includes('switch') || h.includes('electric'))                                     return '39120000';
+    if (h.includes('nail')   || h.includes('bolt')     || h.includes('screw')  ||
+        h.includes('fastener'))                                                             return '31160000';
+    if (h.includes('hammer') || h.includes('drill')    || h.includes('tool')   ||
+        h.includes('hardware'))                                                             return '27110000';
+    if (h.includes('timber') || h.includes('wood')     || h.includes('tile')   ||
+        h.includes('roofing'))                                                              return '30100000';
+    if (h.includes('helmet') || h.includes('glove')    || h.includes('safety'))            return '46180000';
+    return '99010000';
 }
 
-async function submitSaleToEtims(saleData) {
-    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
+async function registerItemWithEtims(item) {
+    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
-        const now         = new Date();
-        const saleDate    = now.toISOString().split('T')[0];
-        const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
-        
-        // DigiTax strict rule: unit_price * quantity MUST equal total_amount exactly
-        const unitPrice   = parseFloat(saleData.unitPrice) || 0;
-        const quantity    = parseFloat(saleData.quantity)  || 1;
-        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
-
         const barCode = String(
-            saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
+            item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
-        const invoiceNum = Math.abs(
-            parseInt((saleData.invoiceNumber || saleData.receiptNumber || '1')
-            .replace(/\D/g, '').slice(-8))
-        ) || 1;
-
-        const itemClassCode = getEtimsClassCode(saleData.itemName, saleData.category);
-
         const payload = {
-            // Append ms timestamp to guarantee uniqueness — DigiTax rejects duplicate trader_invoice_numbers
-            trader_invoice_number: `${saleData.invoiceNumber || saleData.receiptNumber}-${Date.now()}`,
-            invoice_number:         invoiceNum,
-            receipt_type_code:     'S',
-            payment_type_code:     payMap[saleData.paymentMethod] || '01',
-            invoice_status_code:   '02',
-            sale_date:             saleDate,
-            items: [{
-                item_name:             saleData.itemName,
-                item_class_code:       itemClassCode,
-                item_type_code:        '2',
-                item_bar_code:         barCode,
-                item_tax_type_code:    'B',      // Category A
-                quantity:              quantity,
-                quantity_unit_code:    'U',
-                package_unit_code:     'NT',
-                package_unit_quantity: 1,
-                unit_price:            unitPrice,   // inclusive price: unit_price * qty = total_amount
-                total_amount:          totalAmount,
-                tax_type_code:         'B',
-               discount_rate:         0,
-                origin_nation_code:    'KE'
-            }]
+            item_name:          item.itemName,
+            item_class_code:    getEtimsClassCode(item.itemName, item.category),
+            item_type_code:     '2',
+            item_bar_code:      barCode,
+            tax_type_code:      'A',
+            default_unit_price: parseFloat(item.sellingPrice) || 0,
+            quantity_unit_code: 'U',
+            package_unit_code:  'NT',
+            origin_nation_code: 'KE',
+            active:             true
         };
 
-        log.info('[eTIMS] Submitting sale to DigiTax', { invoice: payload.trader_invoice_number, item: saleData.itemName, unitPrice, quantity, totalAmount });
+        log.info('[eTIMS] Registering item', { item: item.itemName, classCode: payload.item_class_code });
 
-        const res = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
+        const res  = await fetch(`${DIGITAX_BASE_URL}/items`, {
             method:  'POST',
             headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
             body:    JSON.stringify(payload),
             signal:  AbortSignal.timeout(10000)
         });
-        
         const data = await res.json();
 
         if (!res.ok) {
-            log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: JSON.stringify(data) });
+            log.warn('[eTIMS] Item registration rejected', { status: res.status, item: item.itemName, body: JSON.stringify(data) });
             return null;
         }
 
-        const kraQrUrl     = (data?.etims_url && data.etims_url !== '') ? data.etims_url : (data?.offline_url || null);
-        const kraReceiptNo = data?.serial_number || data?.id || null;
-
-        return { kraReceiptNo, kraQrUrl };
-
-    } catch (err) {
-        log.warn('[eTIMS] DigiTax call failed:', err.message);
-        return null;
-    }
-}
-/**
- * Registers an item with DigiTax (KRA eTIMS) and pushes its opening stock.
- * Uses DigiTax KE V2 API: PUT /stock/adjust
- */
-async function registerItemWithEtims(item) {
-    if (!DIGITAX_API_KEY) { 
-        log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); 
-        return null; 
-    }
-
-    try {
-        // 1. Generate a deterministic 8-digit barcode if one isn't provided
-        const barCode = String(
-            item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
-        ).padStart(8, '0');
-
-        const itemClassCode = getEtimsClassCode(item.itemName, item.category);
-
-        // --- STEP 1: REGISTER THE ITEM IDENTITY ---
-        const registerPayload = {
-            item_name:          item.itemName,
-            item_class_code:    itemClassCode,
-            item_type_code:     '2', // Finished Goods
-            item_bar_code:      barCode,
-            tax_type_code:      'B', // 16% VAT
-            default_unit_price: parseFloat(item.sellingPrice) || 0,
-            quantity_unit_code: 'U',  // Units/Pieces
-            package_unit_code:  'NT', // Net
-            origin_nation_code: 'KE',
-            active:             true
-        };
-
-        log.info('[eTIMS] Step 1: Registering item identity', { item: item.itemName });
-
-        const regRes = await fetch(`${DIGITAX_BASE_URL}/items`, {
-            method:  'POST',
-            headers: { 
-                'x-api-key': DIGITAX_API_KEY, 
-                'Content-Type': 'application/json' 
-            },
-            body:    JSON.stringify(registerPayload),
-            signal:  AbortSignal.timeout(10000)
-        });
-
-        const regData = await regRes.json();
-
-        if (!regRes.ok) {
-            log.warn('[eTIMS] ❌ Item registration rejected', { 
-                status: regRes.status, 
-                body: JSON.stringify(regData) 
-            });
-            return null;
-        }
-
-        // Handle both possible DigiTax response formats for ID
-        const digitaxItemId = regData?.id || regData?.data?.id || regData?.item_id || null;
-        
-        if (!digitaxItemId) {
-            log.error('[eTIMS] ❌ Registered but no ID returned from DigiTax');
-            return null;
-        }
-
-        log.info('[eTIMS] ✅ Identity registered', { digitaxItemId });
-
-        // --- STEP 2: SYNC STOCK QUANTITY (THE FINAL FIX) ---
-const openingQty = parseFloat(item.stockQty) || 0;
-
-if (openingQty > 0) {
-    log.info(`[eTIMS] Step 2: Pushing opening stock (${openingQty} units)`);
-
-    const stockPayload = {
-        item_id:       digitaxItemId,
-        quantity:      openingQty,
-        action:        "ADD",         // <--- MISSING FIELD CAUSING THE 400 ERROR
-        movement_type: "04",          // "04" = Incoming Other
-        remarks:       "Initial System Upload"
-    };
-
-    const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
-        method: 'PUT',
-        headers: { 
-            'x-api-key':    DIGITAX_API_KEY, 
-            'Content-Type': 'application/json' 
-        },
-        body: JSON.stringify(stockPayload),
-        signal: AbortSignal.timeout(10000)
-    });
-
-    const stockText = await stockRes.text();
-    
-    if (stockRes.ok) {
-        log.info(`[eTIMS] ✅ Stock qty successfully synced to ${openingQty}`);
-    } else {
-        log.warn(`[eTIMS] ❌ Stock sync rejected`, { 
-            status: stockRes.status, 
-            response: stockText 
-        });
-    }
-}
-
+        const digitaxItemId = data?.id || data?.item_id || null;
+        log.info('[eTIMS] ✅ Item registered with DigiTax', { item: item.itemName, digitaxItemId });
         return digitaxItemId;
 
     } catch (err) {
-        log.error('[eTIMS] Fatal Exception during registration', { 
-            item: item.itemName, 
-            error: err.message 
-        });
+        log.warn('[eTIMS] Item registration failed (product still saved):', err.message);
         return null;
     }
-}// ============================================================
+}
+
+// ── Sync opening stock to DigiTax after item registration ─────────────────────
+async function syncStockWithEtims(digitaxItemId, quantity) {
+    if (!DIGITAX_API_KEY || !digitaxItemId || !quantity) return;
+    try {
+        const res = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+            method:  'PUT',
+            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ item_id: digitaxItemId, quantity: parseFloat(quantity), stock_io_code: '06' }),
+            signal:  AbortSignal.timeout(10000)
+        });
+        const data = await res.json();
+        if (!res.ok) log.warn('[eTIMS] Stock sync failed', { digitaxItemId, body: JSON.stringify(data) });
+        else         log.info('[eTIMS] ✅ Stock synced', { digitaxItemId, quantity });
+    } catch (err) {
+        log.warn('[eTIMS] Stock sync error:', err.message);
+    }
+}
+// ============================================================
 //  2. EMAIL CONFIGURATION
 // ============================================================
 const transporter = nodemailer.createTransport({
@@ -296,16 +269,16 @@ const apiLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-app.use(log.middleware);          // structured JSON request logging
-app.use(sanitizeQuery);           // strip PostgREST injection chars from all query params
-app.use(express.json({ limit: '2mb' })); // Body size cap — prevents oversized bulk import abuse
 
 // FIX: pagesPath must be defined before HTML_PAGES routes use it
-const _root        = path.resolve(__dirname, '..');  // backend/../ = project root (works locally + Render)
+const _root        = path.resolve(__dirname, '..');
 const pagesPath    = path.join(_root, 'frontend');
 const subPagesPath = path.join(_root, 'frontend', 'src', 'pages');
 app.use(express.static(pagesPath));
 app.use(express.static(subPagesPath));
+app.use(log.middleware);          // structured JSON request logging
+app.use(sanitizeQuery);           // strip PostgREST injection chars from all query params
+app.use(express.json({ limit: '2mb' })); // Body size cap — prevents oversized bulk import abuse
 
 
 
@@ -484,14 +457,14 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
         let digitaxItemId = null;
         const etimsItem = await registerItemWithEtims({
             itemName: itemName, category: category || 'General',
-            sellingPrice: sellingPrice, costPrice: costPrice || 0,
-            unit: unit || 'PCS', stockQty: stockQty || 0
+            sellingPrice: sellingPrice, unit: unit || 'PCS'
         });
         if (etimsItem) {
             digitaxItemId = etimsItem;
             await supabase.from('Inventory')
                 .update({ digitax_item_id: digitaxItemId, kra_registered: true })
                 .eq('id', newItem.id);
+            await syncStockWithEtims(digitaxItemId, parseInt(stockQty));
         }
         res.json({
             success:       true,
@@ -2099,13 +2072,13 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
             // ── Register item with DigiTax/KRA (non-blocking) ──────────────
             const bulkEtimsId = await registerItemWithEtims({
                 itemName: itemName.trim(), category: category || 'General',
-                sellingPrice: price, costPrice: cost || 0,
-                unit: unit || 'PCS', stockQty: qty
+                sellingPrice: price, unit: unit || 'PCS'
             });
             if (bulkEtimsId) {
                 await supabase.from('Inventory')
                     .update({ digitax_item_id: bulkEtimsId, kra_registered: true })
                     .eq('id', newItem.id);
+                await syncStockWithEtims(bulkEtimsId, qty);
             }
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
@@ -2156,14 +2129,12 @@ app.post('/api/sell', requireAuth, validateBody({
     }
     try {
         // Fetch item details for price and name (read-only — safe before the atomic decrement)
-        // FIX: fetch category too — needed for DigiTax item_class_code lookup
-        const { data: item, error: fetchError } = await supabase.from('Inventory').select('stock_quantity, item_name, price, category').eq('id', itemId).single();
+        const { data: item, error: fetchError } = await supabase.from('Inventory').select('stock_quantity, item_name, price, category, digitax_item_id').eq('id', itemId).single();
         if (fetchError || !item) throw new Error('Item not found.');
 
         // Use server-side values only
-        const price    = item.price;              // from DB, not client
-        const itemName = item.item_name;          // from DB, not client
-        const category = item.category || 'General'; // FIX: for eTIMS class code lookup
+        const price    = item.price;       // from DB, not client
+        const itemName = item.item_name;   // from DB, not client
 
         const { data: batches, error: batchErr } = await supabase.from('stock_batches').select('*')
             .eq('inventory_id', itemId).gt('remaining_qty', 0).order('created_at', { ascending: true });
@@ -2254,41 +2225,18 @@ app.post('/api/sell', requireAuth, validateBody({
 
         if (newStock <= 10) transporter.sendMail({ from: process.env.EMAIL_USER, to: process.env.EMAIL_USER, subject: `⚠️ LOW STOCK: ${itemName}`, text: `${itemName} is down to ${newStock} units.` }, e => { if (e) log.warn('Stock alert email failed', e); });
 
-        // ── FIX: Submit to KRA via DigiTax — pass category for correct item_class_code ──
+        // ── Submit to KRA via DigiTax (non-blocking) ──
         let kraReceiptNo = null, kraQrUrl = null;
-        const etims = await submitSaleToEtims({
-            invoiceNumber: invoiceNumber || receiptNumber,
-            receiptNumber,
-            itemName,
-            category,        // FIX: ensures correct item_class_code per item type
-            quantity,        // quantity sold — DigiTax uses this to track stock movement
-            unitPrice: item.price,
-            paymentMethod,
-            customerName: customerName || null,
-            customerPin:  null
-        });
+        const etims = await submitSaleToEtims({ invoiceNumber: invoiceNumber || receiptNumber, receiptNumber, itemName, category: item.category, quantity, unitPrice: item.price, paymentMethod, customerName: customerName || null, customerPin: null, digitaxItemId: item.digitax_item_id || null });
         if (etims) {
             kraReceiptNo = etims.kraReceiptNo;
             kraQrUrl     = etims.kraQrUrl;
             if (kraReceiptNo || kraQrUrl) {
-                await supabase.from('Sales').update({
-                    kra_receipt_no: kraReceiptNo || null,
-                    kra_qr_url:     kraQrUrl     || null
-                }).eq('id', saleData[0].id);
+                await supabase.from('Sales').update({ kra_receipt_no: kraReceiptNo || null, kra_qr_url: kraQrUrl || null }).eq('id', saleData[0].id);
             }
         }
 
-        res.json({
-            success: true,
-            message: `Sale recorded. Stock: ${newStock}`,
-            receiptNumber,
-            invoiceNumber,
-            dnNumber,
-            saleId:       saleData[0].id,
-            kraReceiptNo,
-            kraQrUrl,
-            kraRegistered: !!(kraReceiptNo || kraQrUrl)
-        });
+        res.json({ success: true, message: `Sale recorded. Stock: ${newStock}`, receiptNumber, invoiceNumber, dnNumber, saleId: saleData[0].id, kraReceiptNo, kraQrUrl });
     } catch (err) {
         log.error('Sale error', err);
         res.status(500).json({ success: false, message: err.message });
@@ -2632,21 +2580,15 @@ app.patch('/api/employees/:id/reset-pin', requireAuth, requireRole('admin'), asy
 // ============================================================
 
 app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
-    const { 
-        originalReceipt, kraInvoiceNumber, originalSaleId, customerName, customerPhone,
-        returnedItemId, returnedQuantity, returnReason,
-        replacementItemId, replacementQuantity,
-        sellingPriceOriginal, notes 
-    } = req.body;
-
+    const { originalReceipt, originalSaleId, customerName, customerPhone,
+            returnedItemId, returnedQuantity, returnReason,
+            replacementItemId, replacementQuantity,
+            sellingPriceOriginal, notes } = req.body;
     const processedBy = req.user.name;
     const processedRole = req.user.role;
 
-    // 1. Validations
     if (!returnedItemId || !replacementItemId || !returnReason)
         return res.status(400).json({ success: false, message: 'returnedItemId, replacementItemId and returnReason are required.' });
-    // kraInvoiceNumber is used for KRA eTIMS credit/debit note — warn in log if missing but don't block
-    if (!kraInvoiceNumber) log.warn('[RETURNS] Exchange submitted without KRA invoice number — eTIMS note will be unlinked.');
     if (!['damaged','wrong_item','other'].includes(returnReason))
         return res.status(400).json({ success: false, message: 'returnReason must be: damaged, wrong_item or other.' });
 
@@ -2654,114 +2596,161 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
     const repQty = parseInt(replacementQuantity) || 1;
 
     try {
-        // 2. Database Lookups
-        const { data: retItem, error: retErr } = await supabase.from('Inventory').select('*').eq('id', returnedItemId).single();
-        if (retErr || !retItem) return res.status(404).json({ success: false, message: 'Returned item not found.' });
+        const { data: retItem, error: retErr } = await supabase
+            .from('Inventory').select('id,item_name,stock_quantity,cost_price').eq('id', returnedItemId).single();
+        if (retErr || !retItem)
+            return res.status(404).json({ success: false, message: 'Returned item not found.' });
 
-        const { data: repItem, error: repErr } = await supabase.from('Inventory').select('*').eq('id', replacementItemId).single();
-        if (repErr || !repItem) return res.status(404).json({ success: false, message: 'Replacement item not found.' });
+        const { data: repItem, error: repErr } = await supabase
+            .from('Inventory').select('id,item_name,stock_quantity,cost_price').eq('id', replacementItemId).single();
+        if (repErr || !repItem)
+            return res.status(404).json({ success: false, message: 'Replacement item not found.' });
 
         if (parseInt(repItem.stock_quantity) < repQty)
-            return res.status(400).json({ success: false, message: `Not enough stock for replacement. Available: ${repItem.stock_quantity} ${repItem.item_name}.` });
+            return res.status(400).json({ success: false, message: 'Not enough stock for replacement. Available: ' + repItem.stock_quantity + ' ' + repItem.item_name + '.' });
 
-        // 3. KRA COMPLIANCE CALLS (Must happen before DB updates to ensure sync)
-        
-        // A. Reverse original tax (Credit Note)
-        const creditNote = await submitCreditNoteToEtims({
-            originalInvoiceNumber: kraInvoiceNumber,
-            itemName: retItem.item_name,
-            quantity: retQty,
-            unitPrice: sellingPriceOriginal,
-            reason: returnReason
-        });
-        if (!creditNote) throw new Error('KRA Credit Note failed. Aborting exchange to maintain tax sync.');
-
-        // B. Record new tax (New Sale Receipt)
-        const replacementSale = await submitSaleToEtims({
-            itemName: repItem.item_name,
-            quantity: repQty,
-            unitPrice: sellingPriceOriginal, // Assuming even value swap
-            category: repItem.category,
-            paymentMethod: 'Credit', 
-            invoiceNumber: `EXCH-${originalReceipt || Date.now()}`
-        });
-        if (!replacementSale) throw new Error('KRA Replacement Receipt failed. Aborting exchange.');
-
-        // 4. Inventory & Expense Logic (Your detailed calculations)
         const costWrittenOff = parseFloat(retItem.cost_price || 0) * retQty;
-        const retOldStock = parseInt(retItem.stock_quantity);
-        const retNewStock = returnReason === 'damaged' ? retOldStock : retOldStock + retQty;
-        const repOldStock = parseInt(repItem.stock_quantity);
-        const repNewStock = repOldStock - repQty;
+        const retOldStock    = parseInt(retItem.stock_quantity);
+        const retNewStock    = returnReason === 'damaged' ? retOldStock : retOldStock + retQty;
+        const repOldStock    = parseInt(repItem.stock_quantity);
+        const repNewStock    = repOldStock - repQty;
 
         if (returnReason !== 'damaged') {
-            await supabase.from('Inventory').update({ stock_quantity: retNewStock }).eq('id', returnedItemId);
+            const { error: inErr } = await supabase.from('Inventory').update({ stock_quantity: retNewStock }).eq('id', returnedItemId);
+            if (inErr) throw inErr;
         }
-        await supabase.from('Inventory').update({ stock_quantity: repNewStock }).eq('id', replacementItemId);
+
+        const { error: outErr } = await supabase.from('Inventory').update({ stock_quantity: repNewStock }).eq('id', replacementItemId);
+        if (outErr) throw outErr;
 
         let expenseId = null;
         if (returnReason === 'damaged' && costWrittenOff > 0) {
-            const { data: exp } = await supabase.from('expenses').insert([{
-                description: `Exchange Write-off — ${retItem.item_name} (damaged, qty: ${retQty})`,
-                category: 'Damaged Goods',
-                amount: costWrittenOff,
-                spent_by: processedBy,
+            const { data: exp, error: expErr } = await supabase.from('expenses').insert([{
+                description:  'Exchange Write-off — ' + retItem.item_name + ' (returned damaged, qty: ' + retQty + ')',
+                category:     'Damaged Goods',
+                amount:       costWrittenOff,
+                spent_by:     processedBy,
                 expense_date: new Date().toISOString()
             }]).select('id').single();
-            expenseId = exp?.id;
+            if (expErr) console.error('[RETURNS] Expense error:', expErr.message);
+            else expenseId = exp && exp.id;
         }
 
-        // 5. Audit Logging (Preserving your original audit trail)
         const auditRows = [
             {
                 performed_by: processedBy,
-                action: returnReason === 'damaged' ? 'DAMAGE_WRITEOFF' : 'EXCHANGE_IN',
-                item_name: retItem.item_name,
-                old_stock: retOldStock, added_qty: returnReason === 'damaged' ? 0 : retQty, new_stock: retNewStock,
-                details: `EXCHANGE IN (KRA CN: ${creditNote.kraReceiptNo}). Reason: ${returnReason.toUpperCase()}. Original Receipt: ${originalReceipt}`,
-                timestamp: new Date().toISOString()
+                action:       returnReason === 'damaged' ? 'DAMAGE_WRITEOFF' : 'EXCHANGE_IN',
+                item_name:    retItem.item_name,
+                old_stock:    retOldStock, added_qty: returnReason === 'damaged' ? 0 : retQty, new_stock: retNewStock,
+                details:      'EXCHANGE — ' + retItem.item_name + ' returned (' + returnReason.toUpperCase() + '). Customer: ' + (customerName||'N/A') + ' | Receipt: ' + (originalReceipt||'N/A') + ' | By: ' + processedBy,
+                timestamp:    new Date().toISOString()
             },
             {
                 performed_by: processedBy,
-                action: 'EXCHANGE_OUT',
-                item_name: repItem.item_name,
-                old_stock: repOldStock, added_qty: -repQty, new_stock: repNewStock,
-                details: `EXCHANGE OUT (KRA REC: ${replacementSale.kraReceiptNo}). Issued for ${retItem.item_name}.`,
-                timestamp: new Date().toISOString()
+                action:       'EXCHANGE_OUT',
+                item_name:    repItem.item_name,
+                old_stock:    repOldStock, added_qty: -repQty, new_stock: repNewStock,
+                details:      'EXCHANGE — ' + repItem.item_name + ' issued as replacement for ' + retItem.item_name + '. Customer: ' + (customerName||'N/A') + ' | By: ' + processedBy,
+                timestamp:    new Date().toISOString()
             }
         ];
+        if (returnReason === 'damaged' && costWrittenOff > 0) {
+            auditRows.push({
+                performed_by: processedBy,
+                action:       'DAMAGE_WRITEOFF',
+                item_name:    retItem.item_name,
+                old_stock:    retOldStock, added_qty: 0, new_stock: retOldStock,
+                details:      'DAMAGE WRITE-OFF — KES ' + costWrittenOff + ' expense logged for ' + retItem.item_name + ' (x' + retQty + '). Expense ID: ' + (expenseId||'N/A'),
+                timestamp:    new Date().toISOString()
+            });
+        }
         await supabase.from('audit_logs').insert(auditRows);
 
-        // 6. Detailed Returns Log (Now includes KRA signatures)
-        const { data: rec } = await supabase.from('returns_log').insert([{
-            original_receipt: originalReceipt,
-            original_sale_id: originalSaleId,
-            customer_name: customerName,
-            returned_item_id: returnedItemId,
-            returned_item_name: retItem.item_name,
-            returned_quantity: retQty,
-            return_reason: returnReason,
-            replacement_item_id: replacementItemId,
-            replacement_item_name: repItem.item_name,
+        const { data: rec, error: recErr } = await supabase.from('returns_log').insert([{
+            original_receipt: originalReceipt||null, original_sale_id: originalSaleId||null,
+            customer_name: customerName||null, customer_phone: customerPhone||null,
+            returned_item_id: returnedItemId, returned_item_name: retItem.item_name,
+            returned_quantity: retQty, return_reason: returnReason,
+            replacement_item_id: replacementItemId, replacement_item_name: repItem.item_name,
             replacement_quantity: repQty,
             cost_price_written_off: costWrittenOff,
-            selling_price_original: parseFloat(sellingPriceOriginal || 0),
-            kra_credit_note_no: creditNote.kraReceiptNo,       // Mandatory for KRA Audit
-            kra_replacement_receipt_no: replacementSale.kraReceiptNo, // Mandatory for KRA Audit
-            processed_by: processedBy,
-            expense_id: expenseId,
-            notes: notes
+            selling_price_original: parseFloat(sellingPriceOriginal||0),
+            processed_by: processedBy, processed_by_role: processedRole,
+            expense_id: expenseId, notes: notes||null
         }]).select('id').single();
+        if (recErr) throw recErr;
+
+        // ── Notify KRA via DigiTax eTIMS ────────────────────────────────────
+        // Credit Note  → customer return (wrong_item / other) — reverses original sale
+        // Debit Note   → damaged goods write-off — notifies KRA of stock loss
+        let kraReturnRef = null, kraReturnQrUrl = null;
+        try {
+            const now      = new Date();
+            const date     = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
+            const time     = now.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
+            const returnRef = `RET-${Date.now()}`;
+
+            // Credit note for customer return; debit note for damaged goods
+            const noteType = returnReason === 'damaged' ? 'debit_note' : 'credit_note';
+            const sellingPrice = parseFloat(sellingPriceOriginal || retItem.cost_price || 0);
+
+            const payload = {
+                trader_invoice_number: returnRef,
+                original_invoice_number: originalReceipt || null,
+                note_type:   noteType,
+                date,
+                time,
+                reason:      returnReason === 'damaged'    ? 'Damaged goods write-off'
+                           : returnReason === 'wrong_item' ? 'Wrong item returned'
+                           : 'Customer return',
+                customer_pin:  null,
+                customer_name: customerName || null,
+                sale_items: [{
+                    item_name:     retItem.item_name,
+                    quantity:      retQty,
+                    unit_price:    sellingPrice,
+                    tax_type_code: 'A',
+                    discount_rate: 0
+                }]
+            };
+
+            const etimsRes = await fetch(`${DIGITAX_BASE_URL}/${noteType === 'credit_note' ? 'credit-notes' : 'debit-notes'}`, {
+                method:  'POST',
+                headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                body:    JSON.stringify(payload),
+                signal:  AbortSignal.timeout(10000)
+            });
+            const etimsData = await etimsRes.json();
+
+            if (etimsRes.ok) {
+                kraReturnRef   = etimsData?.data?.receipt_number || returnRef;
+                kraReturnQrUrl = etimsData?.data?.etims_url      || null;
+
+                // Save KRA ref back to returns_log
+                await supabase.from('returns_log')
+                    .update({ kra_return_ref: kraReturnRef, kra_return_qr_url: kraReturnQrUrl })
+                    .eq('id', rec.id);
+
+                log.info(`[eTIMS] ✅ ${noteType} submitted to KRA`, { ref: kraReturnRef, reason: returnReason });
+            } else {
+                log.warn('[eTIMS] Return note rejected by DigiTax', { status: etimsRes.status, body: etimsData });
+            }
+        } catch (etimsErr) {
+            log.warn('[eTIMS] Return eTIMS submission failed (return still saved):', etimsErr.message);
+        }
 
         res.json({
             success: true,
-            message: `Exchange processed. KRA Credit Note: ${creditNote.kraReceiptNo}. Replacement: ${replacementSale.kraReceiptNo}`,
-            returnId: rec?.id,
-            expenseId
+            message: 'Exchange processed. ' + retItem.item_name + ' replaced with ' + repItem.item_name + '.' +
+                     (returnReason === 'damaged' ? ' KES ' + costWrittenOff + ' written off as expense.' : ''),
+            returnId:      rec && rec.id,
+            expenseId,
+            kraReturnRef,
+            kraReturnQrUrl,
+            etimsSubmitted: !!kraReturnRef
         });
-
     } catch (err) {
-        log.error('[RETURNS] Exchange error:', err.message);
+        log.error('[RETURNS] Exchange error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
@@ -2819,7 +2808,7 @@ app.get('/api/returns/search-sale', requireAuth, requireRole('admin', 'manager')
     if (!q) return res.status(400).json({ success: false, message: 'Query q is required.' });
     try {
         const { data, error } = await supabase.from('Sales')
-            .select('id,receipt_number,invoice_number,kra_receipt_no,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
+            .select('id,receipt_number,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
             .or(`customer_name.ilike.%${q}%,customer_phone.ilike.%${q}%,receipt_number.ilike.%${q}%`)
             .eq('is_voided', false)
             .order('sale_date', { ascending: false })
