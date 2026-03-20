@@ -67,60 +67,89 @@ function getEtimsClassCode(itemName, category) {
 }
 
 async function submitSaleToEtims(saleData) {
-    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
+    if (!DIGITAX_API_KEY) { 
+        log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); 
+        return null; 
+    }
+
     try {
         const now         = new Date();
         const saleDate    = now.toISOString().split('T')[0];
-        const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
+        const payMap      = { 'Cash': '01', 'M-Pesa': '06', 'Credit': '02' };
 
         // --- 16% VAT MATH FIX (THE KRA WAY) ---
-        const unitPrice   = parseFloat(saleData.unitPrice) || 0; 
-        const quantity    = parseFloat(saleData.quantity)  || 1;
-        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
+        // eTIMS Strict Rule: total_amount MUST exactly equal unit_price * quantity
+        const unitPrice   = parseFloat(saleData.unitPrice) || 0; // Inclusive price (e.g., 1200)
+        const quantity    = parseFloat(saleData.quantity)  || 1; // e.g., 2
+        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2)); // e.g., 2400
 
-        // 1. Calculate Tax Amount first (The 16% slice of the inclusive total)
-        // Formula: Total - (Total / 1.16)
-        const taxAmount = parseFloat((totalAmount - (totalAmount / 1.16)).toFixed(2));
-
-        // 2. Calculate Taxable Amount (The base price)
-        // Formula: Total - Tax Amount
-        // This ensures: taxableAmount + taxAmount === totalAmount
+        /**
+         * MATH REFINEMENT:
+         * To avoid floating point errors (e.g., 0.01 discrepancies), 
+         * we calculate the Tax Amount first and then subtract it from the total 
+         * to get the Taxable Amount.
+         */
+        const taxAmount     = parseFloat((totalAmount - (totalAmount / 1.16)).toFixed(2));
         const taxableAmount = parseFloat((totalAmount - taxAmount).toFixed(2));
 
-        // ... rest of your code ...
+        const barCode = String(
+            saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
+        ).padStart(8, '0');
+
+        // Extract last 8 digits of invoice/receipt number to ensure numeric compatibility
+        const invoiceNum = Math.abs(
+            parseInt((saleData.invoiceNumber || saleData.receiptNumber || '1')
+            .replace(/\D/g, '').slice(-8))
+        ) || 1;
+
+        const itemClassCode = getEtimsClassCode(saleData.itemName, saleData.category);
 
         const payload = {
-            // ... invoice headers ...
+            trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
+            invoice_number:        invoiceNum,
+            receipt_type_code:     'S', // Sale
+            payment_type_code:     payMap[saleData.paymentMethod] || '01',
+            invoice_status_code:   '02', // Finalized
+            sale_date:             saleDate,
             items: [{
                 item_name:             saleData.itemName,
                 item_class_code:       itemClassCode,
-                item_type_code:        '2',
+                item_type_code:        '2', // Finished Goods
                 item_bar_code:         barCode,
-                item_tax_type_code:    'B', // 16% Standard Rate
-                quantity:              quantity,
-                quantity_unit_code:    'U',
-                package_unit_code:     'NT',
-                package_unit_quantity: 1,
-                unit_price:            unitPrice,     // 1200
-                total_amount:          totalAmount,   // 2400
-                tax_type_code:         'B',           // Matching Category B
+                
+                // --- CATEGORY B (16% VAT) ---
+                item_tax_type_code:    'B', 
+                tax_type_code:         'B',
                 tax_rate:              16,
-                tax_amount:            taxAmount,     // Exactly 331.03
+                
+                quantity:              quantity,
+                quantity_unit_code:    'U',  // Units
+                package_unit_code:     'NT', // Net
+                package_unit_quantity: 1,
+                
+                unit_price:            unitPrice,    
+                total_amount:          totalAmount,  
+                tax_amount:            taxAmount,    
+                
                 discount_rate:         0,
                 origin_nation_code:    'KE'
             }]
         };
-        log.info('[eTIMS] Submitting with strict inclusive math', {
+
+        log.info('[eTIMS] Submitting Category B sale with refined math', {
             invoice: payload.trader_invoice_number,
             item: saleData.itemName,
-            unitPrice,
-            totalAmount,
-            taxAmount
+            total: totalAmount,
+            tax: taxAmount,
+            taxable: taxableAmount
         });
 
         const res = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
             method:  'POST',
-            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+            headers: { 
+                'x-api-key': DIGITAX_API_KEY, 
+                'Content-Type': 'application/json' 
+            },
             body:    JSON.stringify(payload),
             signal:  AbortSignal.timeout(10000)
         });
@@ -128,10 +157,14 @@ async function submitSaleToEtims(saleData) {
         const data = await res.json();
 
         if (!res.ok) {
-            log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: JSON.stringify(data) });
+            log.warn('[eTIMS] DigiTax rejected sale', { 
+                status: res.status, 
+                body: JSON.stringify(data) 
+            });
             return null;
         }
 
+        // Capture QR URL and KRA Serial Number
         const kraQrUrl     = (data?.etims_url && data.etims_url !== '') ? data.etims_url : (data?.offline_url || null);
         const kraReceiptNo = data?.serial_number || data?.id || null;
 
