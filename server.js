@@ -106,14 +106,14 @@ async function submitSaleToEtims(saleData) {
                 item_class_code:       itemClassCode,
                 item_type_code:        '2',
                 item_bar_code:         barCode,
-                item_tax_type_code:    'A', // Category A (16%)
+                item_tax_type_code:    'B', // Category A (16%)
                 quantity:              quantity,
                 quantity_unit_code:    'U',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
                 unit_price:            unitPrice,      // 1200 
                 total_amount:          totalAmount,    // 2400 (Math is now perfect)
-                tax_type_code:         'A',
+                tax_type_code:         'B',
                 tax_rate:              16,             // Tells KRA to extract 16% from the total
                 tax_amount:            taxAmount,      // 331.03
                 discount_rate:         0,
@@ -179,7 +179,7 @@ async function registerItemWithEtims(item) {
             item_class_code:    itemClassCode,
             item_type_code:     '2', // Finished Goods
             item_bar_code:      barCode,
-            tax_type_code:      'A', // 16% VAT
+            tax_type_code:      'B', // 16% VAT
             default_unit_price: parseFloat(item.sellingPrice) || 0,
             quantity_unit_code: 'U',  // Units/Pieces
             package_unit_code:  'NT', // Net
