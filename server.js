@@ -72,23 +72,16 @@ async function submitSaleToEtims(saleData) {
         const now         = new Date();
         const saleDate    = now.toISOString().split('T')[0];
         const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
-        
-            // --- 16% VAT MATH FIX ---
-        const unitPriceInclusive = parseFloat(saleData.unitPrice) || 0;
-        const quantity           = parseFloat(saleData.quantity)  || 1;
 
-        // 1. Get the exclusive unit price and ROUND IT FIRST
-        const unitPriceExclusive = parseFloat((unitPriceInclusive / 1.16).toFixed(2));
+        // --- 16% VAT MATH FIX (THE KRA WAY) ---
+        // eTIMS Strict Rule: total_amount MUST exactly equal unit_price * quantity
+        const unitPrice   = parseFloat(saleData.unitPrice) || 0; // Inclusive price (e.g., 1200)
+        const quantity    = parseFloat(saleData.quantity)  || 1; // e.g., 2
+        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2)); // e.g., 2400
 
-        // 2. Calculate the total taxable amount based on the rounded unit price
-        const taxableAmount      = parseFloat((unitPriceExclusive * quantity).toFixed(2));
-
-        // 3. Calculate the tax amount (16% of the taxable amount)
-        const taxAmount          = parseFloat((taxableAmount * 0.16).toFixed(2));
-
-        // 4. THE TOTAL AMOUNT must be the sum of the two rounded figures
-        // This ensures: total_amount === (unit_price * quantity) + tax
-        const totalAmount        = parseFloat((taxableAmount + taxAmount).toFixed(2));
+        // Reverse-calculate the tax from the strict total so the PDF prints correctly
+        const taxableAmount = parseFloat((totalAmount / 1.16).toFixed(2));
+        const taxAmount     = parseFloat((totalAmount - taxableAmount).toFixed(2));
 
         const barCode = String(
             saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
@@ -103,7 +96,7 @@ async function submitSaleToEtims(saleData) {
 
         const payload = {
             trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
-            invoice_number:         invoiceNum,
+            invoice_number:        invoiceNum,
             receipt_type_code:     'S',
             payment_type_code:     payMap[saleData.paymentMethod] || '01',
             invoice_status_code:   '02',
@@ -113,24 +106,26 @@ async function submitSaleToEtims(saleData) {
                 item_class_code:       itemClassCode,
                 item_type_code:        '2',
                 item_bar_code:         barCode,
-                item_tax_type_code:    'A',      // Category A
+                item_tax_type_code:    'A', // Category A (16%)
                 quantity:              quantity,
                 quantity_unit_code:    'U',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
-                unit_price:            unitPriceExclusive, // Price BEFORE tax
-                total_amount:          totalAmount,        // Price AFTER tax
+                unit_price:            unitPrice,      // 1200 
+                total_amount:          totalAmount,    // 2400 (Math is now perfect)
                 tax_type_code:         'A',
-                tax_rate:              16,                 // <--- FIX: Added explicit 16%
-                tax_amount:            taxAmount,          // <--- FIX: Added calculated tax
+                tax_rate:              16,             // Tells KRA to extract 16% from the total
+                tax_amount:            taxAmount,      // 331.03
                 discount_rate:         0,
                 origin_nation_code:    'KE'
             }]
         };
 
-        log.info('[eTIMS] Submitting with 16% VAT breakdown', {
+        log.info('[eTIMS] Submitting with strict inclusive math', {
             invoice: payload.trader_invoice_number,
             item: saleData.itemName,
+            unitPrice,
+            totalAmount,
             taxAmount
         });
 
@@ -140,7 +135,7 @@ async function submitSaleToEtims(saleData) {
             body:    JSON.stringify(payload),
             signal:  AbortSignal.timeout(10000)
         });
-        
+
         const data = await res.json();
 
         if (!res.ok) {
@@ -150,6 +145,8 @@ async function submitSaleToEtims(saleData) {
 
         const kraQrUrl     = (data?.etims_url && data.etims_url !== '') ? data.etims_url : (data?.offline_url || null);
         const kraReceiptNo = data?.serial_number || data?.id || null;
+
+        log.info('[eTIMS] ✅ Sale accepted by DigiTax', { kraReceiptNo });
 
         return { kraReceiptNo, kraQrUrl };
 
