@@ -2523,15 +2523,23 @@ app.patch('/api/employees/:id/reset-pin', requireAuth, requireRole('admin'), asy
 // ============================================================
 
 app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
-    const { originalReceipt, originalSaleId, customerName, customerPhone,
-            returnedItemId, returnedQuantity, returnReason,
-            replacementItemId, replacementQuantity,
-            sellingPriceOriginal, notes } = req.body;
+    const { 
+        originalReceipt, kraInvoiceNumber, originalSaleId, customerName, customerPhone,
+        returnedItemId, returnedQuantity, returnReason,
+        replacementItemId, replacementQuantity,
+        sellingPriceOriginal, notes 
+    } = req.body;
+
     const processedBy = req.user.name;
     const processedRole = req.user.role;
 
+    // 1. STACK VALIDATIONS
     if (!returnedItemId || !replacementItemId || !returnReason)
         return res.status(400).json({ success: false, message: 'returnedItemId, replacementItemId and returnReason are required.' });
+    
+    if (!kraInvoiceNumber)
+        return res.status(400).json({ success: false, message: 'Original KRA Invoice Number is required for tax reversal.' });
+
     if (!['damaged','wrong_item','other'].includes(returnReason))
         return res.status(400).json({ success: false, message: 'returnReason must be: damaged, wrong_item or other.' });
 
@@ -2539,25 +2547,51 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
     const repQty = parseInt(replacementQuantity) || 1;
 
     try {
+        // 2. DATABASE LOOKUPS (FETCH FULL ITEM PROFILES)
         const { data: retItem, error: retErr } = await supabase
-            .from('Inventory').select('id,item_name,stock_quantity,cost_price').eq('id', returnedItemId).single();
+            .from('Inventory').select('id,item_name,stock_quantity,cost_price,category').eq('id', returnedItemId).single();
         if (retErr || !retItem)
             return res.status(404).json({ success: false, message: 'Returned item not found.' });
 
         const { data: repItem, error: repErr } = await supabase
-            .from('Inventory').select('id,item_name,stock_quantity,cost_price').eq('id', replacementItemId).single();
+            .from('Inventory').select('id,item_name,stock_quantity,cost_price,category').eq('id', replacementItemId).single();
         if (repErr || !repItem)
             return res.status(404).json({ success: false, message: 'Replacement item not found.' });
 
         if (parseInt(repItem.stock_quantity) < repQty)
             return res.status(400).json({ success: false, message: 'Not enough stock for replacement. Available: ' + repItem.stock_quantity + ' ' + repItem.item_name + '.' });
 
+        // 3. KRA COMPLIANCE (THE DOUBLE-ENTRY SYNC)
+        
+        // A. Issue Credit Note (Code C) - Reverses the tax on the unit coming BACK
+        const creditNote = await submitCreditNoteToEtims({
+            originalInvoiceNumber: kraInvoiceNumber,
+            itemName: retItem.item_name,
+            quantity: retQty,
+            unitPrice: sellingPriceOriginal,
+            reason: returnReason
+        });
+        if (!creditNote) throw new Error('KRA Credit Note (Reversal) failed. Exchange aborted to prevent tax mismatch.');
+
+        // B. Issue New Sale (Code S) - Records the tax on the replacement unit going OUT
+        const replacementSale = await submitSaleToEtims({
+            itemName: repItem.item_name,
+            quantity: repQty,
+            unitPrice: sellingPriceOriginal, 
+            category: repItem.category,
+            paymentMethod: 'Credit', 
+            invoiceNumber: `EXCH-${Date.now()}`
+        });
+        if (!replacementSale) throw new Error('KRA Replacement Sale failed. Exchange aborted.');
+
+        // 4. INVENTORY LOGIC
         const costWrittenOff = parseFloat(retItem.cost_price || 0) * retQty;
         const retOldStock    = parseInt(retItem.stock_quantity);
         const retNewStock    = returnReason === 'damaged' ? retOldStock : retOldStock + retQty;
         const repOldStock    = parseInt(repItem.stock_quantity);
         const repNewStock    = repOldStock - repQty;
 
+        // Update Inventory: Only put back in stock if NOT damaged
         if (returnReason !== 'damaged') {
             const { error: inErr } = await supabase.from('Inventory').update({ stock_quantity: retNewStock }).eq('id', returnedItemId);
             if (inErr) throw inErr;
@@ -2566,6 +2600,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
         const { error: outErr } = await supabase.from('Inventory').update({ stock_quantity: repNewStock }).eq('id', replacementItemId);
         if (outErr) throw outErr;
 
+        // 5. EXPENSE LOGGING (DAMAGED GOODS WRITE-OFF)
         let expenseId = null;
         if (returnReason === 'damaged' && costWrittenOff > 0) {
             const { data: exp, error: expErr } = await supabase.from('expenses').insert([{
@@ -2579,13 +2614,14 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
             else expenseId = exp && exp.id;
         }
 
+        // 6. DETAILED AUDIT TRAIL (TRIPLE-ROW LOGGING)
         const auditRows = [
             {
                 performed_by: processedBy,
                 action:       returnReason === 'damaged' ? 'DAMAGE_WRITEOFF' : 'EXCHANGE_IN',
                 item_name:    retItem.item_name,
                 old_stock:    retOldStock, added_qty: returnReason === 'damaged' ? 0 : retQty, new_stock: retNewStock,
-                details:      'EXCHANGE — ' + retItem.item_name + ' returned (' + returnReason.toUpperCase() + '). Customer: ' + (customerName||'N/A') + ' | Receipt: ' + (originalReceipt||'N/A') + ' | By: ' + processedBy,
+                details:      `EXCHANGE IN (KRA CN: ${creditNote.kraReceiptNo}). Reason: ${returnReason.toUpperCase()}. Orig Receipt: ${originalReceipt}`,
                 timestamp:    new Date().toISOString()
             },
             {
@@ -2593,107 +2629,60 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
                 action:       'EXCHANGE_OUT',
                 item_name:    repItem.item_name,
                 old_stock:    repOldStock, added_qty: -repQty, new_stock: repNewStock,
-                details:      'EXCHANGE — ' + repItem.item_name + ' issued as replacement for ' + retItem.item_name + '. Customer: ' + (customerName||'N/A') + ' | By: ' + processedBy,
+                details:      `EXCHANGE OUT (KRA REC: ${replacementSale.kraReceiptNo}). Replacement for ${retItem.item_name}.`,
                 timestamp:    new Date().toISOString()
             }
         ];
+
         if (returnReason === 'damaged' && costWrittenOff > 0) {
             auditRows.push({
                 performed_by: processedBy,
                 action:       'DAMAGE_WRITEOFF',
                 item_name:    retItem.item_name,
                 old_stock:    retOldStock, added_qty: 0, new_stock: retOldStock,
-                details:      'DAMAGE WRITE-OFF — KES ' + costWrittenOff + ' expense logged for ' + retItem.item_name + ' (x' + retQty + '). Expense ID: ' + (expenseId||'N/A'),
+                details:      'DAMAGE WRITE-OFF — KES ' + costWrittenOff + ' expense logged. Expense ID: ' + (expenseId||'N/A'),
                 timestamp:    new Date().toISOString()
             });
         }
         await supabase.from('audit_logs').insert(auditRows);
 
+        // 7. FINAL RETURNS LOG (WITH DUAL KRA REFS)
         const { data: rec, error: recErr } = await supabase.from('returns_log').insert([{
-            original_receipt: originalReceipt||null, original_sale_id: originalSaleId||null,
-            customer_name: customerName||null, customer_phone: customerPhone||null,
-            returned_item_id: returnedItemId, returned_item_name: retItem.item_name,
-            returned_quantity: retQty, return_reason: returnReason,
-            replacement_item_id: replacementItemId, replacement_item_name: repItem.item_name,
+            original_receipt: originalReceipt || null,
+            original_sale_id: originalSaleId || null,
+            customer_name: customerName || null,
+            customer_phone: customerPhone || null,
+            returned_item_id: returnedItemId,
+            returned_item_name: retItem.item_name,
+            returned_quantity: retQty,
+            return_reason: returnReason,
+            replacement_item_id: replacementItemId,
+            replacement_item_name: repItem.item_name,
             replacement_quantity: repQty,
             cost_price_written_off: costWrittenOff,
-            selling_price_original: parseFloat(sellingPriceOriginal||0),
-            processed_by: processedBy, processed_by_role: processedRole,
-            expense_id: expenseId, notes: notes||null
+            selling_price_original: parseFloat(sellingPriceOriginal || 0),
+            kra_return_ref: creditNote.kraReceiptNo,       // The Reversal (Credit Note)
+            kra_replacement_ref: replacementSale.kraReceiptNo, // The New Sale (Receipt)
+            processed_by: processedBy,
+            processed_by_role: processedRole,
+            expense_id: expenseId,
+            notes: notes || null
         }]).select('id').single();
+
         if (recErr) throw recErr;
 
-        // ── Notify KRA via DigiTax eTIMS ────────────────────────────────────
-        // Credit Note  → customer return (wrong_item / other) — reverses original sale
-        // Debit Note   → damaged goods write-off — notifies KRA of stock loss
-        let kraReturnRef = null, kraReturnQrUrl = null;
-        try {
-            const now      = new Date();
-            const date     = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
-            const time     = now.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
-            const returnRef = `RET-${Date.now()}`;
-
-            // Credit note for customer return; debit note for damaged goods
-            const noteType = returnReason === 'damaged' ? 'debit_note' : 'credit_note';
-            const sellingPrice = parseFloat(sellingPriceOriginal || retItem.cost_price || 0);
-
-            const payload = {
-                trader_invoice_number: returnRef,
-                original_invoice_number: originalReceipt || null,
-                note_type:   noteType,
-                date,
-                time,
-                reason:      returnReason === 'damaged'    ? 'Damaged goods write-off'
-                           : returnReason === 'wrong_item' ? 'Wrong item returned'
-                           : 'Customer return',
-                customer_pin:  null,
-                customer_name: customerName || null,
-                sale_items: [{
-                    item_name:     retItem.item_name,
-                    quantity:      retQty,
-                    unit_price:    sellingPrice,
-                    tax_type_code: 'A',
-                    discount_rate: 0
-                }]
-            };
-
-            const etimsRes = await fetch(`${DIGITAX_BASE_URL}/${noteType === 'credit_note' ? 'credit-notes' : 'debit-notes'}`, {
-                method:  'POST',
-                headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
-                body:    JSON.stringify(payload),
-                signal:  AbortSignal.timeout(10000)
-            });
-            const etimsData = await etimsRes.json();
-
-            if (etimsRes.ok) {
-                kraReturnRef   = etimsData?.data?.receipt_number || returnRef;
-                kraReturnQrUrl = etimsData?.data?.etims_url      || null;
-
-                // Save KRA ref back to returns_log
-                await supabase.from('returns_log')
-                    .update({ kra_return_ref: kraReturnRef, kra_return_qr_url: kraReturnQrUrl })
-                    .eq('id', rec.id);
-
-                log.info(`[eTIMS] ✅ ${noteType} submitted to KRA`, { ref: kraReturnRef, reason: returnReason });
-            } else {
-                log.warn('[eTIMS] Return note rejected by DigiTax', { status: etimsRes.status, body: etimsData });
-            }
-        } catch (etimsErr) {
-            log.warn('[eTIMS] Return eTIMS submission failed (return still saved):', etimsErr.message);
-        }
-
+        // 8. RESPONSE
         res.json({
             success: true,
-            message: 'Exchange processed. ' + retItem.item_name + ' replaced with ' + repItem.item_name + '.' +
-                     (returnReason === 'damaged' ? ' KES ' + costWrittenOff + ' written off as expense.' : ''),
-            returnId:      rec && rec.id,
+            message: 'Exchange processed successfully.',
+            returnId: rec?.id,
             expenseId,
-            kraReturnRef,
-            kraReturnQrUrl,
-            etimsSubmitted: !!kraReturnRef
+            kraReturnRef: creditNote.kraReceiptNo,
+            kraReplacementRef: replacementSale.kraReceiptNo
         });
+
     } catch (err) {
-        log.error('[RETURNS] Exchange error:', err);
+        console.error('[RETURNS] Exchange Critical Error:', err.message);
         res.status(500).json({ success: false, message: err.message });
     }
 });
