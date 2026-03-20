@@ -124,16 +124,33 @@ async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
       const classCodeMap = {
-    'Hardware':            '27110000',  // Hand tools — verified DigiTax table
-    'Tools':               '27110000',  // Hand tools — verified DigiTax table
-    'Paint':               '31210000',  // Paints and primers and finishes — verified
-    'Electrical':          '39120000',  // Electrical equipment and components — verified
-    'Plumbing':            '40170000',  // Pipe piping and pipe fittings — verified
-    'Building Materials':  '30110000',  // Concrete and cement and plaster — verified
-    'Fasteners':           '31160000',  // Hardware screws bolts — verified
-    'Safety':              '46180000',  // Personal safety and protection — verified
-    'Cement':              '30110000',  // Concrete and cement and plaster — verified
-    'General':             '99010000',  // Goods — verified DigiTax default
+    // ── Core categories — verified against ke.docs.digitax.tech/docs/items-item-classification-table ──
+    'Hardware':            '27110000',  // Hand tools
+    'Tools':               '27110000',  // Hand tools
+    'Power Tools':         '27110000',  // Tools and General Machinery
+    'Welding':             '27110000',  // Tools and General Machinery
+    'Hydraulics':          '27120000',  // Hydraulic machinery and equipment
+    'Paint':               '31210000',  // Paints and primers and finishes
+    'Electrical':          '39120000',  // Electrical equipment and components and supplies
+    'Lighting':            '39110000',  // Lighting Fixtures and Accessories
+    'Plumbing':            '40170000',  // Pipe piping and pipe fittings
+    'Water Storage':       '40170000',  // Pipe piping and pipe fittings
+    'Building Materials':  '30110000',  // Concrete and cement and plaster
+    'Cement':              '30110000',  // Concrete and cement and plaster
+    'Steel & Metal':       '30100000',  // Structural components and basic shapes
+    'Timber & Wood':       '30130000',  // Structural building products
+    'Fencing':             '30130000',  // Structural building products
+    'Roofing':             '30150000',  // Exterior finishing materials
+    'Tiles & Flooring':    '30160000',  // Interior finishing materials
+    'Insulation':          '30140000',  // Insulation
+    'Doors & Windows':     '30170000',  // Doors and windows and glass
+    'Ladders':             '30190000',  // Construction and maintenance support equipment
+    'Scaffolding':         '30190000',  // Construction and maintenance support equipment
+    'Fasteners':           '31160000',  // Hardware — screws, bolts, nails
+    'Adhesives':           '31200000',  // Adhesives and sealants
+    'Safety':              '46180000',  // Personal safety and protection
+    'Cleaning':            '47130000',  // Cleaning and janitorial supplies
+    'General':             '99010000',  // Goods — safe default
 };
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
