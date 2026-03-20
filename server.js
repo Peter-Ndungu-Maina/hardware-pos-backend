@@ -78,16 +78,15 @@ async function submitSaleToEtims(saleData) {
         const payMap      = { 'Cash': '01', 'M-Pesa': '06', 'Credit': '02' };
 
         // --- 16% VAT MATH FIX (THE KRA WAY) ---
-        // eTIMS Strict Rule: total_amount MUST exactly equal unit_price * quantity
-        const unitPrice   = parseFloat(saleData.unitPrice) || 0; // Inclusive price (e.g., 1200)
-        const quantity    = parseFloat(saleData.quantity)  || 1; // e.g., 2
-        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2)); // e.g., 2400
+        // Rule: total_amount MUST exactly equal unit_price * quantity
+        const unitPrice   = parseFloat(saleData.unitPrice) || 0; 
+        const quantity    = parseFloat(saleData.quantity)  || 1;
+        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
 
         /**
-         * MATH REFINEMENT:
-         * To avoid floating point errors (e.g., 0.01 discrepancies), 
-         * we calculate the Tax Amount first and then subtract it from the total 
-         * to get the Taxable Amount.
+         * PRECISION MATH:
+         * We calculate Tax Amount first, then derive Taxable Amount.
+         * This prevents the 0.01 rounding discrepancy on the KRA PDF.
          */
         const taxAmount     = parseFloat((totalAmount - (totalAmount / 1.16)).toFixed(2));
         const taxableAmount = parseFloat((totalAmount - taxAmount).toFixed(2));
@@ -96,7 +95,7 @@ async function submitSaleToEtims(saleData) {
             saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
-        // Extract last 8 digits of invoice/receipt number to ensure numeric compatibility
+        // Numeric extraction for DigiTax compatibility
         const invoiceNum = Math.abs(
             parseInt((saleData.invoiceNumber || saleData.receiptNumber || '1')
             .replace(/\D/g, '').slice(-8))
@@ -107,14 +106,14 @@ async function submitSaleToEtims(saleData) {
         const payload = {
             trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
             invoice_number:        invoiceNum,
-            receipt_type_code:     'S', // Sale
+            receipt_type_code:     'S',
             payment_type_code:     payMap[saleData.paymentMethod] || '01',
-            invoice_status_code:   '02', // Finalized
+            invoice_status_code:   '02',
             sale_date:             saleDate,
             items: [{
                 item_name:             saleData.itemName,
                 item_class_code:       itemClassCode,
-                item_type_code:        '2', // Finished Goods
+                item_type_code:        '2',
                 item_bar_code:         barCode,
                 
                 // --- CATEGORY B (16% VAT) ---
@@ -123,8 +122,8 @@ async function submitSaleToEtims(saleData) {
                 tax_rate:              16,
                 
                 quantity:              quantity,
-                quantity_unit_code:    'U',  // Units
-                package_unit_code:     'NT', // Net
+                quantity_unit_code:    'U',
+                package_unit_code:     'NT',
                 package_unit_quantity: 1,
                 
                 unit_price:            unitPrice,    
@@ -136,12 +135,10 @@ async function submitSaleToEtims(saleData) {
             }]
         };
 
-        log.info('[eTIMS] Submitting Category B sale with refined math', {
-            invoice: payload.trader_invoice_number,
-            item: saleData.itemName,
-            total: totalAmount,
-            tax: taxAmount,
-            taxable: taxableAmount
+        log.info('[eTIMS] Attempting Sale Submission', { 
+            inv: payload.trader_invoice_number, 
+            total: totalAmount, 
+            tax: taxAmount 
         });
 
         const res = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
@@ -157,12 +154,22 @@ async function submitSaleToEtims(saleData) {
         const data = await res.json();
 
         if (!res.ok) {
-            log.warn('[eTIMS] DigiTax rejected sale', { 
-                status: res.status, 
-                body: JSON.stringify(data) 
-            });
+            log.warn('[eTIMS] DigiTax rejected sale', { status: res.status, body: JSON.stringify(data) });
             return null;
         }
+
+        const kraQrUrl     = (data?.etims_url && data.etims_url !== '') ? data.etims_url : (data?.offline_url || null);
+        const kraReceiptNo = data?.serial_number || data?.id || null;
+
+        log.info('[eTIMS] ✅ Sale accepted by DigiTax', { kraReceiptNo });
+
+        return { kraReceiptNo, kraQrUrl };
+
+    } catch (err) {
+        log.warn('[eTIMS] DigiTax call failed:', err.message);
+        return null;
+    }
+}
 
         // Capture QR URL and KRA Serial Number
         const kraQrUrl     = (data?.etims_url && data.etims_url !== '') ? data.etims_url : (data?.offline_url || null);
