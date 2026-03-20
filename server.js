@@ -64,7 +64,7 @@ async function submitSaleToEtims(saleData) {
             sale_date:             saleDate,
             items: [{
                 item_name:             saleData.itemName,
-                item_class_code:       '5020230600',
+                item_class_code:       '99010000',
                 item_type_code:        '2',
                 item_bar_code:         barCode,
                 item_tax_type_code:    'A',
@@ -124,16 +124,16 @@ async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
       const classCodeMap = {
-    'Hardware':            '31162800',
-    'Tools':               '27111700',
-    'Paint':               '31211700',
-    'Electrical':          '39121400',
-    'Plumbing':            '40171700',
-    'Building Materials':  '30101700',
-    'Fasteners':           '31161500',
-    'Safety':              '46181500',
-    'Cement':              '30111700',
-    'General':             '44121700',
+    'Hardware':            '27110000',  // Hand tools — verified DigiTax table
+    'Tools':               '27110000',  // Hand tools — verified DigiTax table
+    'Paint':               '31210000',  // Paints and primers and finishes — verified
+    'Electrical':          '39120000',  // Electrical equipment and components — verified
+    'Plumbing':            '40170000',  // Pipe piping and pipe fittings — verified
+    'Building Materials':  '30110000',  // Concrete and cement and plaster — verified
+    'Fasteners':           '31160000',  // Hardware screws bolts — verified
+    'Safety':              '46180000',  // Personal safety and protection — verified
+    'Cement':              '30110000',  // Concrete and cement and plaster — verified
+    'General':             '99010000',  // Goods — verified DigiTax default
 };
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
@@ -141,7 +141,7 @@ async function registerItemWithEtims(item) {
 
         const payload = {
             item_name:          item.itemName,
-            item_class_code:    classCodeMap[item.category] || '5020230600',
+            item_class_code:    classCodeMap[item.category] || '99010000',
             item_type_code:     '2',
             item_bar_code:      barCode,
             tax_type_code:      'A',
@@ -2523,7 +2523,7 @@ app.patch('/api/employees/:id/reset-pin', requireAuth, requireRole('admin'), asy
 // ============================================================
 
 app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
-    const { originalReceipt, originalSaleId, customerName, customerPhone,
+    const { originalReceipt, kraInvoiceNumber, originalSaleId, customerName, customerPhone,
             returnedItemId, returnedQuantity, returnReason,
             replacementItemId, replacementQuantity,
             sellingPriceOriginal, notes } = req.body;
@@ -2639,7 +2639,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
 
             const payload = {
                 trader_invoice_number: returnRef,
-                original_invoice_number: originalReceipt || null,
+                original_invoice_number: kraInvoiceNumber || originalReceipt || null,
                 note_type:   noteType,
                 date,
                 time,
