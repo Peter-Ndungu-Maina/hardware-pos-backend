@@ -185,25 +185,24 @@ async function registerItemWithEtims(item) {
             return null;
         }
 
-        const digitaxItemId = data?.id || data?.item_id || data?.data?.id || data?.data?.item_id || data?.result?.id || null;
-        log.info('[eTIMS] Item reg raw response', { status: res.status, body: JSON.stringify(data) });
+        const digitaxItemId = data?.id || data?.item_id || data?.data?.id || null;
         log.info('[eTIMS] ✅ Identity registered', { item: item.itemName, digitaxItemId });
 
         // ════════ PHASE 2: IMMEDIATELY UPLOAD STOCK QUANTITY ════════
         // We use the ID from Phase 1 to push the stock count so KRA doesn't show 0
-        const stockQty = parseFloat(item.stockQty || item.stock_quantity) || 0;
+        const stockQty = parseInt(item.stockQty || item.stock_quantity) || 0;
 
         if (digitaxItemId && stockQty > 0) {
             log.info(`[eTIMS] Waiting 3s before pushing ${stockQty} units...`);
             await new Promise(resolve => setTimeout(resolve, 3000));
 
-            const stockPayload = {
+           const stockPayload = {
                 item_id:       digitaxItemId,
-                quantity:      parseInt(stockQty),
+                quantity:      stockQty,
                 movement_type: '04',
                 action:        'add',   // DigiTax V2 requires lowercase
                 remarks:       'Initial System Upload'
-            };
+};
 
             const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
                 method:  'PUT',
@@ -214,7 +213,7 @@ async function registerItemWithEtims(item) {
 
             const stockResBody = await stockRes.json();
             if (stockRes.ok) {
-                log.info('[eTIMS] ✅ Stock pushed', { qty: parseInt(stockQty), res: JSON.stringify(stockResBody) });
+                log.info('[eTIMS] ✅ Stock pushed', { qty: stockQty, res: JSON.stringify(stockResBody) });
             } else {
                 log.warn('[eTIMS] ❌ Stock push failed', { status: stockRes.status, payload: JSON.stringify(stockPayload), res: JSON.stringify(stockResBody) });
             }
@@ -233,7 +232,7 @@ async function syncStockWithEtims(digitaxItemId, quantity, reason, movementType 
     try {
         const payload = {
             item_id:       digitaxItemId,
-            quantity:      parseInt(quantity) || 0,
+            quantity:      parseFloat(quantity) || 0,
             movement_type: movementType, // '04' for restock/opening, '01' for purchase
             action:        'add',          // DigiTax V2 requires lowercase
             remarks:       reason || 'Stock Update'
@@ -491,7 +490,8 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
         let digitaxItemId = null;
         const etimsItem = await registerItemWithEtims({
             itemName: itemName, category: category || 'General',
-            sellingPrice: sellingPrice, unit: unit || 'PCS'
+            sellingPrice: sellingPrice, unit: unit || 'PCS',
+            stockQty: parseInt(stockQty) || 0
         });
         if (etimsItem) {
             digitaxItemId = etimsItem;
@@ -2105,7 +2105,8 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
             // ── Register item with DigiTax/KRA (non-blocking) ──────────────
             const bulkEtimsId = await registerItemWithEtims({
                 itemName: itemName.trim(), category: category || 'General',
-                sellingPrice: price, unit: unit || 'PCS'
+                sellingPrice: price, unit: unit || 'PCS',
+                stockQty: parseInt(qty) || 0
             });
             if (bulkEtimsId) {
                 await supabase.from('Inventory')
