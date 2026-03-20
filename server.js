@@ -2819,7 +2819,7 @@ app.get('/api/returns/search-sale', requireAuth, requireRole('admin', 'manager')
     if (!q) return res.status(400).json({ success: false, message: 'Query q is required.' });
     try {
         const { data, error } = await supabase.from('Sales')
-            .select('id,receipt_number,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
+            .select('id,receipt_number,invoice_number,kra_receipt_no,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
             .or(`customer_name.ilike.%${q}%,customer_phone.ilike.%${q}%,receipt_number.ilike.%${q}%`)
             .eq('is_voided', false)
             .order('sale_date', { ascending: false })
