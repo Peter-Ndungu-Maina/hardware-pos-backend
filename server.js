@@ -200,7 +200,7 @@ async function registerItemWithEtims(item) {
                 item_id:       digitaxItemId,
                 quantity:      stockQty,
                 movement_type: '04',
-                action:        'add',   // DigiTax V2 requires lowercase
+                action:        'ADD',   // DigiTax V2 requires lowercase
                 remarks:       'Initial System Upload'
 };
 
