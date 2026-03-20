@@ -67,35 +67,27 @@ function getEtimsClassCode(itemName, category) {
 }
 
 async function submitSaleToEtims(saleData) {
-    if (!DIGITAX_API_KEY) { 
-        log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); 
-        return null; 
-    }
-
+    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
     try {
         const now         = new Date();
         const saleDate    = now.toISOString().split('T')[0];
-        const payMap      = { 'Cash': '01', 'M-Pesa': '06', 'Credit': '02' };
+        const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
+        
+        // --- 16% VAT MATH ---
+        // Assume unitPrice is inclusive (e.g. 1200)
+        const unitPriceInclusive = parseFloat(saleData.unitPrice) || 0;
+        const quantity           = parseFloat(saleData.quantity)  || 1;
+        const totalAmount        = parseFloat((unitPriceInclusive * quantity).toFixed(2));
 
-        // --- 16% VAT MATH FIX (THE KRA WAY) ---
-        // Rule: total_amount MUST exactly equal unit_price * quantity
-        const unitPrice   = parseFloat(saleData.unitPrice) || 0; 
-        const quantity    = parseFloat(saleData.quantity)  || 1;
-        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
-
-        /**
-         * PRECISION MATH:
-         * We calculate Tax Amount first, then derive Taxable Amount.
-         * This prevents the 0.01 rounding discrepancy on the KRA PDF.
-         */
-        const taxAmount     = parseFloat((totalAmount - (totalAmount / 1.16)).toFixed(2));
-        const taxableAmount = parseFloat((totalAmount - taxAmount).toFixed(2));
+        // Calculate Tax Breakdown
+        const unitPriceExclusive = parseFloat((unitPriceInclusive / 1.16).toFixed(2));
+        const taxableAmount      = parseFloat((totalAmount / 1.16).toFixed(2));
+        const taxAmount          = parseFloat((totalAmount - taxableAmount).toFixed(2));
 
         const barCode = String(
             saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
-        // Numeric extraction for DigiTax compatibility
         const invoiceNum = Math.abs(
             parseInt((saleData.invoiceNumber || saleData.receiptNumber || '1')
             .replace(/\D/g, '').slice(-8))
@@ -104,8 +96,9 @@ async function submitSaleToEtims(saleData) {
         const itemClassCode = getEtimsClassCode(saleData.itemName, saleData.category);
 
         const payload = {
-            trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
-            invoice_number:        invoiceNum,
+            // Append ms timestamp to guarantee uniqueness — DigiTax rejects duplicate trader_invoice_numbers
+            trader_invoice_number: `${saleData.invoiceNumber || saleData.receiptNumber}-${Date.now()}`,
+            invoice_number:         invoiceNum,
             receipt_type_code:     'S',
             payment_type_code:     payMap[saleData.paymentMethod] || '01',
             invoice_status_code:   '02',
@@ -115,42 +108,34 @@ async function submitSaleToEtims(saleData) {
                 item_class_code:       itemClassCode,
                 item_type_code:        '2',
                 item_bar_code:         barCode,
-                
-                // --- CATEGORY B (16% VAT) ---
-                item_tax_type_code:    'B', 
-                tax_type_code:         'B',
-                tax_rate:              16,
-                
+                item_tax_type_code:    'A',      // Category A
                 quantity:              quantity,
                 quantity_unit_code:    'U',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
-                
-                unit_price:            unitPrice,    
-                total_amount:          totalAmount,  
-                tax_amount:            taxAmount,    
-                
+                unit_price:            unitPriceExclusive, // Price BEFORE tax
+                total_amount:          totalAmount,        // Price AFTER tax
+                tax_type_code:         'A',
+                tax_rate:              16,                 // <--- FIX: Added explicit 16%
+                tax_amount:            taxAmount,          // <--- FIX: Added calculated tax
                 discount_rate:         0,
                 origin_nation_code:    'KE'
             }]
         };
 
-        log.info('[eTIMS] Attempting Sale Submission', { 
-            inv: payload.trader_invoice_number, 
-            total: totalAmount, 
-            tax: taxAmount 
+        log.info('[eTIMS] Submitting with 16% VAT breakdown', {
+            invoice: payload.trader_invoice_number,
+            item: saleData.itemName,
+            taxAmount
         });
 
         const res = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
             method:  'POST',
-            headers: { 
-                'x-api-key': DIGITAX_API_KEY, 
-                'Content-Type': 'application/json' 
-            },
+            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
             body:    JSON.stringify(payload),
             signal:  AbortSignal.timeout(10000)
         });
-
+        
         const data = await res.json();
 
         if (!res.ok) {
@@ -160,22 +145,6 @@ async function submitSaleToEtims(saleData) {
 
         const kraQrUrl     = (data?.etims_url && data.etims_url !== '') ? data.etims_url : (data?.offline_url || null);
         const kraReceiptNo = data?.serial_number || data?.id || null;
-
-        log.info('[eTIMS] ✅ Sale accepted by DigiTax', { kraReceiptNo });
-
-        return { kraReceiptNo, kraQrUrl };
-
-    } catch (err) {
-        log.warn('[eTIMS] DigiTax call failed:', err.message);
-        return null;
-    }
-}
-
-        // Capture QR URL and KRA Serial Number
-        const kraQrUrl     = (data?.etims_url && data.etims_url !== '') ? data.etims_url : (data?.offline_url || null);
-        const kraReceiptNo = data?.serial_number || data?.id || null;
-
-        log.info('[eTIMS] ✅ Sale accepted by DigiTax', { kraReceiptNo });
 
         return { kraReceiptNo, kraQrUrl };
 
@@ -208,7 +177,7 @@ async function registerItemWithEtims(item) {
             item_class_code:    itemClassCode,
             item_type_code:     '2', // Finished Goods
             item_bar_code:      barCode,
-            tax_type_code:      'B', // 16% VAT
+            tax_type_code:      'A', // 16% VAT
             default_unit_price: parseFloat(item.sellingPrice) || 0,
             quantity_unit_code: 'U',  // Units/Pieces
             package_unit_code:  'NT', // Net
@@ -257,7 +226,7 @@ if (openingQty > 0) {
     const stockPayload = {
         item_id:       digitaxItemId,
         quantity:      openingQty,
-        action:        "ADD",         // <--- MISSING FIELD CAUSING THE 400 ERROR
+        action:        "add",         // <--- MISSING FIELD CAUSING THE 400 ERROR
         movement_type: "04",          // "04" = Incoming Other
         remarks:       "Initial System Upload"
     };
@@ -344,8 +313,10 @@ app.use(sanitizeQuery);           // strip PostgREST injection chars from all qu
 app.use(express.json({ limit: '2mb' })); // Body size cap — prevents oversized bulk import abuse
 
 // FIX: pagesPath must be defined before HTML_PAGES routes use it
-const pagesPath = path.join(__dirname, 'public'); // change 'public' to your actual HTML folder
+const pagesPath    = path.join(__dirname, '..', 'frontend');                    // index.html lives here
+const subPagesPath = path.join(__dirname, '..', 'frontend', 'src', 'pages');   // all other .html pages live here
 app.use(express.static(pagesPath));
+app.use(express.static(subPagesPath));
 
 
 
@@ -363,7 +334,7 @@ const HTML_PAGES = [
 ];
 HTML_PAGES.forEach(page => {
     app.get(`/${page}.html`, (req, res) => {
-        const file = path.join(pagesPath, `${page}.html`);
+        const file = path.join(subPagesPath, `${page}.html`);
         if (require('fs').existsSync(file)) {
             res.sendFile(file);
         } else {
@@ -375,10 +346,7 @@ HTML_PAGES.forEach(page => {
 // ── 4. Root Routes ──────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-    res.status(200).json({ 
-        message: "Elite Hardware POS API is running", 
-        status: "Live" 
-    });
+    res.sendFile(path.join(pagesPath, 'index.html'));
 });
 // ============================================================
 //  4. AUTH MIDDLEWARE
