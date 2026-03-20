@@ -73,16 +73,10 @@ async function submitSaleToEtims(saleData) {
         const saleDate    = now.toISOString().split('T')[0];
         const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
         
-        // --- 16% VAT MATH ---
-        // Assume unitPrice is inclusive (e.g. 1200)
-        const unitPriceInclusive = parseFloat(saleData.unitPrice) || 0;
-        const quantity           = parseFloat(saleData.quantity)  || 1;
-        const totalAmount        = parseFloat((unitPriceInclusive * quantity).toFixed(2));
-
-        // Calculate Tax Breakdown
-        const unitPriceExclusive = parseFloat((unitPriceInclusive / 1.16).toFixed(2));
-        const taxableAmount      = parseFloat((totalAmount / 1.16).toFixed(2));
-        const taxAmount          = parseFloat((totalAmount - taxableAmount).toFixed(2));
+        // DigiTax strict rule: unit_price * quantity MUST equal total_amount exactly
+        const unitPrice   = parseFloat(saleData.unitPrice) || 0;
+        const quantity    = parseFloat(saleData.quantity)  || 1;
+        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
 
         const barCode = String(
             saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
@@ -108,26 +102,20 @@ async function submitSaleToEtims(saleData) {
                 item_class_code:       itemClassCode,
                 item_type_code:        '2',
                 item_bar_code:         barCode,
-                item_tax_type_code:    'A',      // Category A
+                item_tax_type_code:    'B',      // Category A
                 quantity:              quantity,
                 quantity_unit_code:    'U',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
-                unit_price:            unitPriceExclusive, // Price BEFORE tax
-                total_amount:          totalAmount,        // Price AFTER tax
-                tax_type_code:         'A',
-                tax_rate:              16,                 // <--- FIX: Added explicit 16%
-                tax_amount:            taxAmount,          // <--- FIX: Added calculated tax
-                discount_rate:         0,
+                unit_price:            unitPrice,   // inclusive price: unit_price * qty = total_amount
+                total_amount:          totalAmount,
+                tax_type_code:         'B',
+               discount_rate:         0,
                 origin_nation_code:    'KE'
             }]
         };
 
-        log.info('[eTIMS] Submitting with 16% VAT breakdown', {
-            invoice: payload.trader_invoice_number,
-            item: saleData.itemName,
-            taxAmount
-        });
+        log.info('[eTIMS] Submitting sale to DigiTax', { invoice: payload.trader_invoice_number, item: saleData.itemName, unitPrice, quantity, totalAmount });
 
         const res = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
             method:  'POST',
@@ -177,7 +165,7 @@ async function registerItemWithEtims(item) {
             item_class_code:    itemClassCode,
             item_type_code:     '2', // Finished Goods
             item_bar_code:      barCode,
-            tax_type_code:      'A', // 16% VAT
+            tax_type_code:      'B', // 16% VAT
             default_unit_price: parseFloat(item.sellingPrice) || 0,
             quantity_unit_code: 'U',  // Units/Pieces
             package_unit_code:  'NT', // Net
@@ -226,7 +214,7 @@ if (openingQty > 0) {
     const stockPayload = {
         item_id:       digitaxItemId,
         quantity:      openingQty,
-        action:        "add",         // <--- MISSING FIELD CAUSING THE 400 ERROR
+        action:        "ADD",         // <--- MISSING FIELD CAUSING THE 400 ERROR
         movement_type: "04",          // "04" = Incoming Other
         remarks:       "Initial System Upload"
     };
@@ -313,8 +301,9 @@ app.use(sanitizeQuery);           // strip PostgREST injection chars from all qu
 app.use(express.json({ limit: '2mb' })); // Body size cap — prevents oversized bulk import abuse
 
 // FIX: pagesPath must be defined before HTML_PAGES routes use it
-const pagesPath    = path.join(__dirname, '..', 'frontend');                    // index.html lives here
-const subPagesPath = path.join(__dirname, '..', 'frontend', 'src', 'pages');   // all other .html pages live here
+const _root        = path.resolve(__dirname, '..');  // backend/../ = project root (works locally + Render)
+const pagesPath    = path.join(_root, 'frontend');
+const subPagesPath = path.join(_root, 'frontend', 'src', 'pages');
 app.use(express.static(pagesPath));
 app.use(express.static(subPagesPath));
 
