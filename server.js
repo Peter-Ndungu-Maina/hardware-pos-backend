@@ -185,7 +185,8 @@ async function registerItemWithEtims(item) {
             return null;
         }
 
-        const digitaxItemId = data?.id || data?.item_id || data?.data?.id || null;
+        const digitaxItemId = data?.id || data?.item_id || data?.data?.id || data?.data?.item_id || data?.result?.id || null;
+        log.info('[eTIMS] Item reg raw response', { status: res.status, body: JSON.stringify(data) });
         log.info('[eTIMS] ✅ Identity registered', { item: item.itemName, digitaxItemId });
 
         // ════════ PHASE 2: IMMEDIATELY UPLOAD STOCK QUANTITY ════════
@@ -196,15 +197,13 @@ async function registerItemWithEtims(item) {
             log.info(`[eTIMS] Waiting 3s before pushing ${stockQty} units...`);
             await new Promise(resolve => setTimeout(resolve, 3000));
 
-           const stockPayload = {
-    item_id:       digitaxItemId,
-    quantity:      stockQty,
-    movement_type: '04',
-    action:        'ADD',
-    branch_id:     '01', // Standard KRA branch code
-    store_id:      '01', // Standard KRA store code
-    remarks:       'Initial System Upload'
-};
+            const stockPayload = {
+                item_id:       digitaxItemId,
+                quantity:      parseInt(stockQty),
+                movement_type: '04',
+                action:        'add',   // DigiTax V2 requires lowercase
+                remarks:       'Initial System Upload'
+            };
 
             const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
                 method:  'PUT',
@@ -213,12 +212,12 @@ async function registerItemWithEtims(item) {
                 signal:  AbortSignal.timeout(10000)
             });
 
-            if (stockRes.ok) {
-                log.info('[eTIMS] ✅ Stock quantity successfully uploaded');
-            } else {
-                const stockData = await stockRes.json();
-                log.warn('[eTIMS] ❌ Identity created, but stock upload failed', { body: stockData });
-            }
+            const stockResBody = await stockRes.json();
+            if (stockRes.ok) {
+                log.info('[eTIMS] ✅ Stock pushed', { qty: parseInt(stockQty), res: JSON.stringify(stockResBody) });
+            } else {
+                log.warn('[eTIMS] ❌ Stock push failed', { status: stockRes.status, payload: JSON.stringify(stockPayload), res: JSON.stringify(stockResBody) });
+            }
         }
 
         return digitaxItemId;
@@ -234,9 +233,9 @@ async function syncStockWithEtims(digitaxItemId, quantity, reason, movementType 
     try {
         const payload = {
             item_id:       digitaxItemId,
-            quantity:      parseFloat(quantity) || 0,
+            quantity:      parseInt(quantity) || 0,
             movement_type: movementType, // '04' for restock/opening, '01' for purchase
-            action:        'ADD',         // Tells KRA to + this to the current balance
+            action:        'add',          // DigiTax V2 requires lowercase
             remarks:       reason || 'Stock Update'
         };
 
