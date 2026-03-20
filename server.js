@@ -70,11 +70,19 @@ async function submitSaleToEtims(saleData) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping'); return null; }
     try {
         const now         = new Date();
-        const saleDate    = now.toISOString().split('T')[0]; // YYYY-MM-DD
+        const saleDate    = now.toISOString().split('T')[0];
         const payMap      = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
-        const unitPrice   = parseFloat(saleData.unitPrice) || 0;
-        const quantity    = parseFloat(saleData.quantity)  || 1;
-        const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
+        
+        // --- 16% VAT MATH ---
+        // Assume unitPrice is inclusive (e.g. 1200)
+        const unitPriceInclusive = parseFloat(saleData.unitPrice) || 0;
+        const quantity           = parseFloat(saleData.quantity)  || 1;
+        const totalAmount        = parseFloat((unitPriceInclusive * quantity).toFixed(2));
+
+        // Calculate Tax Breakdown
+        const unitPriceExclusive = parseFloat((unitPriceInclusive / 1.16).toFixed(2));
+        const taxableAmount      = parseFloat((totalAmount / 1.16).toFixed(2));
+        const taxAmount          = parseFloat((totalAmount - taxableAmount).toFixed(2));
 
         const barCode = String(
             saleData.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
@@ -85,12 +93,11 @@ async function submitSaleToEtims(saleData) {
             .replace(/\D/g, '').slice(-8))
         ) || 1;
 
-        // FIX: dynamic class code from item name + category — was hardcoded '99010000'
         const itemClassCode = getEtimsClassCode(saleData.itemName, saleData.category);
 
         const payload = {
             trader_invoice_number: saleData.invoiceNumber || saleData.receiptNumber,
-            invoice_number:        invoiceNum,
+            invoice_number:         invoiceNum,
             receipt_type_code:     'S',
             payment_type_code:     payMap[saleData.paymentMethod] || '01',
             invoice_status_code:   '02',
@@ -100,35 +107,34 @@ async function submitSaleToEtims(saleData) {
                 item_class_code:       itemClassCode,
                 item_type_code:        '2',
                 item_bar_code:         barCode,
-                item_tax_type_code:    'A',
-                quantity:              quantity,   // quantity sold — sent to DigiTax for stock tracking
+                item_tax_type_code:    'A',      // Category A
+                quantity:              quantity,
                 quantity_unit_code:    'U',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
-                unit_price:            unitPrice,
-                total_amount:          totalAmount,
+                unit_price:            unitPriceExclusive, // Price BEFORE tax
+                total_amount:          totalAmount,        // Price AFTER tax
                 tax_type_code:         'A',
+                tax_rate:              16,                 // <--- FIX: Added explicit 16%
+                tax_amount:            taxAmount,          // <--- FIX: Added calculated tax
                 discount_rate:         0,
                 origin_nation_code:    'KE'
             }]
         };
 
-        log.info('[eTIMS] Submitting to DigiTax', {
-            invoice:         payload.trader_invoice_number,
-            item:            saleData.itemName,
-            category:        saleData.category,
-            item_class_code: itemClassCode,
-            quantity,
-            total:           totalAmount,
-            sale_date:       saleDate
+        log.info('[eTIMS] Submitting with 16% VAT breakdown', {
+            invoice: payload.trader_invoice_number,
+            item: saleData.itemName,
+            taxAmount
         });
 
-        const res  = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
+        const res = await fetch(`${DIGITAX_BASE_URL}/sales-with-items`, {
             method:  'POST',
             headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
             body:    JSON.stringify(payload),
             signal:  AbortSignal.timeout(10000)
         });
+        
         const data = await res.json();
 
         if (!res.ok) {
@@ -136,26 +142,16 @@ async function submitSaleToEtims(saleData) {
             return null;
         }
 
-        // Use etims_url when KRA approved, offline_url while still PENDING
         const kraQrUrl     = (data?.etims_url && data.etims_url !== '') ? data.etims_url : (data?.offline_url || null);
         const kraReceiptNo = data?.serial_number || data?.id || null;
-
-        log.info('[eTIMS] ✅ Sale accepted by DigiTax', {
-            invoice:      payload.trader_invoice_number,
-            status:       data?.status,
-            kraReceiptNo,
-            kraQrUrl,
-            offlineUrl:   data?.offline_url
-        });
 
         return { kraReceiptNo, kraQrUrl };
 
     } catch (err) {
-        log.warn('[eTIMS] DigiTax call failed (sale still saved):', err.message);
+        log.warn('[eTIMS] DigiTax call failed:', err.message);
         return null;
     }
 }
-
 /**
  * Registers an item with DigiTax (KRA eTIMS) and pushes its opening stock.
  * Uses DigiTax KE V2 API: PUT /stock/adjust
@@ -229,7 +225,7 @@ if (openingQty > 0) {
     const stockPayload = {
         item_id:       digitaxItemId,
         quantity:      openingQty,
-        action:        "ADD",         // <--- MISSING FIELD CAUSING THE 400 ERROR
+        action:        "add",         // <--- MISSING FIELD CAUSING THE 400 ERROR
         movement_type: "04",          // "04" = Incoming Other
         remarks:       "Initial System Upload"
     };
