@@ -141,135 +141,6 @@ async function submitSaleToEtims(saleData) {
         return null;
     }
 }
-
-// ── Credit Note: reverses a previous sale (wrong_item / other returns) ──────
-async function submitCreditNoteToEtims({ originalInvoiceNumber, itemName, quantity, unitPrice, reason, customerName }) {
-    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping credit note'); return null; }
-    try {
-        const date      = new Date().toISOString().split('T')[0];
-        const price     = parseFloat(unitPrice) || 0;
-        const qty       = parseFloat(quantity)  || 1;
-        const total     = parseFloat((price * qty).toFixed(2));
-        const barCode   = String(itemName.split('').reduce((a,c) => Math.abs(a + c.charCodeAt(0)), 0)).padStart(8,'0');
-        const classCode = getEtimsClassCode(itemName, null);
-
-        const payload = {
-            trader_invoice_number:   `CN-${Date.now()}`,
-            original_invoice_number: originalInvoiceNumber || null,
-            receipt_type_code:       'C',
-            payment_type_code:       '01',
-            invoice_status_code:     '02',
-            sale_date:               date,
-            reason:                  reason === 'wrong_item' ? 'Wrong item returned' : 'Customer return',
-            customer_name:           customerName || null,
-            items: [{
-                item_name:             itemName,
-                item_class_code:       classCode,
-                item_type_code:        '2',
-                item_bar_code:         barCode,
-                item_tax_type_code:    'A',
-                quantity:              qty,
-                quantity_unit_code:    'U',
-                package_unit_code:     'NT',
-                package_unit_quantity: 1,
-                unit_price:            price,
-                total_amount:          total,
-                tax_type_code:         'A',
-                discount_rate:         0,
-                origin_nation_code:    'KE'
-            }]
-        };
-
-        log.info('[eTIMS] Submitting credit note', { ref: payload.trader_invoice_number, originalInvoiceNumber, itemName });
-
-        const res  = await fetch(`${DIGITAX_BASE_URL}/credit-notes`, {
-            method:  'POST',
-            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
-            body:    JSON.stringify(payload),
-            signal:  AbortSignal.timeout(10000)
-        });
-        const data = await res.json();
-
-        if (!res.ok) {
-            log.warn('[eTIMS] Credit note rejected', { status: res.status, body: JSON.stringify(data) });
-            return null;
-        }
-
-        const kraReceiptNo = data?.data?.receipt_number || data?.serial_number || data?.id || payload.trader_invoice_number;
-        const kraQrUrl     = data?.data?.etims_url || data?.etims_url || data?.offline_url || null;
-        log.info('[eTIMS] ✅ Credit note accepted', { kraReceiptNo });
-        return { kraReceiptNo, kraQrUrl };
-
-    } catch (err) {
-        log.warn('[eTIMS] Credit note call failed:', err.message);
-        return null;
-    }
-}
-
-// ── Debit Note: logs damaged goods write-off ────────────────────────────────
-async function submitDebitNoteToEtims({ originalInvoiceNumber, itemName, quantity, unitPrice, customerName }) {
-    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping debit note'); return null; }
-    try {
-        const date      = new Date().toISOString().split('T')[0];
-        const price     = parseFloat(unitPrice) || 0;
-        const qty       = parseFloat(quantity)  || 1;
-        const total     = parseFloat((price * qty).toFixed(2));
-        const barCode   = String(itemName.split('').reduce((a,c) => Math.abs(a + c.charCodeAt(0)), 0)).padStart(8,'0');
-        const classCode = getEtimsClassCode(itemName, null);
-
-        const payload = {
-            trader_invoice_number:   `DN-${Date.now()}`,
-            original_invoice_number: originalInvoiceNumber || null,
-            receipt_type_code:       'D',
-            payment_type_code:       '01',
-            invoice_status_code:     '02',
-            sale_date:               date,
-            reason:                  'Damaged goods write-off',
-            customer_name:           customerName || null,
-            items: [{
-                item_name:             itemName,
-                item_class_code:       classCode,
-                item_type_code:        '2',
-                item_bar_code:         barCode,
-                item_tax_type_code:    'A',
-                quantity:              qty,
-                quantity_unit_code:    'U',
-                package_unit_code:     'NT',
-                package_unit_quantity: 1,
-                unit_price:            price,
-                total_amount:          total,
-                tax_type_code:         'A',
-                discount_rate:         0,
-                origin_nation_code:    'KE'
-            }]
-        };
-
-        log.info('[eTIMS] Submitting debit note', { ref: payload.trader_invoice_number, originalInvoiceNumber, itemName });
-
-        const res  = await fetch(`${DIGITAX_BASE_URL}/debit-notes`, {
-            method:  'POST',
-            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
-            body:    JSON.stringify(payload),
-            signal:  AbortSignal.timeout(10000)
-        });
-        const data = await res.json();
-
-        if (!res.ok) {
-            log.warn('[eTIMS] Debit note rejected', { status: res.status, body: JSON.stringify(data) });
-            return null;
-        }
-
-        const kraReceiptNo = data?.data?.receipt_number || data?.serial_number || data?.id || payload.trader_invoice_number;
-        const kraQrUrl     = data?.data?.etims_url || data?.etims_url || data?.offline_url || null;
-        log.info('[eTIMS] ✅ Debit note accepted', { kraReceiptNo });
-        return { kraReceiptNo, kraQrUrl };
-
-    } catch (err) {
-        log.warn('[eTIMS] Debit note call failed:', err.message);
-        return null;
-    }
-}
-
 /**
  * Registers an item with DigiTax (KRA eTIMS) and pushes its opening stock.
  * Uses DigiTax KE V2 API: PUT /stock/adjust
@@ -2774,8 +2645,8 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
     // 1. Validations
     if (!returnedItemId || !replacementItemId || !returnReason)
         return res.status(400).json({ success: false, message: 'returnedItemId, replacementItemId and returnReason are required.' });
-    if (!kraInvoiceNumber)
-        return res.status(400).json({ success: false, message: 'Original KRA Invoice Number is required for tax reversal.' });
+    // kraInvoiceNumber is used for KRA eTIMS credit/debit note — warn in log if missing but don't block
+    if (!kraInvoiceNumber) log.warn('[RETURNS] Exchange submitted without KRA invoice number — eTIMS note will be unlinked.');
     if (!['damaged','wrong_item','other'].includes(returnReason))
         return res.status(400).json({ success: false, message: 'returnReason must be: damaged, wrong_item or other.' });
 
@@ -2796,41 +2667,25 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
         // 3. KRA COMPLIANCE CALLS (Must happen before DB updates to ensure sync)
         
         // A. Reverse original tax (Credit Note)
-        // Use cost_price as fallback when sellingPriceOriginal not provided
-        const etimsUnitPrice = parseFloat(sellingPriceOriginal) || parseFloat(retItem.cost_price) || 0;
+        const creditNote = await submitCreditNoteToEtims({
+            originalInvoiceNumber: kraInvoiceNumber,
+            itemName: retItem.item_name,
+            quantity: retQty,
+            unitPrice: sellingPriceOriginal,
+            reason: returnReason
+        });
+        if (!creditNote) throw new Error('KRA Credit Note failed. Aborting exchange to maintain tax sync.');
 
-        // Choose credit note (wrong_item/other) or debit note (damaged)
-        let kraNote = null;
-        if (returnReason === 'damaged') {
-            kraNote = await submitDebitNoteToEtims({
-                originalInvoiceNumber: kraInvoiceNumber,
-                itemName:     retItem.item_name,
-                quantity:     retQty,
-                unitPrice:    etimsUnitPrice,
-                customerName: customerName || null
-            });
-        } else {
-            kraNote = await submitCreditNoteToEtims({
-                originalInvoiceNumber: kraInvoiceNumber,
-                itemName:     retItem.item_name,
-                quantity:     retQty,
-                unitPrice:    etimsUnitPrice,
-                reason:       returnReason,
-                customerName: customerName || null
-            });
-        }
-        // Log KRA failure but do NOT abort — exchange is saved regardless
-        if (!kraNote) log.warn('[RETURNS] eTIMS note failed — exchange will be saved without KRA ref');
-
-        // B. Record replacement sale on KRA (best-effort — don't abort if it fails)
+        // B. Record new tax (New Sale Receipt)
         const replacementSale = await submitSaleToEtims({
-            itemName:      repItem.item_name,
-            quantity:      repQty,
-            unitPrice:     parseFloat(repItem.price) || etimsUnitPrice,
-            category:      repItem.category,
-            paymentMethod: 'Cash',
+            itemName: repItem.item_name,
+            quantity: repQty,
+            unitPrice: sellingPriceOriginal, // Assuming even value swap
+            category: repItem.category,
+            paymentMethod: 'Credit', 
             invoiceNumber: `EXCH-${originalReceipt || Date.now()}`
         });
+        if (!replacementSale) throw new Error('KRA Replacement Receipt failed. Aborting exchange.');
 
         // 4. Inventory & Expense Logic (Your detailed calculations)
         const costWrittenOff = parseFloat(retItem.cost_price || 0) * retQty;
@@ -2863,7 +2718,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
                 action: returnReason === 'damaged' ? 'DAMAGE_WRITEOFF' : 'EXCHANGE_IN',
                 item_name: retItem.item_name,
                 old_stock: retOldStock, added_qty: returnReason === 'damaged' ? 0 : retQty, new_stock: retNewStock,
-                details: `EXCHANGE IN (KRA CN: ${kraNote?.kraReceiptNo || 'pending'}). Reason: ${returnReason.toUpperCase()}. Original Receipt: ${originalReceipt}`,
+                details: `EXCHANGE IN (KRA CN: ${creditNote.kraReceiptNo}). Reason: ${returnReason.toUpperCase()}. Original Receipt: ${originalReceipt}`,
                 timestamp: new Date().toISOString()
             },
             {
@@ -2871,7 +2726,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
                 action: 'EXCHANGE_OUT',
                 item_name: repItem.item_name,
                 old_stock: repOldStock, added_qty: -repQty, new_stock: repNewStock,
-                details: `EXCHANGE OUT (KRA REC: ${replacementSale?.kraReceiptNo || 'pending'}). Issued for ${retItem.item_name}.`,
+                details: `EXCHANGE OUT (KRA REC: ${replacementSale.kraReceiptNo}). Issued for ${retItem.item_name}.`,
                 timestamp: new Date().toISOString()
             }
         ];
@@ -2891,22 +2746,18 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
             replacement_quantity: repQty,
             cost_price_written_off: costWrittenOff,
             selling_price_original: parseFloat(sellingPriceOriginal || 0),
-            kra_return_ref:     kraNote?.kraReceiptNo     || null,
-            kra_return_qr_url:  kraNote?.kraQrUrl         || null,
-            kra_replacement_receipt_no: replacementSale?.kraReceiptNo || null,
+            kra_credit_note_no: creditNote.kraReceiptNo,       // Mandatory for KRA Audit
+            kra_replacement_receipt_no: replacementSale.kraReceiptNo, // Mandatory for KRA Audit
             processed_by: processedBy,
             expense_id: expenseId,
             notes: notes
         }]).select('id').single();
 
         res.json({
-            success:        true,
-            message:        `Exchange processed. ${kraNote ? `KRA Note: ${kraNote.kraReceiptNo}.` : 'KRA note pending.'} ${replacementSale ? `Replacement: ${replacementSale.kraReceiptNo}.` : ''}`,
-            returnId:       rec?.id,
-            expenseId,
-            kraReturnRef:   kraNote?.kraReceiptNo    || null,
-            kraReturnQrUrl: kraNote?.kraQrUrl        || null,
-            etimsSubmitted: !!kraNote,
+            success: true,
+            message: `Exchange processed. KRA Credit Note: ${creditNote.kraReceiptNo}. Replacement: ${replacementSale.kraReceiptNo}`,
+            returnId: rec?.id,
+            expenseId
         });
 
     } catch (err) {
@@ -2968,7 +2819,7 @@ app.get('/api/returns/search-sale', requireAuth, requireRole('admin', 'manager')
     if (!q) return res.status(400).json({ success: false, message: 'Query q is required.' });
     try {
         const { data, error } = await supabase.from('Sales')
-            .select('id,receipt_number,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
+            .select('id,receipt_number,invoice_number,kra_receipt_no,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status')
             .or(`customer_name.ilike.%${q}%,customer_phone.ilike.%${q}%,receipt_number.ilike.%${q}%`)
             .eq('is_voided', false)
             .order('sale_date', { ascending: false })
