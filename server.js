@@ -67,14 +67,14 @@ async function submitSaleToEtims(saleData) {
                 item_class_code:       '99010000',
                 item_type_code:        '2',
                 item_bar_code:         barCode,
-                item_tax_type_code:    'A',
+                item_tax_type_code:    'B',  // B = 16% VAT (standard rate for hardware goods)
                 quantity:              quantity,
                 quantity_unit_code:    'U',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
-                unit_price:            unitPrice,
+                unit_price:            unitPrice,   // VAT-inclusive price (KRA expects inclusive pricing)
                 total_amount:          totalAmount,
-                tax_type_code:         'A',
+                tax_type_code:         'B',  // B = 16% VAT
                 discount_rate:         0,
                 origin_nation_code:    'KE'
             }]
@@ -124,7 +124,7 @@ async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
       const classCodeMap = {
-    // ── Core categories — verified against ke.docs.digitax.tech/docs/items-item-classification-table ──
+    // Verified against ke.docs.digitax.tech/docs/items-item-classification-table
     'Hardware':            '27110000',  // Hand tools
     'Tools':               '27110000',  // Hand tools
     'Power Tools':         '27110000',  // Tools and General Machinery
@@ -161,7 +161,7 @@ async function registerItemWithEtims(item) {
             item_class_code:    classCodeMap[item.category] || '99010000',
             item_type_code:     '2',
             item_bar_code:      barCode,
-            tax_type_code:      'A',
+            tax_type_code:      'B',  // B = 16% VAT (standard rate for hardware goods)
             default_unit_price: parseFloat(item.sellingPrice) || 0,
             quantity_unit_code: 'U',
             package_unit_code:  'NT',
