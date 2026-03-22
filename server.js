@@ -128,7 +128,6 @@ async function registerItemWithEtims(item) {
     try {
       const classCodeMap = {
     // UNSPSC 8-digit codes — KRA eTIMS production-ready
-    // Layer 1: POS category name → Layer 2: UNSPSC 8-digit code
     'Hardware':           '27111601',  // Hand tools — general hardware
     'Tools':              '27111601',  // Hand tools
     'Power Tools':        '27112700',  // Power tools
@@ -506,17 +505,20 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
         let digitaxItemId = null;
         const etimsItem = await registerItemWithEtims({
             itemName: itemName, category: category || 'General',
-            sellingPrice: sellingPrice, unit: unit || 'PCS'
+            sellingPrice: sellingPrice, unit: unit || 'PCS',
+            stockQty: parseInt(stockQty) || 0
         });
         if (etimsItem) {
             digitaxItemId = etimsItem;
             await supabase.from('Inventory')
                 .update({ digitax_item_id: digitaxItemId, kra_registered: true })
                 .eq('id', newItem.id);
+            // Belt-and-suspenders stock sync after registerItemWithEtims Phase 2
+            await syncStockWithEtims(digitaxItemId, parseInt(stockQty), 'Initial System Upload');
         }
         res.json({
             success:       true,
-            message:       'Product registered successfully!' + (digitaxItemId ? ' ✅ KRA item registered.' : ' ⚠️ KRA registration pending.'),
+            message:       'Product registered successfully!' + (digitaxItemId ? ' ✅ KRA item registered + stock synced.' : ' ⚠️ KRA registration pending.'),
             kraRegistered: !!digitaxItemId,
             digitaxItemId
         });
@@ -566,6 +568,14 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
             timestamp: new Date().toISOString()
         }]);
         if (auditErr2) console.error('Audit log error (RESTOCK_FIFO):', auditErr2.message);
+
+        // Sync restocked quantity with KRA
+        const { data: restockedItem } = await supabase
+            .from('Inventory').select('digitax_item_id').eq('id', inventory_id).single();
+        if (restockedItem?.digitax_item_id) {
+            await syncStockWithEtims(restockedItem.digitax_item_id, added, `Restock — DN: ${delivery_number}`);
+        }
+
         res.json({ success: true, message: 'Restock successful!' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2120,12 +2130,15 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
             // ── Register item with DigiTax/KRA (non-blocking) ──────────────
             const bulkEtimsId = await registerItemWithEtims({
                 itemName: itemName.trim(), category: category || 'General',
-                sellingPrice: price, unit: unit || 'PCS'
+                sellingPrice: price, unit: unit || 'PCS',
+                stockQty: qty
             });
             if (bulkEtimsId) {
                 await supabase.from('Inventory')
                     .update({ digitax_item_id: bulkEtimsId, kra_registered: true })
                     .eq('id', newItem.id);
+                // Sync opening stock with KRA
+                await syncStockWithEtims(bulkEtimsId, qty, 'Initial System Upload');
             }
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
