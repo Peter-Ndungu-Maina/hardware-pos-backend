@@ -124,146 +124,146 @@ async function submitSaleToEtims(saleData) {
 }
 
 async function registerItemWithEtims(item) {
-    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
-    try {
-      const classCodeMap = {
-    // Verified against ke.docs.digitax.tech/docs/items-item-classification-table
-    'Hardware':            '27110000',  // Hand tools
-    'Tools':               '27110000',  // Hand tools
-    'Power Tools':         '27110000',  // Tools and General Machinery
-    'Welding':             '27110000',  // Tools and General Machinery
-    'Hydraulics':          '27120000',  // Hydraulic machinery and equipment
-    'Paint':               '31210000',  // Paints and primers and finishes
-    'Electrical':          '39120000',  // Electrical equipment and components and supplies
-    'Lighting':            '39110000',  // Lighting Fixtures and Accessories
-    'Plumbing':            '40170000',  // Pipe piping and pipe fittings
-    'Water Storage':       '40170000',  // Pipe piping and pipe fittings
-    'Building Materials':  '30110000',  // Concrete and cement and plaster
-    'Cement':              '30110000',  // Concrete and cement and plaster
-    'Steel & Metal':       '30100000',  // Structural components and basic shapes
-    'Timber & Wood':       '30130000',  // Structural building products
-    'Fencing':             '30130000',  // Structural building products
-    'Roofing':             '30150000',  // Exterior finishing materials
-    'Tiles & Flooring':    '30160000',  // Interior finishing materials
-    'Insulation':          '30140000',  // Insulation
-    'Doors & Windows':     '30170000',  // Doors and windows and glass
-    'Ladders':             '30190000',  // Construction and maintenance support equipment
-    'Scaffolding':         '30190000',  // Construction and maintenance support equipment
-    'Fasteners':           '31160000',  // Hardware — screws, bolts, nails
-    'Adhesives':           '31200000',  // Adhesives and sealants
-    'Safety':              '46180000',  // Personal safety and protection
-    'Cleaning':            '47130000',  // Cleaning and janitorial supplies
-    'General':             '99010000',  // Goods — safe default
+    if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
+    try {
+      const classCodeMap = {
+    // Verified against ke.docs.digitax.tech/docs/items-item-classification-table
+    'Hardware':            '27110000',  // Hand tools
+    'Tools':               '27110000',  // Hand tools
+    'Power Tools':         '27110000',  // Tools and General Machinery
+    'Welding':             '27110000',  // Tools and General Machinery
+    'Hydraulics':          '27120000',  // Hydraulic machinery and equipment
+    'Paint':               '31210000',  // Paints and primers and finishes
+    'Electrical':          '39120000',  // Electrical equipment and components and supplies
+    'Lighting':            '39110000',  // Lighting Fixtures and Accessories
+    'Plumbing':            '40170000',  // Pipe piping and pipe fittings
+    'Water Storage':       '40170000',  // Pipe piping and pipe fittings
+    'Building Materials':  '30110000',  // Concrete and cement and plaster
+    'Cement':              '30110000',  // Concrete and cement and plaster
+    'Steel & Metal':       '30100000',  // Structural components and basic shapes
+    'Timber & Wood':       '30130000',  // Structural building products
+    'Fencing':             '30130000',  // Structural building products
+    'Roofing':             '30150000',  // Exterior finishing materials
+    'Tiles & Flooring':    '30160000',  // Interior finishing materials
+    'Insulation':          '30140000',  // Insulation
+    'Doors & Windows':     '30170000',  // Doors and windows and glass
+    'Ladders':             '30190000',  // Construction and maintenance support equipment
+    'Scaffolding':         '30190000',  // Construction and maintenance support equipment
+    'Fasteners':           '31160000',  // Hardware — screws, bolts, nails
+    'Adhesives':           '31200000',  // Adhesives and sealants
+    'Safety':              '46180000',  // Personal safety and protection
+    'Cleaning':            '47130000',  // Cleaning and janitorial supplies
+    'General':             '99010000',  // Goods — safe default
 };
-        const barCode = String(
-            item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
-        ).padStart(8, '0');
+        const barCode = String(
+            item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
+        ).padStart(8, '0');
 
-        const payload = {
-            item_name:          item.itemName,
-            item_class_code:    classCodeMap[item.category] || '99010000',
-            item_type_code:     '2',
-            item_bar_code:      barCode,
-            tax_type_code:      'B',  // B = 16% VAT
-            default_unit_price: parseFloat(item.sellingPrice) || 0,
-            quantity_unit_code: 'U',
-            package_unit_code:  'NT',
-            origin_nation_code: 'KE',
-            active:             true
-        };
-        
-        const res  = await fetch(`${DIGITAX_BASE_URL}/items`, {
-            method:  'POST',
-            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
-            body:    JSON.stringify(payload),
-            signal:  AbortSignal.timeout(10000)
-        });
-        const data = await res.json();
+        const payload = {
+            item_name:          item.itemName,
+            item_class_code:    classCodeMap[item.category] || '99010000',
+            item_type_code:     '2',
+            item_bar_code:      barCode,
+            tax_type_code:      'B',  // B = 16% VAT (standard rate for hardware goods),  // B = 16% VAT
+            default_unit_price: parseFloat(item.sellingPrice) || 0,
+            quantity_unit_code: 'U',
+            package_unit_code:  'NT',
+            origin_nation_code: 'KE',
+            active:             true
+        };
+        
+        const res  = await fetch(`${DIGITAX_BASE_URL}/items`, {
+            method:  'POST',
+            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(10000)
+        });
+        const data = await res.json();
 
-        if (!res.ok) {
-            log.warn('[eTIMS] Item registration rejected', { status: res.status, item: item.itemName, body: JSON.stringify(data) });
-            return null;
-        }
+        if (!res.ok) {
+            log.warn('[eTIMS] Item registration rejected', { status: res.status, item: item.itemName, body: JSON.stringify(data) });
+            return null;
+        }
 
-        const digitaxItemId = data?.id || data?.item_id || data?.data?.id || null;
-        log.info('[eTIMS] ✅ Identity registered', { item: item.itemName, digitaxItemId });
+        const digitaxItemId = data?.id || data?.item_id || data?.data?.id || null;
+        log.info('[eTIMS] ✅ Identity registered', { item: item.itemName, digitaxItemId });
 
-        // ════════ PHASE 2: IMMEDIATELY UPLOAD STOCK QUANTITY ════════
-        // We use the ID from Phase 1 to push the stock count so KRA doesn't show 0
-        const stockQty = parseFloat(item.stockQty || item.stock_quantity) || 0;
+        // ════════ PHASE 2: IMMEDIATELY UPLOAD STOCK QUANTITY ════════
+        // We use the ID from Phase 1 to push the stock count so KRA doesn't show 0
+        const stockQty = parseFloat(item.stockQty || item.stock_quantity) || 0;
 
-        if (digitaxItemId && stockQty > 0) {
+        if (digitaxItemId && stockQty > 0) {
             log.info(`[eTIMS] Waiting 3s before pushing ${stockQty} units...`);
             await new Promise(resolve => setTimeout(resolve, 3000));
 
-           const stockPayload = {
-    item_id:       digitaxItemId,
-    quantity:      stockQty,
-    movement_type: '04',
-    action:        'ADD',
-    branch_id:     '01', // Standard KRA branch code
-    store_id:      '01', // Standard KRA store code
-    remarks:       'Initial System Upload'
+           const stockPayload = {
+    item_id:       digitaxItemId,
+    quantity:      stockQty,
+    movement_type: '04',
+    action:        'ADD',
+    branch_id:     '01', // Standard KRA branch code
+    store_id:      '01', // Standard KRA store code
+    remarks:       'Initial System Upload'
 };
 
-            const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
-                method:  'PUT',
-                headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
-                body:    JSON.stringify(stockPayload),
-                signal:  AbortSignal.timeout(10000)
-            });
+            const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+                method:  'PUT',
+                headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                body:    JSON.stringify(stockPayload),
+                signal:  AbortSignal.timeout(10000)
+            });
 
-            if (stockRes.ok) {
-                log.info('[eTIMS] ✅ Stock quantity successfully uploaded');
-            } else {
-                const stockData = await stockRes.json();
-                log.warn('[eTIMS] ❌ Identity created, but stock upload failed', { body: stockData });
-            }
-        }
+            if (stockRes.ok) {
+                log.info('[eTIMS] ✅ Stock quantity successfully uploaded');
+            } else {
+                const stockData = await stockRes.json();
+                log.warn('[eTIMS] ❌ Identity created, but stock upload failed', { body: stockData });
+            }
+        }
 
-        return digitaxItemId;
+        return digitaxItemId;
 
-    } catch (err) {
-        log.warn('[eTIMS] Critical failure during registration/stock push:', err.message);
-        return null;
-    }
+    } catch (err) {
+        log.warn('[eTIMS] Critical failure during registration/stock push:', err.message);
+        return null;
+    }
 }
 async function syncStockWithEtims(digitaxItemId, quantity, reason, movementType = '04') {
-    if (!DIGITAX_API_KEY || !digitaxItemId) return null;
-    
-    try {
-        const payload = {
-            item_id:       digitaxItemId,
-            quantity:      parseFloat(quantity) || 0,
-            movement_type: movementType, // '04' for restock/opening, '01' for purchase
-            action:        'ADD',         // Tells KRA to + this to the current balance
-            remarks:       reason || 'Stock Update'
-        };
+    if (!DIGITAX_API_KEY || !digitaxItemId) return null;
+    
+    try {
+        const payload = {
+            item_id:       digitaxItemId,
+            quantity:      parseFloat(quantity) || 0,
+            movement_type: movementType, // '04' for restock/opening, '01' for purchase
+            action:        'ADD',         // Tells KRA to + this to the current balance
+            remarks:       reason || 'Stock Update'
+        };
 
-        // Use the dedicated stock adjust endpoint
-        const res = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
-            method:  'PUT', 
-            headers: { 
-                'x-api-key': DIGITAX_API_KEY, 
-                'Content-Type': 'application/json' 
-            },
-            body:    JSON.stringify(payload),
-            signal:  AbortSignal.timeout(10000)
-        });
+        // Use the dedicated stock adjust endpoint
+        const res = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+            method:  'PUT', 
+            headers: { 
+                'x-api-key': DIGITAX_API_KEY, 
+                'Content-Type': 'application/json' 
+            },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(10000)
+        });
 
-        const data = await res.json();
+        const data = await res.json();
 
-        if (!res.ok) {
-            log.warn('[eTIMS] Stock adjustment rejected', { digitaxItemId, body: data });
-            return null;
-        }
+        if (!res.ok) {
+            log.warn('[eTIMS] Stock adjustment rejected', { digitaxItemId, body: data });
+            return null;
+        }
 
-        log.info('[eTIMS] ✅ Stock balance updated in DigiTax');
-        return data;
-    } catch (err) {
-        log.warn('[eTIMS] Stock sync exception:', err.message);
-        return null;
-    }
+        log.info('[eTIMS] ✅ Stock balance updated in DigiTax');
+        return data;
+    } catch (err) {
+        log.warn('[eTIMS] Stock sync exception:', err.message);
+        return null;
+    }
 } 
 // ============================================================
 //  2. EMAIL CONFIGURATION
@@ -499,10 +499,12 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
             await supabase.from('Inventory')
                 .update({ digitax_item_id: digitaxItemId, kra_registered: true })
                 .eq('id', newItem.id);
+            // ── Sync opening stock quantity with KRA ──────────────────────
+            await syncStockWithEtims(digitaxItemId, parseInt(stockQty), 'Initial System Upload');
         }
         res.json({
             success:       true,
-            message:       'Product registered successfully!' + (digitaxItemId ? ' ✅ KRA item registered.' : ' ⚠️ KRA registration pending.'),
+            message:       'Product registered successfully!' + (digitaxItemId ? ' ✅ KRA item registered + stock synced.' : ' ⚠️ KRA registration pending.'),
             kraRegistered: !!digitaxItemId,
             digitaxItemId
         });
@@ -552,6 +554,14 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
             timestamp: new Date().toISOString()
         }]);
         if (auditErr2) console.error('Audit log error (RESTOCK_FIFO):', auditErr2.message);
+
+        // ── Sync restocked quantity with KRA ─────────────────────────────
+        const { data: restockedItem } = await supabase
+            .from('Inventory').select('digitax_item_id').eq('id', inventory_id).single();
+        if (restockedItem?.digitax_item_id) {
+            await syncStockWithEtims(restockedItem.digitax_item_id, added, `Restock — DN: ${delivery_number}`);
+        }
+
         res.json({ success: true, message: 'Restock successful!' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2112,6 +2122,8 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                 await supabase.from('Inventory')
                     .update({ digitax_item_id: bulkEtimsId, kra_registered: true })
                     .eq('id', newItem.id);
+                // ── Sync opening stock quantity with KRA ──────────────────
+                await syncStockWithEtims(bulkEtimsId, qty, 'Initial System Upload');
             }
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
