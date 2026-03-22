@@ -448,12 +448,12 @@ app.get('/api/inventory', requireAuth, async (req, res) => {
 });
 
 app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validateBody({
-    item_name:      { type: 'string', required: true, maxLen: 200 },
-    price:          { type: 'number', required: true, min: 0 },
-    cost_price:     { type: 'number', min: 0 },
-    stock_quantity: { type: 'number', min: 0 },
-    unit:           { type: 'string', maxLen: 50 },
-    category:       { type: 'string', maxLen: 100 },
+    itemName:      { type: 'string', required: true, maxLen: 200 },
+    sellingPrice:  { type: 'number', required: true, min: 0 },
+    costPrice:     { type: 'number', min: 0 },
+    stockQty:      { type: 'number', min: 0 },
+    unit:          { type: 'string', maxLen: 50 },
+    category:      { type: 'string', maxLen: 100 },
 }), async (req, res) => {
     const { itemName, category, unit, costPrice, sellingPrice, stockQty, deliveryNote } = req.body;
     const userName = req.user.name;
@@ -2718,58 +2718,36 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
         // Debit Note   → damaged goods write-off — notifies KRA of stock loss
         let kraReturnRef = null, kraReturnQrUrl = null;
         try {
+            const now      = new Date();
+            const date     = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
+            const time     = now.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true });
             const returnRef = `RET-${Date.now()}`;
 
-            // Credit note → wrong_item/other (reverses sale); Debit note → damaged (stock loss)
-            const isDamaged    = returnReason === 'damaged';
-            const noteEndpoint = isDamaged ? 'debit-notes' : 'credit-notes';
-            const sellingPrice = parseFloat(retItem.price || sellingPriceOriginal || retItem.cost_price || 0);
-            const saleDate     = new Date().toISOString().split('T')[0]; // YYYY-MM-DD required by DigiTax V2
-            const barCode      = String(
-                retItem.item_name.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
-            ).padStart(8, '0');
-
-            // Fetch item class code from Inventory if digitax_item_id exists
-            const classCodeMap = {
-                'Hardware':'27110000','Tools':'27110000','Power Tools':'27110000',
-                'Paint':'31210000','Electrical':'39120000','Lighting':'39110000',
-                'Plumbing':'40170000','Building Materials':'30110000','Cement':'30110000',
-                'Fasteners':'31160000','Safety':'46180000','General':'99010000'
-            };
-            const itemClassCode = classCodeMap[retItem.category] || '99010000';
+            // Credit note for customer return; debit note for damaged goods
+            const noteType = returnReason === 'damaged' ? 'debit_note' : 'credit_note';
+            const sellingPrice = parseFloat(sellingPriceOriginal || retItem.cost_price || 0);
 
             const payload = {
-                trader_invoice_number:   returnRef,
+                trader_invoice_number: returnRef,
                 original_invoice_number: kraInvoiceNumber || originalReceipt || null,
-                receipt_type_code:       isDamaged ? 'D' : 'C',   // C=Credit Note, D=Debit Note
-                payment_type_code:       '01',                     // 01=Cash (standard for reversals)
-                invoice_status_code:     '02',                     // 02=Cancelled/reversed
-                sale_date:               saleDate,
-                reason:                  isDamaged            ? 'Damaged goods write-off'
-                                       : returnReason === 'wrong_item' ? 'Wrong item returned'
-                                       : 'Customer return',
-                customer_name:           customerName || null,
-                items: [{
-                    item_name:             retItem.item_name,
-                    item_class_code:       itemClassCode,
-                    item_type_code:        '2',
-                    item_bar_code:         barCode,
-                    item_tax_type_code:    'B',
-                    quantity:              retQty,
-                    quantity_unit_code:    'U',
-                    package_unit_code:     'NT',
-                    package_unit_quantity: 1,
-                    unit_price:            sellingPrice,
-                    total_amount:          parseFloat((sellingPrice * retQty).toFixed(2)),
-                    tax_type_code:         'B',
-                    discount_rate:         0,
-                    origin_nation_code:    'KE'
+                note_type:   noteType,
+                date,
+                time,
+                reason:      returnReason === 'damaged'    ? 'Damaged goods write-off'
+                           : returnReason === 'wrong_item' ? 'Wrong item returned'
+                           : 'Customer return',
+                customer_pin:  null,
+                customer_name: customerName || null,
+                sale_items: [{
+                    item_name:     retItem.item_name,
+                    quantity:      retQty,
+                    unit_price:    sellingPrice,
+                    tax_type_code: 'B',  // B = 16% VAT
+                    discount_rate: 0
                 }]
             };
 
-            log.info('[eTIMS] Submitting return note', { endpoint: noteEndpoint, payload: JSON.stringify(payload) });
-
-            const etimsRes = await fetch(`${DIGITAX_BASE_URL}/${noteEndpoint}`, {
+            const etimsRes = await fetch(`${DIGITAX_BASE_URL}/${noteType === 'credit_note' ? 'credit-notes' : 'debit-notes'}`, {
                 method:  'POST',
                 headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
                 body:    JSON.stringify(payload),
@@ -2786,12 +2764,12 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
                     .update({ kra_return_ref: kraReturnRef, kra_return_qr_url: kraReturnQrUrl })
                     .eq('id', rec.id);
 
-                log.info(`[eTIMS] ✅ ${noteEndpoint} submitted to KRA`, { ref: kraReturnRef, reason: returnReason });
+                log.info(`[eTIMS] ✅ ${noteType} submitted to KRA`, { ref: kraReturnRef, reason: returnReason });
             } else {
-                log.warn('[eTIMS] Return note rejected by DigiTax', { status: etimsRes.status, body: JSON.stringify(etimsData) });
+                log.warn('[eTIMS] Return note rejected by DigiTax', { status: etimsRes.status, body: etimsData });
             }
         } catch (etimsErr) {
-            log.warn('[eTIMS] Return eTIMS submission failed (return still saved):', { message: etimsErr.message, stack: etimsErr.stack, name: etimsErr.name });
+            log.warn('[eTIMS] Return eTIMS submission failed (return still saved):', etimsErr.message);
         }
 
         res.json({
