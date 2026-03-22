@@ -209,6 +209,34 @@ async function registerItemWithEtims(item) {
                 if (retry.ok) {
                     const fallbackId = retryData?.id || retryData?.item_id || retryData?.data?.id || null;
                     log.info('[eTIMS] ✅ Item registered with fallback code', { item: item.itemName, digitaxItemId: fallbackId });
+
+                    // ── Phase 2: push stock qty for fallback-registered item ──
+                    const stockQtyFallback = parseFloat(item.stockQty || item.stock_quantity) || 0;
+                    if (fallbackId && stockQtyFallback > 0) {
+                        log.info(`[eTIMS] Waiting 3s before pushing ${stockQtyFallback} units (fallback)...`);
+                        await new Promise(resolve => setTimeout(resolve, 3000));
+                        const stockPayload = {
+                            item_id:       fallbackId,
+                            quantity:      stockQtyFallback,
+                            movement_type: '04',
+                            action:        'ADD',
+                            branch_id:     '01',
+                            store_id:      '01',
+                            remarks:       'Initial System Upload'
+                        };
+                        const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+                            method:  'PUT',
+                            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                            body:    JSON.stringify(stockPayload),
+                            signal:  AbortSignal.timeout(10000)
+                        });
+                        if (stockRes.ok) {
+                            log.info('[eTIMS] ✅ Stock pushed for fallback-registered item');
+                        } else {
+                            const sd = await stockRes.json();
+                            log.warn('[eTIMS] Stock push failed for fallback item', { body: sd });
+                        }
+                    }
                     return fallbackId;
                 }
                 log.warn('[eTIMS] Item registration failed even with fallback', { item: item.itemName, body: JSON.stringify(retryData) });
