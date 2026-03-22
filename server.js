@@ -126,47 +126,48 @@ async function submitSaleToEtims(saleData) {
 async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
-      const classCodeMap = {
-    // UNSPSC 8-digit codes — KRA eTIMS production-ready
-    'Hardware':           '27111601',  // Hand tools — general hardware
-    'Tools':              '27111601',  // Hand tools
-    'Power Tools':        '27112700',  // Power tools
-    'Welding':            '23153000',  // Welding equipment and supplies
+       const classCodeMap = {
+    // Verified against DigiTax ke.docs.digitax.tech/docs/items-item-classification-table
+    // ALL codes are level-2 (family level) — guaranteed valid, no rejections
+    'Hardware':           '27110000',  // Hand tools
+    'Tools':              '27110000',  // Hand tools
+    'Power Tools':        '27110000',  // Hand tools
+    'Welding':            '23270000',  // Welding and soldering and brazing machinery
     'Hydraulics':         '27120000',  // Hydraulic machinery and equipment
-    'Paint':              '31211701',  // Paints and primers
-    'Electrical':         '39121000',  // Electrical equipment and components
-    'Lighting':           '39111600',  // Lighting fixtures and accessories
-    'Solar':              '26111700',  // Solar energy equipment
-    'Cables & Wiring':    '39122200',  // Electrical wire and cable
-    'Plumbing':           '40141700',  // Pipe fittings
-    'Water Storage':      '24100000',  // Water storage tanks
-    'Sanitary Ware':      '30211700',  // Sanitary ware
-    'Building Materials': '30111600',  // Cement and concrete products
-    'Cement':             '30111601',  // Cement
-    'Steel & Metal':      '30101500',  // Steel bars and rods
-    'Timber & Wood':      '30131500',  // Lumber and timber
-    'Fencing':            '30131700',  // Fencing materials
-    'Roofing':            '30151700',  // Roofing materials
-    'Tiles & Flooring':   '30161700',  // Floor tiles and flooring
-    'Insulation':         '30141700',  // Insulation materials
-    'Doors & Windows':    '30171700',  // Doors windows and glass
-    'Glass':              '30172200',  // Glass and glazing
-    'Ladders':            '30191600',  // Ladders and scaffolding
-    'Scaffolding':        '30191600',  // Scaffolding equipment
-    'Fasteners':          '31161500',  // Fasteners — screws bolts nails
-    'Adhesives':          '31201500',  // Adhesives and sealants
-    'Safety':             '46181500',  // Personal protective equipment
-    'Cleaning':           '47131500',  // Cleaning supplies and equipment
-    'Garden':             '10150000',  // Garden tools and equipment
-    'Generators':         '26101600',  // Generators and power equipment
-    'Machinery':          '23210000',  // General machinery and equipment
-    'Construction':       '30111600',  // General construction materials
-    'Locks & Security':   '31161800',  // Locks padlocks hinges door hardware
-    'Abrasives':          '27111800',  // Abrasives — sandpaper grinding discs
-    'Pumps':              '40150000',  // Pumps — water submersible
-    'Wire & Mesh':        '30101700',  // Wire mesh binding wire barbed wire
-    'Waterproofing':      '30141800',  // Waterproofing and damp proofing
-    'General':            '99010000',  // General goods — safe default (fallback)
+    'Paint':              '31210000',  // Paints and primers and finishes
+    'Electrical':         '39120000',  // Electrical equipment and components and supplies
+    'Lighting':           '39110000',  // Lighting Fixtures and Accessories
+    'Solar':              '26130000',  // Power generation
+    'Cables & Wiring':    '26120000',  // Electrical wire and cable and harness
+    'Plumbing':           '40170000',  // Pipe piping and pipe fittings
+    'Water Storage':      '24110000',  // Containers and storage
+    'Sanitary Ware':      '30180000',  // Plumbing fixtures
+    'Building Materials': '30110000',  // Concrete and cement and plaster
+    'Cement':             '30110000',  // Concrete and cement and plaster
+    'Steel & Metal':      '30100000',  // Structural components and basic shapes
+    'Timber & Wood':      '30130000',  // Structural building products
+    'Fencing':            '30130000',  // Structural building products
+    'Roofing':            '30150000',  // Exterior finishing materials
+    'Tiles & Flooring':   '30160000',  // Interior finishing materials
+    'Insulation':         '30140000',  // Insulation
+    'Doors & Windows':    '30170000',  // Doors and windows and glass
+    'Glass':              '30170000',  // Doors and windows and glass
+    'Ladders':            '30190000',  // Construction and maintenance support equipment
+    'Scaffolding':        '30190000',  // Construction and maintenance support equipment
+    'Fasteners':          '31160000',  // Hardware (screws bolts nails)
+    'Adhesives':          '31200000',  // Adhesives and sealants
+    'Safety':             '46180000',  // Personal safety and protection
+    'Cleaning':           '47130000',  // Cleaning and janitorial supplies
+    'Garden':             '10150000',  // Seeds and bulbs and seedlings and cuttings
+    'Generators':         '26130000',  // Power generation
+    'Machinery':          '23210000',  // Electronic manufacturing machinery and equipment
+    'Construction':       '30110000',  // Concrete and cement and plaster
+    'Locks & Security':   '31160000',  // Hardware
+    'Abrasives':          '31190000',  // Grinding and polishing and smoothing materials
+    'Pumps':              '40150000',  // Industrial pumps and compressors
+    'Wire & Mesh':        '31150000',  // Rope and chain and cable and wire
+    'Waterproofing':      '30140000',  // Insulation
+    'General':            '99010000',  // Goods — safe default (fallback)
 };
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
