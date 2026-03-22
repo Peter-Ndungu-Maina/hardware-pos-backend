@@ -127,33 +127,47 @@ async function registerItemWithEtims(item) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — skipping item registration'); return null; }
     try {
       const classCodeMap = {
-    // Verified against ke.docs.digitax.tech/docs/items-item-classification-table
-    'Hardware':            '27110000',  // Hand tools
-    'Tools':               '27110000',  // Hand tools
-    'Power Tools':         '27110000',  // Tools and General Machinery
-    'Welding':             '27110000',  // Tools and General Machinery
-    'Hydraulics':          '27120000',  // Hydraulic machinery and equipment
-    'Paint':               '31210000',  // Paints and primers and finishes
-    'Electrical':          '39120000',  // Electrical equipment and components and supplies
-    'Lighting':            '39110000',  // Lighting Fixtures and Accessories
-    'Plumbing':            '40170000',  // Pipe piping and pipe fittings
-    'Water Storage':       '40170000',  // Pipe piping and pipe fittings
-    'Building Materials':  '30110000',  // Concrete and cement and plaster
-    'Cement':              '30110000',  // Concrete and cement and plaster
-    'Steel & Metal':       '30100000',  // Structural components and basic shapes
-    'Timber & Wood':       '30130000',  // Structural building products
-    'Fencing':             '30130000',  // Structural building products
-    'Roofing':             '30150000',  // Exterior finishing materials
-    'Tiles & Flooring':    '30160000',  // Interior finishing materials
-    'Insulation':          '30140000',  // Insulation
-    'Doors & Windows':     '30170000',  // Doors and windows and glass
-    'Ladders':             '30190000',  // Construction and maintenance support equipment
-    'Scaffolding':         '30190000',  // Construction and maintenance support equipment
-    'Fasteners':           '31160000',  // Hardware — screws, bolts, nails
-    'Adhesives':           '31200000',  // Adhesives and sealants
-    'Safety':              '46180000',  // Personal safety and protection
-    'Cleaning':            '47130000',  // Cleaning and janitorial supplies
-    'General':             '99010000',  // Goods — safe default
+    // UNSPSC 8-digit codes — KRA eTIMS production-ready
+    // Layer 1: POS category name → Layer 2: UNSPSC 8-digit code
+    'Hardware':           '27111601',  // Hand tools — general hardware
+    'Tools':              '27111601',  // Hand tools
+    'Power Tools':        '27112700',  // Power tools
+    'Welding':            '23153000',  // Welding equipment and supplies
+    'Hydraulics':         '27120000',  // Hydraulic machinery and equipment
+    'Paint':              '31211701',  // Paints and primers
+    'Electrical':         '39121000',  // Electrical equipment and components
+    'Lighting':           '39111600',  // Lighting fixtures and accessories
+    'Solar':              '26111700',  // Solar energy equipment
+    'Cables & Wiring':    '39122200',  // Electrical wire and cable
+    'Plumbing':           '40171500',  // Pipe fittings
+    'Water Storage':      '24102200',  // Water storage tanks
+    'Sanitary Ware':      '30211700',  // Sanitary ware
+    'Building Materials': '30111600',  // Cement and concrete products
+    'Cement':             '30111601',  // Cement
+    'Steel & Metal':      '30101500',  // Steel bars and rods
+    'Timber & Wood':      '30131500',  // Lumber and timber
+    'Fencing':            '30131700',  // Fencing materials
+    'Roofing':            '30151700',  // Roofing materials
+    'Tiles & Flooring':   '30161700',  // Floor tiles and flooring
+    'Insulation':         '30141700',  // Insulation materials
+    'Doors & Windows':    '30171700',  // Doors windows and glass
+    'Glass':              '30172200',  // Glass and glazing
+    'Ladders':            '30191600',  // Ladders and scaffolding
+    'Scaffolding':        '30191600',  // Scaffolding equipment
+    'Fasteners':          '31161500',  // Fasteners — screws bolts nails
+    'Adhesives':          '31201500',  // Adhesives and sealants
+    'Safety':             '46181500',  // Personal protective equipment
+    'Cleaning':           '47131500',  // Cleaning supplies and equipment
+    'Garden':             '10150000',  // Garden tools and equipment
+    'Generators':         '26101600',  // Generators and power equipment
+    'Machinery':          '23210000',  // General machinery and equipment
+    'Construction':       '30111600',  // General construction materials
+    'Locks & Security':   '31161800',  // Locks padlocks hinges door hardware
+    'Abrasives':          '27111800',  // Abrasives — sandpaper grinding discs
+    'Pumps':              '40151500',  // Pumps — water submersible
+    'Wire & Mesh':        '30101700',  // Wire mesh binding wire barbed wire
+    'Waterproofing':      '30141800',  // Waterproofing and damp proofing
+    'General':            '99010000',  // General goods — safe default (fallback)
 };
         const barCode = String(
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
@@ -164,7 +178,7 @@ async function registerItemWithEtims(item) {
             item_class_code:    classCodeMap[item.category] || '99010000',
             item_type_code:     '2',
             item_bar_code:      barCode,
-            tax_type_code:      'B',  // B = 16% VAT (standard rate for hardware goods),  // B = 16% VAT
+            tax_type_code:      'B',  // B = 16% VAT
             default_unit_price: parseFloat(item.sellingPrice) || 0,
             quantity_unit_code: 'U',
             package_unit_code:  'NT',
@@ -499,12 +513,10 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
             await supabase.from('Inventory')
                 .update({ digitax_item_id: digitaxItemId, kra_registered: true })
                 .eq('id', newItem.id);
-            // ── Sync opening stock quantity with KRA ──────────────────────
-            await syncStockWithEtims(digitaxItemId, parseInt(stockQty), 'Initial System Upload');
         }
         res.json({
             success:       true,
-            message:       'Product registered successfully!' + (digitaxItemId ? ' ✅ KRA item registered + stock synced.' : ' ⚠️ KRA registration pending.'),
+            message:       'Product registered successfully!' + (digitaxItemId ? ' ✅ KRA item registered.' : ' ⚠️ KRA registration pending.'),
             kraRegistered: !!digitaxItemId,
             digitaxItemId
         });
@@ -554,14 +566,6 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
             timestamp: new Date().toISOString()
         }]);
         if (auditErr2) console.error('Audit log error (RESTOCK_FIFO):', auditErr2.message);
-
-        // ── Sync restocked quantity with KRA ─────────────────────────────
-        const { data: restockedItem } = await supabase
-            .from('Inventory').select('digitax_item_id').eq('id', inventory_id).single();
-        if (restockedItem?.digitax_item_id) {
-            await syncStockWithEtims(restockedItem.digitax_item_id, added, `Restock — DN: ${delivery_number}`);
-        }
-
         res.json({ success: true, message: 'Restock successful!' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2122,8 +2126,6 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                 await supabase.from('Inventory')
                     .update({ digitax_item_id: bulkEtimsId, kra_registered: true })
                     .eq('id', newItem.id);
-                // ── Sync opening stock quantity with KRA ──────────────────
-                await syncStockWithEtims(bulkEtimsId, qty, 'Initial System Upload');
             }
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
