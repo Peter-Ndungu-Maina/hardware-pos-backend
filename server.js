@@ -2203,6 +2203,194 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
 });
 
 // ============================================================
+//  8. SELL ROUTE — MULTI-ITEM (cart checkout)
+//  POST /api/sell/cart
+//  Accepts all cart items in ONE request → ONE receipt/invoice number
+// ============================================================
+app.post('/api/sell/cart', requireAuth, async (req, res) => {
+    const { items, paymentMethod, mpesaId, mpesaCode, customerName, amountPaid } = req.body;
+    const soldBy = req.user.name;
+
+    if (!Array.isArray(items) || items.length === 0)
+        return res.status(400).json({ success: false, message: 'Cart is empty.' });
+    if (!['Cash', 'M-Pesa', 'Credit'].includes(paymentMethod))
+        return res.status(400).json({ success: false, message: 'Invalid payment method.' });
+
+    const paidNow    = Math.max(0, parseFloat(amountPaid) || 0);
+    const linkedPhone = (mpesaId && mpesaId.trim()) ? mpesaId.trim() : null;
+
+    if ((paymentMethod === 'M-Pesa' || paymentMethod === 'Credit') && !linkedPhone)
+        return res.status(400).json({ success: false, message: 'Phone number required.' });
+    if (paymentMethod === 'M-Pesa' && (!mpesaCode || !mpesaCode.trim()))
+        return res.status(400).json({ success: false, message: 'M-Pesa Code required.' });
+
+    try {
+        // ── Generate ONE shared document number for the whole cart ────────────
+        const today    = new Date();
+        const datePart = today.getFullYear().toString() +
+            String(today.getMonth() + 1).padStart(2, '0') +
+            String(today.getDate()).padStart(2, '0');
+        const dayStart = `${datePart.slice(0,4)}-${datePart.slice(4,6)}-${datePart.slice(6,8)}T00:00:00Z`;
+
+        const { count: todayCount } = await supabase
+            .from('Sales').select('*', { count: 'exact', head: true })
+            .gte('sale_date', dayStart);
+        const seq = String((todayCount || 0) + 1).padStart(4, '0');
+
+        const isCredit     = paymentMethod === 'Credit';
+        const receiptNumber = isCredit ? null : 'REC-' + datePart + '-' + seq;
+        const invoiceNumber = isCredit ? 'INV-' + datePart + '-' + seq : null;
+        const dnNumber      = isCredit ? 'DN-'  + datePart + '-' + seq : null;
+
+        // ── Process each item ─────────────────────────────────────────────────
+        let cartTotal = 0, cartCost = 0;
+        const saleIds = [];
+
+        for (const cartItem of items) {
+            const qty = parseInt(cartItem.quantity);
+            if (!qty || qty <= 0) continue;
+
+            // Fetch price from DB — never trust client price
+            const { data: invItem, error: fetchErr } = await supabase
+                .from('Inventory').select('item_name, price, stock_quantity').eq('id', cartItem.itemId).single();
+            if (fetchErr || !invItem) throw new Error(`Item ${cartItem.itemId} not found.`);
+
+            const price    = invItem.price;
+            const itemName = invItem.item_name;
+            const itemTotal = qty * price;
+
+            // FIFO batch drain
+            const { data: batches } = await supabase.from('stock_batches').select('*')
+                .eq('inventory_id', cartItem.itemId).gt('remaining_qty', 0).order('created_at', { ascending: true });
+
+            let remaining = qty, itemCost = 0;
+            for (const batch of (batches || [])) {
+                if (remaining <= 0) break;
+                const take   = Math.min(batch.remaining_qty, remaining);
+                const newQty = batch.remaining_qty - take;
+                itemCost    += take * parseFloat(batch.unit_cost || 0);
+                await supabase.from('stock_batches').update({ remaining_qty: newQty }).eq('id', batch.id);
+                if (newQty === 0) {
+                    const next = batches[batches.indexOf(batch) + 1];
+                    transporter.sendMail({
+                        from: process.env.EMAIL_USER, to: process.env.EMAIL_USER,
+                        subject: `📦 BATCH FINISHED: ${itemName}`,
+                        text: `Batch for "${itemName}" depleted. Next: ${next ? 'KES ' + next.unit_cost : 'NO STOCK LEFT'}`
+                    }, e => { if (e) log.warn('Batch email failed', e); });
+                }
+                remaining -= take;
+            }
+
+            const avgCost   = itemCost / qty;
+            // Proportional payment per item (by value weight)
+            cartTotal += itemTotal;
+            cartCost  += itemCost;
+
+            // Insert sale row — all share the SAME receipt/invoice/DN number
+            const itemPaid = isCredit ? 0 : itemTotal; // per-item paid
+            const { data: saleRow, error: insertErr } = await supabase.from('Sales').insert([{
+                item_name:      itemName,
+                quantity_sold:  qty,
+                unit_price:     price,
+                total_amount:   itemTotal,
+                amount_paid:    itemPaid,
+                cost_price:     avgCost,
+                profit:         itemTotal - itemCost,
+                payment_status: isCredit ? 'Credit' : 'Paid',
+                is_credit_sale: isCredit,
+                customer_name:  customerName || 'Walk-in',
+                customer_phone: linkedPhone,
+                sold_by:        soldBy,
+                sale_date:      new Date().toISOString(),
+                receipt_number: receiptNumber,   // ← SAME for all items
+                invoice_number: invoiceNumber,   // ← SAME for all items
+                dn_number:      dnNumber         // ← SAME for all items
+            }]).select().single();
+            if (insertErr) throw insertErr;
+            saleIds.push(saleRow.id);
+
+            // Atomic stock decrement
+            const { error: rpcErr } = await supabase.rpc('decrement_stock', {
+                p_item_id: cartItem.itemId, p_quantity: qty
+            });
+            if (rpcErr) throw new Error(rpcErr.message);
+
+            // Low stock alert
+            const newStock = (invItem.stock_quantity || 0) - qty;
+            if (newStock <= 10) {
+                transporter.sendMail({
+                    from: process.env.EMAIL_USER, to: process.env.EMAIL_USER,
+                    subject: `⚠️ LOW STOCK: ${itemName}`,
+                    text: `${itemName} is down to ~${newStock} units.`
+                }, e => { if (e) log.warn('Stock alert email failed', e); });
+            }
+
+            // Submit each item to KRA eTIMS (non-blocking)
+            submitSaleToEtims({
+                invoiceNumber: invoiceNumber || receiptNumber,
+                receiptNumber, itemName, quantity: qty,
+                unitPrice: price, paymentMethod,
+                customerName: customerName || null, customerPin: null
+            }).then(etims => {
+                if (etims?.kraReceiptNo || etims?.kraQrUrl) {
+                    supabase.from('Sales').update({
+                        kra_receipt_no: etims.kraReceiptNo || null,
+                        kra_qr_url:     etims.kraQrUrl     || null
+                    }).eq('id', saleRow.id);
+                }
+            }).catch(() => {});
+        }
+
+        // ── Handle customer debt record ───────────────────────────────────────
+        if (linkedPhone) {
+            const { data: cust } = await supabase.from('customers')
+                .select('name, total_debt').eq('phone', linkedPhone).single();
+            if (!cust) {
+                await supabase.from('customers').insert({ phone: linkedPhone, name: customerName || 'New Customer' });
+            }
+            if (isCredit) {
+                const newDebt = parseFloat(cust?.total_debt || 0) + cartTotal;
+                await supabase.from('customers').update({ total_debt: newDebt }).eq('phone', linkedPhone);
+            }
+        }
+
+        // ── Payment log ───────────────────────────────────────────────────────
+        if (!isCredit && cartTotal > 0) {
+            const storedMethod = (mpesaCode && mpesaCode.trim()) ? 'M-Pesa' : (paymentMethod || 'Cash');
+            // Log payment against first sale ID (represents the transaction)
+            await supabase.from('payments').insert([{
+                sale_id:        saleIds[0],
+                amount:         cartTotal,
+                payment_method: storedMethod,
+                mpesa_code:     mpesaCode || null,
+                received_by:    soldBy,
+                customer_name:  customerName || 'Walk-in',
+                created_at:     new Date().toISOString()
+            }]);
+        }
+
+        log.info('[CART SELL] ✅ Multi-item sale complete', {
+            items: items.length, total: cartTotal,
+            receiptNumber, invoiceNumber
+        });
+
+        res.json({
+            success: true,
+            message: `${items.length} item(s) sold. Total: KES ${cartTotal.toFixed(2)}`,
+            receiptNumber,
+            invoiceNumber,
+            dnNumber,
+            saleIds,
+            total: cartTotal
+        });
+
+    } catch (err) {
+        log.error('[CART SELL] Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ============================================================
 //  8. SELL ROUTE
 // ============================================================
 app.post('/api/sell', requireAuth, validateBody({
