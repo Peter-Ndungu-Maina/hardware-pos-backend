@@ -138,8 +138,8 @@ async function registerItemWithEtims(item) {
     'Lighting':           '39111600',  // Lighting fixtures and accessories
     'Solar':              '26111700',  // Solar energy equipment
     'Cables & Wiring':    '39122200',  // Electrical wire and cable
-    'Plumbing':           '40171500',  // Pipe fittings
-    'Water Storage':      '24102200',  // Water storage tanks
+    'Plumbing':           '40141700',  // Pipe fittings
+    'Water Storage':      '24100000',  // Water storage tanks
     'Sanitary Ware':      '30211700',  // Sanitary ware
     'Building Materials': '30111600',  // Cement and concrete products
     'Cement':             '30111601',  // Cement
@@ -163,7 +163,7 @@ async function registerItemWithEtims(item) {
     'Construction':       '30111600',  // General construction materials
     'Locks & Security':   '31161800',  // Locks padlocks hinges door hardware
     'Abrasives':          '27111800',  // Abrasives — sandpaper grinding discs
-    'Pumps':              '40151500',  // Pumps — water submersible
+    'Pumps':              '40150000',  // Pumps — water submersible
     'Wire & Mesh':        '30101700',  // Wire mesh binding wire barbed wire
     'Waterproofing':      '30141800',  // Waterproofing and damp proofing
     'General':            '99010000',  // General goods — safe default (fallback)
@@ -194,7 +194,27 @@ async function registerItemWithEtims(item) {
         const data = await res.json();
 
         if (!res.ok) {
-            log.warn('[eTIMS] Item registration rejected', { status: res.status, item: item.itemName, body: JSON.stringify(data) });
+            // If item_class_code rejected, retry once with safe fallback 99010000
+            if (data?.metadata?.argument === 'item_class_code' || 
+                (data?.message || '').includes('item_class_code')) {
+                log.warn('[eTIMS] item_class_code rejected — retrying with fallback 99010000', { item: item.itemName });
+                payload.item_class_code = '99010000';
+                const retry = await fetch(`${DIGITAX_BASE_URL}/items`, {
+                    method: 'POST',
+                    headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: AbortSignal.timeout(10000)
+                });
+                const retryData = await retry.json();
+                if (retry.ok) {
+                    const fallbackId = retryData?.id || retryData?.item_id || retryData?.data?.id || null;
+                    log.info('[eTIMS] ✅ Item registered with fallback code', { item: item.itemName, digitaxItemId: fallbackId });
+                    return fallbackId;
+                }
+                log.warn('[eTIMS] Item registration failed even with fallback', { item: item.itemName, body: JSON.stringify(retryData) });
+            } else {
+                log.warn('[eTIMS] Item registration rejected', { status: res.status, item: item.itemName, body: JSON.stringify(data) });
+            }
             return null;
         }
 
@@ -513,8 +533,8 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), validat
             await supabase.from('Inventory')
                 .update({ digitax_item_id: digitaxItemId, kra_registered: true })
                 .eq('id', newItem.id);
-            // Belt-and-suspenders stock sync after registerItemWithEtims Phase 2
-            await syncStockWithEtims(digitaxItemId, parseInt(stockQty), 'Initial System Upload');
+            // Note: stock sync is handled inside registerItemWithEtims Phase 2 (3s delay)
+            // Do NOT call syncStockWithEtims here — it would double the stock count
         }
         res.json({
             success:       true,
@@ -2137,8 +2157,8 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                 await supabase.from('Inventory')
                     .update({ digitax_item_id: bulkEtimsId, kra_registered: true })
                     .eq('id', newItem.id);
-                // Sync opening stock with KRA
-                await syncStockWithEtims(bulkEtimsId, qty, 'Initial System Upload');
+                // Note: stock sync handled inside registerItemWithEtims Phase 2
+                // Do NOT call syncStockWithEtims here — would double the stock count
             }
         } catch (err) {
             results.failed.push({ itemName, reason: err.message });
