@@ -1676,10 +1676,28 @@ app.patch('/api/inventory/update-price/:id', requireAuth, requireRole('admin', '
 
 app.get('/api/inventory/audit-logs', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
     try {
-        const { data, error } = await supabase.from('stock_batches').select('*, Inventory(item_name)').order('created_at', { ascending: false });
+        // Fetch only inventory-related actions from the true audit_logs table
+        const { data, error } = await supabase
+            .from('audit_logs')
+            .select('*')
+            .in('action', ['INITIAL_STOCK', 'RESTOCK_FIFO', 'BULK_RESTOCK', 'MANUAL_INVENTORY_EDIT', 'RESTOCK'])
+            .order('timestamp', { ascending: false });
+            
         if (error) throw error;
-        res.json(data);
+        
+        // Map the columns so the frontend stock_audit.html doesn't have to change
+        const formattedLogs = data.map(log => ({
+            created_at:     log.timestamp,
+            performed_by:   log.performed_by,
+            delivery_number: log.dn_number,
+            stock_at_entry: log.old_stock,
+            batch_qty:      log.added_qty,
+            Inventory:      { item_name: log.item_name }
+        }));
+        
+        res.json(formattedLogs);
     } catch (err) {
+        log.error('[AUDIT LOGS]', err.message);
         res.status(500).json({ error: err.message });
     }
 });
