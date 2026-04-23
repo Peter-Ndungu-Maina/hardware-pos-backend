@@ -530,8 +530,8 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc:     ["'self'"],
-            // 'unsafe-inline' covers <script> blocks and JS in href="javascript:..."
-            scriptSrc:      ["'self'", "'unsafe-inline'", "cdnjs.cloudflare.com", "cdn.tailwindcss.com", "unpkg.com"],
+            // 'unsafe-inline' covers <script> blocks, 'unsafe-eval' allows Tailwind/Chart.js to compile
+            scriptSrc:      ["'self'", "'unsafe-inline'", "'unsafe-eval'", "cdnjs.cloudflare.com", "cdn.tailwindcss.com", "unpkg.com"],
             // 'unsafe-hashes' + 'unsafe-inline' are required for inline event handlers
             // (onclick=, onkeydown=, etc.) — helmet sets script-src-attr:'none' by default
             // which blocks all of them. index.html has hundreds of these, so we permit them.
