@@ -601,7 +601,7 @@ const PAGE_NAMES = [
     'suppliers','purchase_orders','add_product','stock_audit','stock_movement',
     'debtors_report','returns_audit','customer_statement','supplier_statement','accounting',
     'expenses','stock_valuation','profit_loss','reports','debts_repayment',
-    'billing', 'returns_statement'
+    'billing', 'returns_statement', 'sales_orders' // <--- ADDED HERE
 ];
 app.use((req, res, next) => {
     if (req.path.startsWith('/src/pages/') && req.path.endsWith('.html')) return next('route');
@@ -641,6 +641,7 @@ const PROTECTED_PAGES = {
     'inventory':        null,
     'debt_status':      null,
     'payments_report':  null,
+    'sales_orders':     null,
     // ── Manager + Admin only ─────────────────────────────────────────────────
     'suppliers':        ['admin', 'manager'],
     'supplier_statement': ['admin', 'manager'],
@@ -1676,23 +1677,31 @@ app.patch('/api/inventory/update-price/:id', requireAuth, requireRole('admin', '
 
 app.get('/api/inventory/audit-logs', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
     try {
-        // Fetch only inventory-related actions from the true audit_logs table
+        // Fetch ALL inventory-related actions
         const { data, error } = await supabase
             .from('audit_logs')
             .select('*')
-            .in('action', ['INITIAL_STOCK', 'RESTOCK_FIFO', 'BULK_RESTOCK', 'MANUAL_INVENTORY_EDIT', 'RESTOCK'])
+            .in('action', [
+                'INITIAL_STOCK', 'RESTOCK_FIFO', 'BULK_RESTOCK', 'RESTOCK', 
+                'MANUAL_INVENTORY_EDIT', 'STOCK_WRITEOFF', 'DAMAGE_WRITEOFF', 
+                'EXCHANGE_IN', 'EXCHANGE_OUT', 'SUPPLIER_RETURN', 'SUPPLIER_RETURN_PENDING'
+            ])
             .order('timestamp', { ascending: false });
             
         if (error) throw error;
         
-        // Map the columns so the frontend stock_audit.html doesn't have to change
+        // Map all relevant columns for the full audit statement
         const formattedLogs = data.map(log => ({
-            created_at:     log.timestamp,
-            performed_by:   log.performed_by,
+            id:              log.id,
+            created_at:      log.timestamp,
+            performed_by:    log.performed_by,
+            action:          log.action,
             delivery_number: log.dn_number,
-            stock_at_entry: log.old_stock,
-            batch_qty:      log.added_qty,
-            Inventory:      { item_name: log.item_name }
+            stock_at_entry:  log.old_stock,
+            batch_qty:       log.added_qty,
+            new_stock:       log.new_stock,
+            details:         log.details,
+            Inventory:       { item_name: log.item_name }
         }));
         
         res.json(formattedLogs);
@@ -7759,6 +7768,98 @@ app.get('/api/reports/supplier-statement', requireAuth, requireRole('admin', 'ma
 
     } catch (err) {
         console.error('[SUPPLIER STATEMENT]', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+// ============================================================
+//  SALES ORDERS / QUOTATIONS
+// ============================================================
+
+// Helper to generate SO number
+function generateSONumber() {
+    const now = new Date();
+    const date = now.getFullYear().toString() + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0');
+    const time = String(now.getHours()).padStart(2, '0') + String(now.getMinutes()).padStart(2, '0') + String(now.getSeconds()).padStart(2, '0');
+    return `SO-${date}-${time}`;
+}
+
+// ── GET All Sales Orders ──────────────────────────────────────────────────────
+app.get('/api/sales-orders', requireAuth, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('sales_orders')
+            .select('*, sales_order_items(*)')
+            .order('created_at', { ascending: false });
+        if (error) throw error;
+        res.json(data || []);
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ── GET Single Sales Order ────────────────────────────────────────────────────
+app.get('/api/sales-orders/:id', requireAuth, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('sales_orders')
+            .select('*, sales_order_items(*)')
+            .eq('id', req.params.id)
+            .single();
+        if (error || !data) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ── POST Create Sales Order (Quote) ───────────────────────────────────────────
+app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res) => {
+    const { customerName, customerPhone, validUntil, notes, items } = req.body;
+    if (!customerName) return res.status(400).json({ success: false, message: 'Customer name required.' });
+    if (!items || !items.length) return res.status(400).json({ success: false, message: 'Add at least one item.' });
+
+    try {
+        const so_number = generateSONumber();
+        const total_amount = items.reduce((s, i) => s + (parseFloat(i.qty_ordered) * parseFloat(i.unit_price)), 0);
+
+        const { data: so, error: soErr } = await supabase
+            .from('sales_orders')
+            .insert([{
+                so_number, customer_name: customerName, customer_phone: customerPhone,
+                status: 'Quote', order_date: new Date().toISOString().split('T')[0],
+                valid_until: validUntil || null, total_amount, notes, created_by: req.user.name
+            }]).select().single();
+        
+        if (soErr) throw soErr;
+
+        const lineItems = items.map(i => ({
+            so_id: so.id, inventory_id: i.inventory_id,
+            item_name: i.item_name, qty_ordered: parseInt(i.qty_ordered),
+            unit_price: parseFloat(i.unit_price), line_total: parseFloat(i.qty_ordered) * parseFloat(i.unit_price)
+        }));
+
+        await supabase.from('sales_order_items').insert(lineItems);
+        
+        await supabase.from('audit_logs').insert([{
+            performed_by: req.user.name, action: 'SO_CREATED', item_name: so_number,
+            details: `Quote ${so_number} created for ${customerName}. Total: KES ${total_amount}`,
+            timestamp: new Date().toISOString()
+        }]);
+
+        res.json({ success: true, message: 'Quotation created successfully.', data: so });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ── PUT Update Status (Confirm / Cancel) ──────────────────────────────────────
+app.put('/api/sales-orders/:id/status', requireAuth, requireSubscription, async (req, res) => {
+    const { status } = req.body;
+    try {
+        const { error } = await supabase.from('sales_orders').update({ status }).eq('id', req.params.id);
+        if (error) throw error;
+        res.json({ success: true, message: `Order marked as ${status}.` });
+    } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
