@@ -7863,4 +7863,36 @@ app.put('/api/sales-orders/:id/status', requireAuth, requireSubscription, async 
         res.status(500).json({ success: false, message: err.message });
     }
 });
+// ════════════════════════════════════════════════════════════════════════════════
+// SCRIPT 8: SELF-PINGING (Anti-Sleep)
+// Runs every 10 minutes. Hits the root URL of the server to keep the instance
+// active on hosting platforms like Render (Free Tier).
+// ════════════════════════════════════════════════════════════════════════════════
+const SELF_URL = process.env.SELF_URL;
+
+async function runSelfPing() {
+    if (!SELF_URL) {
+        log.info('[SELF-PING] No SELF_URL configured. Skipping anti-sleep ping.');
+        return;
+    }
+    
+    try {
+        const res = await fetch(SELF_URL, { signal: AbortSignal.timeout(5000) });
+        if (res.ok) {
+            log.info(`[SELF-PING] Heartbeat sent to ${SELF_URL} — Status: ${res.status}`);
+        } else {
+            log.warn(`[SELF-PING] Heartbeat returned non-OK status: ${res.status}`);
+        }
+    } catch (err) {
+        log.error(`[SELF-PING] Failed to ping ${SELF_URL}: ${err.message}`);
+    }
+}
+
+// Only start pinging if the environment is not local
+if (process.env.NODE_ENV === 'production' || process.env.MPESA_ENV === 'live') {
+    // Ping immediately on startup
+    runSelfPing();
+    // Repeat every 10 minutes (600,000 ms)
+    setInterval(runSelfPing, 10 * 60 * 1000);
+}
 app.listen(PORT, () => log.info(`🚀 Elite Hardware POS running on http://localhost:${PORT}`));
