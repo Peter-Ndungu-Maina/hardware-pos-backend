@@ -587,7 +587,9 @@ const apiLimiter = rateLimit({
 app.use('/api/', apiLimiter);
 app.use(log.middleware);          // structured JSON request logging
 app.use(sanitizeQuery);           // strip PostgREST injection chars from all query params
-app.use(express.json({ limit: '10mb' })); // 10mb supports large CSV bulk imports (~5000 rows)
+app.use(express.json({ limit: '100kb' })); // Tight global limit — prevents DoS via large payloads
+// Bulk import is the only route that legitimately receives large bodies; apply 10mb only there.
+const bulkJsonParser = express.json({ limit: '10mb' });
 
 // ── File paths (backend/server.js → ../frontend/)
 const frontendPath = path.join(__dirname, '..', 'frontend');
@@ -806,6 +808,20 @@ function requireRole(...roles) {
         }
         next();
     };
+}
+
+
+// ── WEBHOOK SECRET GUARD ─────────────────────────────────────────────────────
+// All Safaricom webhook endpoints must include ?secret=WEBHOOK_SECRET in the URL
+// you register with Safaricom/Daraja. This prevents spoofed payloads from
+// arbitrary IPs since Safaricom does not sign its webhook bodies.
+function requireWebhookSecret(req, res, next) {
+    const secret = process.env.WEBHOOK_SECRET;
+    if (secret && req.query.secret !== secret) {
+        log.warn(`[WEBHOOK] Rejected — missing or invalid ?secret from ${req.ip}`);
+        return res.status(403).send('Forbidden');
+    }
+    next();
 }
 
 // ============================================================
@@ -1028,7 +1044,7 @@ app.get('/api/subscription/payments', requireAuth, requireRole('admin'), async (
             .order('paid_at', { ascending: false }).limit(50);
         if (error) throw error;
         res.json({ success: true, data });
-    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+    } catch (err) { log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' }); }
 });
 
 // POST /api/subscription/payment — manual payment recording (admin fallback)
@@ -1077,7 +1093,7 @@ app.post('/api/subscription/payment', requireAuth, requireRole('admin'), async (
         });
     } catch (err) {
         log.error(`[SUB] Payment recording failed: ${err.message} | code=${err.code} | hint=${err.hint || 'none'}`);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1111,7 +1127,7 @@ app.post('/api/subscription/refresh', requireAuth, requireRole('admin'), async (
 //
 // .env: VENDOR_MPESA_SHORTCODE, SUBSCRIPTION_MONTHLY_KES,
 //       SUBSCRIPTION_ANNUAL_KES, SUBSCRIPTION_SERVICE_KES
-app.post('/api/subscription/mpesa-confirmation', async (req, res) => {
+app.post('/api/subscription/mpesa-confirmation', requireWebhookSecret, async (req, res) => {
     // Always ACK immediately — Safaricom retries if you don't respond fast
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
@@ -1292,7 +1308,7 @@ app.post('/api/login', loginLimiter, async (req, res) => {
             JWT_SECRET,
             { expiresIn: '8h', algorithm: 'HS256' }
         );
-        res.cookie('authToken', token, { sameSite: 'Strict', maxAge: 28800000 });
+        res.cookie('authToken', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'Strict', maxAge: 28800000 });
         res.json({ success: true, token, role: user.role, name: user.name });
     } catch (err) {
         log.error('[LOGIN ERROR]', err);
@@ -1415,7 +1431,7 @@ app.get('/api/business-info', requireAuth, async (req, res) => {
         res.json({ success: true, ...info, cached: false });
     } catch (err) {
         log.error('[business-info] DigiTax fetch failed:', err.message);
-        res.status(502).json({ success: false, message: err.message });
+        res.status(502).json({ success: false, message: 'Failed to fetch business info from DigiTax. Check server logs.' });
     }
 });
 
@@ -1451,7 +1467,7 @@ app.get('/api/inventory', requireAuth, async (req, res) => {
         if (page) return res.json({ items: enriched, totalCount, totalPages: Math.ceil(totalCount / perPage) });
         res.json(enriched);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1538,7 +1554,7 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), require
             digitaxItemId
         });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1593,7 +1609,7 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
 
         res.json({ success: true, message: 'Restock successful!' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1633,7 +1649,7 @@ app.post('/api/inventory/bulk-restock', requireAuth, requireRole('admin', 'manag
         }
         res.json({ success: true, message: 'Bulk restock processed.' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1657,7 +1673,7 @@ app.put('/api/inventory/:id', requireAuth, requireRole('admin'), requireSubscrip
         await supabase.from('audit_logs').insert([{ performed_by: userName, action: 'MANUAL_INVENTORY_EDIT', item_name, old_stock: oldStock, new_stock: parseInt(stock_quantity), details: `Admin manual reset of ${item_name}. ${oldStock} → ${stock_quantity}`, timestamp: new Date().toISOString() }]);
         res.json({ success: true, message: 'Item synchronized successfully!' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1672,7 +1688,7 @@ app.patch('/api/inventory/update-price/:id', requireAuth, requireRole('admin', '
         await supabase.from('audit_logs').insert([{ performed_by: userName, action: 'PRICE_MARKDOWN', details: `${item.item_name}: ${item.price} → ${newPrice}`, timestamp: new Date().toISOString() }]);
         res.json({ success: true, message: 'Price updated!' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1708,7 +1724,7 @@ app.get('/api/inventory/audit-logs', requireAuth, requireRole('admin', 'manager'
         res.json(formattedLogs);
     } catch (err) {
         log.error('[AUDIT LOGS]', err.message);
-        res.status(500).json({ error: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1768,7 +1784,7 @@ app.patch('/api/inventory/:id', requireAuth, requireRole('admin', 'manager'), re
         
         res.json({ success: true, message: `Added ${added}. Total: ${newTotal}` });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1782,7 +1798,7 @@ app.delete('/api/inventory/:id', requireAuth, requireRole('admin'), requireSubsc
         await supabase.from('audit_logs').insert([{ performed_by: userName, action: 'DELETE', details: `Removed: ${item?.item_name || 'Unknown'} (ID: ${id})`, timestamp: new Date().toISOString() }]);
         res.json({ success: true, message: 'Item deleted and logged.' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ============================================================
@@ -1812,7 +1828,7 @@ app.get('/api/suppliers', requireAuth, async (req, res) => {
         res.json(data || []);
     } catch (err) {
         console.error('[GET /api/suppliers]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1832,7 +1848,7 @@ app.get('/api/suppliers/:id', requireAuth, async (req, res) => {
         res.json(data);
     } catch (err) {
         console.error('[GET /api/suppliers/:id]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1891,7 +1907,7 @@ app.post('/api/suppliers', requireAuth, requireRole('admin', 'manager'), require
         res.status(201).json({ success: true, message: 'Supplier added successfully.', data });
     } catch (err) {
         console.error('[POST /api/suppliers]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -1967,7 +1983,7 @@ app.put('/api/suppliers/:id', requireAuth, requireRole('admin', 'manager'), requ
         res.json({ success: true, message: 'Supplier updated successfully.', data });
     } catch (err) {
         console.error('[PUT /api/suppliers/:id]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2013,7 +2029,7 @@ app.delete('/api/suppliers/:id', requireAuth, requireRole('admin', 'manager'), r
         res.json({ success: true, message: `"${existing.name}" has been deleted.` });
     } catch (err) {
         console.error('[DELETE /api/suppliers/:id]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2058,7 +2074,7 @@ app.patch('/api/suppliers/:id/balance', requireAuth, requireRole('admin'), requi
         res.json({ success: true, message: 'Balance updated.', data });
     } catch (err) {
         console.error('[PATCH /api/suppliers/:id/balance]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ============================================================
@@ -2129,7 +2145,7 @@ app.get('/api/purchase-orders', requireAuth, async (req, res) => {
         res.json(data || []);
     } catch (err) {
         console.error('[GET /api/purchase-orders]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2144,7 +2160,7 @@ app.get('/api/purchase-orders/:id', requireAuth, async (req, res) => {
         if (error || !data) return res.status(404).json({ success: false, message: 'Purchase order not found.' });
         res.json(data);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2212,7 +2228,7 @@ app.post('/api/purchase-orders', requireAuth, requireRole('admin', 'manager'), r
         res.status(201).json({ success: true, message: 'Purchase order created.', data: po });
     } catch (err) {
         console.error('[POST /api/purchase-orders]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2281,7 +2297,7 @@ app.put('/api/purchase-orders/:id', requireAuth, requireRole('admin', 'manager')
         res.json({ success: true, message: 'Purchase order updated.', data });
     } catch (err) {
         console.error('[PUT /api/purchase-orders/:id]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2536,7 +2552,7 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
         });
     } catch (err) {
         console.error('[POST /api/purchase-orders/:id/receive]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2602,7 +2618,7 @@ app.post('/api/supplier-payments', requireAuth, requireRole('admin', 'manager'),
         });
     } catch (err) {
         console.error('[POST /api/supplier-payments]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2623,7 +2639,7 @@ app.get('/api/purchase-orders/:id/payments', requireAuth, async (req, res) => {
         if (error) throw error;
         res.json(data || []);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2650,7 +2666,7 @@ app.delete('/api/purchase-orders/:id', requireAuth, requireRole('admin', 'manage
         res.json({ success: true, message: `${po.po_number} deleted.` });
     } catch (err) {
         console.error('[DELETE /api/purchase-orders/:id]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ── POST email purchase order to supplier ─────────────────────────────────────
@@ -2787,7 +2803,7 @@ app.get('/api/suppliers/:id/activity', requireAuth, async (req, res) => {
         res.json(logs || []);
     } catch (err) {
         console.error('[GET /api/suppliers/:id/activity]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -2829,7 +2845,7 @@ app.get('/api/purchase-orders/:id/activity', requireAuth, async (req, res) => {
         res.json(logs || []);
     } catch (err) {
         console.error('[GET /api/purchase-orders/:id/activity]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ============================================================
@@ -2920,7 +2936,7 @@ app.get('/api/reports/daily-summary', requireAuth, async (req, res) => {
         });
     } catch (err) {
         console.error('[DAILY SUMMARY ERROR]', err.message);
-        res.status(500).json({ error: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ============================================================
@@ -3039,7 +3055,7 @@ app.get('/api/reports/debtors', requireAuth, async (req, res) => {
 
         res.json(Object.values(consolidated));
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -3117,7 +3133,7 @@ app.get('/api/reports/payments', requireAuth, requireRole('admin', 'manager', 'c
             tx_ref:        p.Sales?.invoice_number  || p.Sales?.receipt_number || null,
         })));
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -3139,7 +3155,7 @@ app.get('/api/reports/expenses', requireAuth, requireRole('admin', 'manager'), a
         if (error) throw error;
         res.json(data);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -3198,7 +3214,7 @@ app.get('/api/reports/profit-loss', requireAuth, requireRole('admin', 'manager')
         
         res.json({ totalSales: realizedSales, unpaidDebts, totalCogs, grossProfit, totalExpenses, netProfit });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -3295,7 +3311,7 @@ app.get('/api/reports/stock-movement', requireAuth, requireRole('admin', 'manage
 
         res.json(result);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -3329,7 +3345,7 @@ app.get('/api/reports/stock-valuation', requireAuth, requireRole('admin', 'manag
 
         res.json(result);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -3390,7 +3406,7 @@ app.get('/api/reports/debtors-full', requireAuth, requireRole('admin', 'manager'
         const result = Object.values(map).sort((a, b) => b.balance - a.balance);
         res.json(result);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -3435,7 +3451,7 @@ app.get('/api/reports/debt-logs', requireAuth, async (req, res) => {
         
         res.json(data);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -3445,7 +3461,7 @@ app.get('/api/reports/debt-logs', requireAuth, async (req, res) => {
 // ============================================================
 //  BULK PRODUCT IMPORT (CSV/EXCEL) - BATCHED KRA SYNC
 // ============================================================
-app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
+app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manager'), requireSubscription, bulkJsonParser, async (req, res) => {
     const { items } = req.body;
     const userName  = req.user.name;
     if (!Array.isArray(items) || !items.length)
@@ -3823,7 +3839,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
 
     } catch (err) {
         log.error('[CART] Error:', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4032,7 +4048,7 @@ app.post('/api/sell', requireAuth, requireSubscription, validateBody({
         res.json({ success: true, message: `Sale recorded. Stock: ${newStock}`, receiptNumber, invoiceNumber, dnNumber, saleId: saleData[0].id, kraReceiptNo, kraQrUrl: qrDataStringSingle, kraQrDataUrl: qrDataUrlSingle, Control_unit_number: controlUnitNumber });
     } catch (err) {
         log.error('Sale error', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4206,7 +4222,7 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
 
     } catch (err) {
         log.error('Payment error:', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ============================================================
@@ -4224,7 +4240,7 @@ app.get('/api/sales/:id', requireAuth, requireRole('admin', 'manager'), async (r
         if (error || !data) return res.status(404).json({ success: false, message: 'Sale not found.' });
         res.json(data);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4258,7 +4274,7 @@ app.patch('/api/sales/:id/edit', requireAuth, requireRole('admin', 'manager'), r
 
         res.json({ success: true, message: 'Transaction updated.' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4333,7 +4349,7 @@ app.get('/api/employees/pin-reset-requests', requireAuth, requireRole('admin'), 
         res.json({ success: true, requests: data || [] });
     } catch (err) {
         log.error('[PIN RESET REQUESTS]', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4370,17 +4386,13 @@ app.post('/auth/request-reset', async (req, res) => {
         res.json({ success: true, message: 'Reset request sent to Admin.' });
     } catch (err) {
         log.error('[PIN RESET REQUEST]', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
 // 2. Get pending requests (Admin only)
-app.get('/admin/reset-requests', requireAuth, async (req, res) => {
+app.get('/admin/reset-requests', requireAuth, requireRole('admin'), async (req, res) => {
     try {
-        // Role Check: Ensure only admins can see requests
-        if (req.user.role !== 'admin') {
-            return res.status(403).json({ success: false, message: 'Unauthorized: Admin access required' });
-        }
 
         const { data, error } = await supabase
             .from('users')
@@ -4390,17 +4402,13 @@ app.get('/admin/reset-requests', requireAuth, async (req, res) => {
         if (error) throw error;
         res.json({ success: true, data });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
 // 3. Approve and Reset PIN (Admin only)
-app.post('/admin/reset-pin', requireAuth, async (req, res) => {
+app.post('/admin/reset-pin', requireAuth, requireRole('admin'), async (req, res) => {
     try {
-        // Role Check: Ensure only admins can perform resets
-        if (req.user.role !== 'admin') {
-            return res.status(403).json({ success: false, message: 'Unauthorized: Admin access required' });
-        }
 
         const { userId, newPin } = req.body; 
         if (!userId || !newPin) return res.status(400).json({ success: false, message: 'Missing data' });
@@ -4419,7 +4427,7 @@ app.post('/admin/reset-pin', requireAuth, async (req, res) => {
 
         res.json({ success: true, message: 'PIN reset successfully.' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ============================================================
@@ -4449,7 +4457,7 @@ app.get('/api/customers/:phone', requireAuth, async (req, res) => {
         if (error) return res.status(404).json({ message: 'Not found' });
         res.json(data);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4465,7 +4473,7 @@ app.post('/api/expenses', requireAuth, requireRole('admin', 'manager'), requireS
         if (error) throw error;
         res.json({ success: true, message: 'Expense recorded!' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4483,7 +4491,7 @@ app.get('/api/employees', requireAuth, requireRole('admin'), async (req, res) =>
         if (error) throw error;
         res.json(data);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4531,7 +4539,7 @@ app.patch('/api/employees/:id/status', requireAuth, requireRole('admin'), requir
         res.json({ success: true, message: `Staff account ${is_active ? 'activated' : 'deactivated'} successfully.` });
     } catch (err) {
         log.error('[STATUS] Error:', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4569,7 +4577,7 @@ app.patch('/api/employees/:id/reset-pin', requireAuth, requireRole('admin'), req
         res.json({ success: true, message: `PIN reset for ${emp.name}.` });
     } catch (err) {
         log.error('[PIN RESET] Error:', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4915,7 +4923,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
         });
     } catch (err) {
         log.error('[RETURNS] Exchange error:', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4950,7 +4958,7 @@ app.get('/api/returns', requireAuth, requireRole('admin', 'manager'), async (req
         if (error) throw error;
         res.json({ returns: data||[], totalCount: count||0, totalPages: Math.ceil((count||0)/perPage), page: pageNum });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -4975,7 +4983,7 @@ app.get('/api/returns/summary', requireAuth, requireRole('admin', 'manager'), as
         }, { totalExchanges:0, totalCostAbsorbed:0, damagedCount:0, wrongItemCount:0, otherCount:0 });
         res.json(s);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -5023,17 +5031,23 @@ app.get('/api/returns/search-sale', requireAuth, requireRole('admin', 'manager')
 
         res.json(enrichedSales);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ╔══════════════════════════════════════════════════════════════╗
 // ║              M-PESA STK PUSH INTEGRATION                     ║
 // ╚══════════════════════════════════════════════════════════════╝
-const MPESA_CONSUMER_KEY    = process.env.MPESA_CONSUMER_KEY    || 'wSlDsjWgrLN4Ty7AX5uNfFPuQvXGK6DufIwTpoZPKx12qfSO';
-const MPESA_CONSUMER_SECRET = process.env.MPESA_CONSUMER_SECRET || 'QjY88Izo25zGza9m4ilv4tetjv02cbbhwVDy6GArmUC4KfVlYGdwEaxuQ2zcfxcK';
-const MPESA_SHORTCODE       = process.env.MPESA_SHORTCODE       || '174379';
-const MPESA_PASSKEY         = process.env.MPESA_PASSKEY         || 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919';
-const MPESA_CALLBACK_URL    = process.env.MPESA_CALLBACK_URL    || 'https://uninfiltrated-persistent-jewel.ngrok-free.dev/api/mpesa/callback';
+// SECURITY: All M-Pesa credentials MUST be set in .env — no hardcoded fallbacks.
+// If any are missing, STK push routes will respond with 503.
+const MPESA_CONSUMER_KEY    = process.env.MPESA_CONSUMER_KEY;
+const MPESA_CONSUMER_SECRET = process.env.MPESA_CONSUMER_SECRET;
+const MPESA_SHORTCODE       = process.env.MPESA_SHORTCODE;
+const MPESA_PASSKEY         = process.env.MPESA_PASSKEY;
+const MPESA_CALLBACK_URL    = process.env.MPESA_CALLBACK_URL;
+
+if (!MPESA_CONSUMER_KEY || !MPESA_CONSUMER_SECRET || !MPESA_PASSKEY || !MPESA_SHORTCODE || !MPESA_CALLBACK_URL) {
+    log.error('\u274c  Missing required M-Pesa env vars. STK push will return 503 until all vars are set.');
+}
 // MPESA_TRANSACTION_TYPE controls Till vs Paybill:
 //   CustomerPayBillOnline  → Paybill (customer enters account number, e.g. invoice no.)
 //   CustomerBuyGoodsOnline → Till / BuyGoods (no account number prompt)
@@ -5069,6 +5083,9 @@ let _mpesaToken    = null;
 let _mpesaTokenExp = 0;   // Unix ms when token expires
 
 async function getMpesaToken() {
+    if (!MPESA_CONSUMER_KEY || !MPESA_CONSUMER_SECRET) {
+        throw new Error('M-Pesa credentials not configured. Set MPESA_CONSUMER_KEY and MPESA_CONSUMER_SECRET in .env');
+    }
     const now = Date.now();
     // Return cached token if it's still valid (with 5-minute buffer)
     if (_mpesaToken && now < _mpesaTokenExp - 5 * 60 * 1000) {
@@ -5227,7 +5244,7 @@ app.post('/api/mpesa/stk-push', requireAuth, requireSubscription, async (req, re
     }
 });
 
-app.post('/api/mpesa/callback', async (req, res) => {
+app.post('/api/mpesa/callback', requireWebhookSecret, async (req, res) => {
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     try {
         console.log('[MPESA CALLBACK] Received:', JSON.stringify(req.body, null, 2));
@@ -5304,7 +5321,7 @@ app.get('/api/mpesa/status/:checkoutId', requireAuth, async (req, res) => {
         }
         res.json({ success: true, status: tx.status, mpesaCode: tx.mpesa_code || null, amount: tx.amount, phone: tx.phone, resultDesc: tx.result_desc || null });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -5344,7 +5361,7 @@ app.get('/api/mpesa/query/:checkoutId', requireAuth, async (req, res) => {
         return res.json({ success: true, status: 'failed', resultDesc: desc });
     } catch (err) {
         console.error('[MPESA QUERY]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ╔══════════════════════════════════════════════════════════════╗
@@ -5495,18 +5512,18 @@ app.post('/api/c2b/register', requireAuth, requireRole('admin', 'manager'), requ
         console.log('[C2B REGISTER]', data);
         res.json({ success: true, data });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
 // ── Safaricom C2B Validation (approve all payments) ───────────────────────────
-app.post('/api/c2b/validation', (req, res) => {
+app.post('/api/c2b/validation', requireWebhookSecret, (req, res) => {
     console.log('[C2B VALIDATION]', JSON.stringify(req.body));
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
 // ── Safaricom C2B Confirmation (payment received) ─────────────────────────────
-app.post('/api/c2b/confirmation', async (req, res) => {
+app.post('/api/c2b/confirmation', requireWebhookSecret, async (req, res) => {
     // Always ACK immediately so Safaricom doesn't retry
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
@@ -5706,7 +5723,7 @@ app.post('/api/c2b/resolve-goods', requireAuth, requireRole('admin', 'manager', 
         res.json({ success: true, message: 'C2B payment resolved', excess });
     } catch (err) {
         console.error('[C2B RESOLVE ERROR]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -5795,7 +5812,7 @@ app.post('/api/c2b/resolve-debt', requireAuth, requireRole('admin', 'manager'), 
         log.info(`[C2B DEBT] ✅ KES ${totalApplied} applied to ${debtorPhone} via C2B from ${c2b.phone}`);
         res.json({ success: true, applied: totalApplied, remaining });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 app.post('/api/c2b/resolve-ignore', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
@@ -5809,7 +5826,7 @@ app.post('/api/c2b/resolve-ignore', requireAuth, requireRole('admin', 'manager')
         if (error) throw error;
         res.json({ success: true, message: 'Payment ignored' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -5826,7 +5843,7 @@ app.post('/api/c2b/receipt-collected', requireAuth, requireRole('admin', 'manage
         if (error) throw error;
         res.json({ success: true, message: 'Receipt marked as collected' });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -5843,7 +5860,7 @@ app.get('/api/c2b/payments', requireAuth, requireRole('admin', 'manager'), async
         res.json(data || []);
     } catch (err) {
         console.error('[C2B PAYMENTS ERROR]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -5931,7 +5948,7 @@ app.post('/api/supplier-returns/:id/confirm', requireAuth, requireRole('admin', 
         });
     } catch (err) {
         log.error('[SUPPLIER RETURN CONFIRM] Error:', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -5950,7 +5967,7 @@ app.get('/api/supplier-returns', requireAuth, requireRole('admin', 'manager'), a
         if (error) throw error;
         res.json({ returns: data||[], totalCount: count||0, totalPages: Math.ceil((count||0)/perPage), page: pageNum });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -5994,7 +6011,7 @@ app.get('/api/supplier-returns/search-po', requireAuth, requireRole('admin', 'ma
 
         res.json(enriched);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -6139,7 +6156,7 @@ app.post('/api/supplier-returns', requireAuth, requireRole('admin', 'manager'), 
         });
     } catch (err) {
         log.error('[SUPPLIER RETURN] Error:', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -6263,7 +6280,7 @@ app.post('/api/inventory/:id/write-off', requireAuth, requireRole('admin', 'mana
         });
     } catch (err) {
         log.error('[STOCK WRITE-OFF] Error:', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -6350,7 +6367,7 @@ app.get('/api/accounting/balance-sheet', requireAuth, requireRole('admin','manag
         });
     } catch(err) {
         log.error('[Balance Sheet]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -6417,7 +6434,7 @@ app.get('/api/accounting/income-statement', requireAuth, requireRole('admin','ma
         });
     } catch (err) {
         log.error('[Income Statement]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -6497,7 +6514,7 @@ app.get('/api/accounting/reconcile', requireAuth, requireRole('admin','manager')
         });
     } catch (err) {
         log.error('[Reconcile]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -6670,7 +6687,7 @@ app.get('/api/digitax/reconcile', requireAuth, requireRole('admin'), async (req,
 
     } catch (err) {
         log.error('[DigiTax Reconcile]', err.message);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -7653,7 +7670,7 @@ app.get('/api/reports/customer-statement', requireAuth, requireRole('admin', 'ma
 
     } catch (err) {
         console.error('[CUSTOMER STATEMENT]', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ============================================================
@@ -7769,7 +7786,7 @@ app.get('/api/reports/supplier-statement', requireAuth, requireRole('admin', 'ma
 
     } catch (err) {
         console.error('[SUPPLIER STATEMENT]', err);
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ============================================================
@@ -7794,7 +7811,7 @@ app.get('/api/sales-orders', requireAuth, async (req, res) => {
         if (error) throw error;
         res.json(data || []);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -7809,7 +7826,7 @@ app.get('/api/sales-orders/:id', requireAuth, async (req, res) => {
         if (error || !data) return res.status(404).json({ success: false, message: 'Sales order not found.' });
         res.json(data);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -7849,19 +7866,23 @@ app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res)
 
         res.json({ success: true, message: 'Quotation created successfully.', data: so });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
 // ── PUT Update Status (Confirm / Cancel) ──────────────────────────────────────
 app.put('/api/sales-orders/:id/status', requireAuth, requireSubscription, async (req, res) => {
     const { status } = req.body;
+    const ALLOWED_STATUSES = ['Quote', 'Confirmed', 'Fulfilled', 'Cancelled'];
+    if (!status || !ALLOWED_STATUSES.includes(status)) {
+        return res.status(400).json({ success: false, message: `Invalid status. Must be one of: ${ALLOWED_STATUSES.join(', ')}.` });
+    }
     try {
         const { error } = await supabase.from('sales_orders').update({ status }).eq('id', req.params.id);
         if (error) throw error;
         res.json({ success: true, message: `Order marked as ${status}.` });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ════════════════════════════════════════════════════════════════════════════════
