@@ -530,16 +530,17 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc:     ["'self'"],
-            // 'unsafe-inline' covers <script> blocks, 'unsafe-eval' allows Tailwind/Chart.js to compile
-            scriptSrc:      ["'self'", "'unsafe-inline'", "'unsafe-eval'", "cdnjs.cloudflare.com", "cdn.tailwindcss.com", "unpkg.com"],
-            // 'unsafe-hashes' + 'unsafe-inline' are required for inline event handlers
-            // (onclick=, onkeydown=, etc.) — helmet sets script-src-attr:'none' by default
-            // which blocks all of them. index.html has hundreds of these, so we permit them.
+            
+            // SECURITY UPDATE: Removed 'unsafe-eval' and 'cdn.tailwindcss.com'
+            // This strictly blocks arbitrary string execution (eval, new Function)
+            scriptSrc:      ["'self'", "'unsafe-inline'", "cdnjs.cloudflare.com", "unpkg.com"],
+            
+            // Allows inline event handlers (onclick=, onkeydown=) which your HTML relies on
             scriptSrcAttr:  ["'unsafe-hashes'", "'unsafe-inline'"],
+            
             styleSrc:       ["'self'", "'unsafe-inline'", "fonts.googleapis.com", "unpkg.com"],
             fontSrc:        ["'self'", "fonts.gstatic.com"],
             imgSrc:         ["'self'", "data:", "blob:", "https://api.qrserver.com", "https://etims.kra.go.ke", "https://api.digitax.tech"],
-            // Added https://cdnjs.cloudflare.com to connectSrc to allow PDF worker scripts to load
             connectSrc:     ["'self'", "https://hardware-pos-backend.onrender.com", "http://localhost:6789", "https://cdnjs.cloudflare.com"],
             frameSrc:       ["'none'"],      // blocks clickjacking via <iframe>
             objectSrc:      ["'none'"],
