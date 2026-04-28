@@ -5967,12 +5967,29 @@ app.post('/api/jenga/ipn', async (req, res) => {
             const accountRef = body.transactionReference || null; // Our STK tracking ID
 
             if (!isPaid) {
-                log.info(`[JENGA EQUITEL STK] Callback failed/cancelled (code=${body.code}).`);
+                log.info(`[JENGA EQUITEL STK] Callback failed (code=${body.code}, msg=${body.message}).`);
                 if (accountRef) {
                     const pending = await mpesaGet(accountRef);
                     if (pending) {
-                        const newStatus = String(body.code) === '5' || String(body.code) === '6' ? 'cancelled' : 'failed';
-                        await mpesaSet(accountRef, { ...pending, status: newStatus, result_desc: body.message || '' });
+                        let newStatus = 'failed';
+                        const codeStr = String(body.code);
+                        const msg = (body.message || '').toLowerCase();
+
+                        // ── THE FIX: Map Equitel errors to Daraja-style frontend statuses ──
+                        if (codeStr === '5' || msg.includes('cancel') || msg.includes('abort') || msg.includes('decline')) {
+                            newStatus = 'cancelled';
+                        } else if (codeStr === '6' || msg.includes('timeout')) {
+                            newStatus = 'timeout';
+                        } else if (codeStr === '11' || codeStr === '12' || msg.includes('insufficient') || msg.includes('balance') || msg.includes('funds')) {
+                            newStatus = 'insufficient_funds';
+                        }
+
+                        // Save the mapped status to the database so the frontend picks it up
+                        await mpesaSet(accountRef, { 
+                            ...pending, 
+                            status: newStatus, 
+                            result_desc: body.message || 'Payment failed' 
+                        });
                     }
                 }
                 return;
