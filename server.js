@@ -5678,12 +5678,15 @@ app.post('/api/jenga/stk-push', requireAuth, requireSubscription, async (req, re
 
     const { phone, amount, accountRef, customerName = 'Walk-in Customer' } = req.body;
 
-    // Phone must be local format for this endpoint
+    // Validate in local format (07/01), then convert to international for Jenga API
     let msisdn = String(phone || '').replace(/\s/g, '');
     if (msisdn.startsWith('+254')) msisdn = '0' + msisdn.slice(4);
     if (msisdn.startsWith('254'))  msisdn = '0' + msisdn.slice(3);
     if (!/^0(7|1)\d{8}$/.test(msisdn))
         return res.status(400).json({ success: false, message: 'Invalid phone. Use 07XXXXXXXX or 01XXXXXXXX' });
+
+    // Jenga M-Pesa STK API requires international format (254XXXXXXXXX)
+    const msisdnIntl = '254' + msisdn.slice(1);
 
     const paymentAmount = Math.ceil(parseFloat(amount));
     if (!paymentAmount || paymentAmount < 1)
@@ -5695,7 +5698,7 @@ app.post('/api/jenga/stk-push', requireAuth, requireSubscription, async (req, re
         const paymentRef = `PR${Date.now()}`;
 
         // Signature formula (Wallet-Based): orderRef + currency + msisdn + amount
-        const dataToSign = `${orderRef}KES${msisdn}${paymentAmount}`;
+        const dataToSign = `${orderRef}KES${msisdnIntl}${paymentAmount}`;
         const signer     = crypto.createSign('SHA256');
         signer.update(dataToSign);
         signer.end();
@@ -5713,7 +5716,7 @@ app.post('/api/jenga/stk-push', requireAuth, requireSubscription, async (req, re
             customer: {
                 name:           customerName,
                 email:          process.env.EMAIL_USER || 'billing@business.com',
-                phoneNumber:    msisdn,
+                phoneNumber:    msisdnIntl,
                 identityNumber: '0000000',
                 firstAddress:   'Nairobi',
                 secondAddress:  ''
@@ -5725,7 +5728,7 @@ app.post('/api/jenga/stk-push', requireAuth, requireSubscription, async (req, re
                 service:          'MPESA',
                 provider:         'JENGA',
                 callbackUrl:      `${process.env.JENGA_CALLBACK_URL}/api/jenga/ipn`,
-                details: { msisdn, paymentAmount }
+                details: { msisdn: msisdnIntl, amount: paymentAmount }
             }
         };
 
@@ -5745,12 +5748,12 @@ app.post('/api/jenga/stk-push', requireAuth, requireSubscription, async (req, re
         }
 
         await mpesaSet(orderRef, {
-            status: 'pending', phone: msisdn, amount: paymentAmount,
+            status: 'pending', phone: msisdnIntl, amount: paymentAmount,
             context: { accountRef, channel: 'MPESA_JENGA' },
             created_at: new Date().toISOString()
         });
 
-        log.info(`[JENGA M-PESA STK] ✅ Sent to ${msisdn} orderRef=${orderRef}`);
+        log.info(`[JENGA M-PESA STK] ✅ Sent to ${msisdnIntl} orderRef=${orderRef}`);
         return res.json({ success: true, message: `M-Pesa STK sent to ${msisdn}.`, checkoutRequestId: orderRef });
 
     } catch (err) {
@@ -5857,6 +5860,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
         }
 
         // Persist using payRef as our tracking key
+       
         await mpesaSet(payRef, {
             status:     'pending',
             phone:      msisdn,
@@ -5864,6 +5868,14 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
             context:    { accountRef, channel: 'EQUITEL_STK', transactionId: data.transactionId },
             created_at: new Date().toISOString()
         });
+
+        // ── THE FIX: Save a cross-reference row so the IPN can find it! ──
+        await mpesaSet(data.transactionId, {
+            status: 'cross_ref',
+            mpesa_code: payRef // Point to our real payRef
+        });
+
+        log.info(`[JENGA EQUITEL STK] ✅ Queued → ${msisdn} ref=${payRef} txId=${data.transactionId}`);
 
         log.info(`[JENGA EQUITEL STK] ✅ Queued → ${msisdn} ref=${payRef} txId=${data.transactionId}`);
         return res.json({
@@ -5960,12 +5972,19 @@ app.post('/api/jenga/ipn', async (req, res) => {
             return;
         }
 
-        // ── 2. ROUTE: OUTBOUND EQUITEL STK CALLBACK ─────────────────────────
+       // ── 2. ROUTE: OUTBOUND EQUITEL STK CALLBACK ─────────────────────────
         // Shape: { status: true/false, code: 3, transactionReference, mobileNumber, debitedAmount... }
         if (body.telco === 'Equitel' || body.transactionReference) {
             const isPaid = body.status === true && String(body.code) === '3';
-            const accountRef = body.transactionReference || null; // Our STK tracking ID
+            let accountRef = body.transactionReference || null; // Jenga's internal ID
 
+            // ── THE FIX: Resolve the cross-reference to find our real payRef ──
+            if (accountRef) {
+                const crossRef = await mpesaGet(accountRef);
+                if (crossRef && crossRef.status === 'cross_ref') {
+                    accountRef = crossRef.mpesa_code; // Translate Jenga's ID into our EQ... payRef
+                }
+            }
             if (!isPaid) {
                 log.info(`[JENGA EQUITEL STK] Callback failed (code=${body.code}, msg=${body.message}).`);
                 if (accountRef) {
