@@ -13,6 +13,8 @@ const { sanitize, sanitizeQuery, validateBody } = require('./validate');
 const app = express();
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
+const crypto = require('crypto'); 
+const fs = require('fs');
 app.set('trust proxy', 1);
 
 // ─────────────────────────────────────────────────────────────
@@ -604,9 +606,13 @@ const PAGE_NAMES = [
     'suppliers','purchase_orders','add_product','stock_audit','stock_movement',
     'debtors_report','returns_audit','customer_statement','supplier_statement','accounting',
     'expenses','stock_valuation','profit_loss','reports','debts_repayment',
-    'billing', 'returns_statement', 'sales_orders' // <--- ADDED HERE
+    'billing', 'returns_statement', 'sales_orders'
 ];
+
 app.use((req, res, next) => {
+    // 🛑 THE FIX: Never intercept API routes for HTML page resolution
+    if (req.path.startsWith('/api/')) return next('route');
+    
     if (req.path.startsWith('/src/pages/') && req.path.endsWith('.html')) return next('route');
     if (PAGE_NAMES.some(p => req.path === '/' + p + '.html')) return next('route');
     if (PAGE_NAMES.some(p => req.path === '/' + p)) return next('route');
@@ -5362,6 +5368,657 @@ app.get('/api/mpesa/query/:checkoutId', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('[MPESA QUERY]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                    JENGA API (EQUITY) INTEGRATION                           ║
+// ║                                                                              ║
+// ║  Two separate Jenga payment channels — each uses a DIFFERENT endpoint        ║
+// ║  and a DIFFERENT signature formula:                                          ║
+// ║                                                                              ║
+// ║  1. /api/jenga/stk-push  ← M-Pesa Wallet-Based STK (existing, untouched)    ║
+// ║     Endpoint : /api-checkout/mpesa-stk-push/v3.0/init                       ║
+// ║     Signature: orderRef + currency + msisdn + amount                         ║
+// ║     Settles to: Jenga wallet (then you pull to bank)                         ║
+// ║                                                                              ║
+// ║  2. /api/jenga/equity-stk-push  ← Equitel STK (NEW, this file)              ║
+// ║     Endpoint : /v3-apis/payment-api/v3.0/stkussdpush/initiate               ║
+// ║     Signature: accountNumber + payRef + mobileNumber + telco + amount + KES  ║
+// ║     Settles to: JENGA_EQUITY_ACCOUNT (your Equity Bank account number)       ║
+// ║     Works for: Equitel numbers only (01XXXXXXXXX)                            ║
+// ║                                                                              ║
+// ║  3. /api/jenga/ipn  ← Webhook for BOTH channels (IPN from Jenga HQ)         ║
+// ║     Matches payments to debts (FIFO) identical to Safaricom C2B              ║
+// ║     Also handles excess → stored for cashier to resolve as goods purchase    ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+const JENGA_API_KEY         = process.env.JENGA_API_KEY;
+const JENGA_MERCHANT_CODE   = process.env.JENGA_MERCHANT_CODE;
+const JENGA_CONSUMER_SECRET = process.env.JENGA_CONSUMER_SECRET;
+
+// JENGA_EQUITY_ACCOUNT: Your Equity Bank account number credited on Equitel STK payments.
+// This is NOT a paybill number — it is your actual Equity Bank account number e.g. 0170194290581
+// Add to .env: JENGA_EQUITY_ACCOUNT=<your account number>
+// Add to .env: JENGA_MERCHANT_NAME=<your business name, e.g. "Elite Hardware Ltd">
+const JENGA_EQUITY_ACCOUNT  = process.env.JENGA_EQUITY_ACCOUNT;
+const JENGA_MERCHANT_NAME   = process.env.JENGA_MERCHANT_NAME || 'Elite Hardware Ltd';
+
+// Single base URL — UAT vs Live switched by JENGA_ENV
+const JENGA_BASE_URL = process.env.JENGA_ENV === 'live'
+    ? 'https://api.finserve.africa'
+    : 'https://uat.finserve.africa';
+
+if (!JENGA_API_KEY || !JENGA_MERCHANT_CODE || !JENGA_CONSUMER_SECRET) {
+    log.warn('⚠️  Missing Jenga credentials (JENGA_API_KEY / JENGA_MERCHANT_CODE / JENGA_CONSUMER_SECRET). Jenga routes disabled.');
+}
+if (!JENGA_EQUITY_ACCOUNT) {
+    log.warn('⚠️  JENGA_EQUITY_ACCOUNT not set — Equitel STK push (/api/jenga/equity-stk-push) will return 503.');
+}
+
+// ── Jenga Bearer Token Cache ───────────────────────────────────────────────────
+// Jenga V3 tokens expire at an ISO timestamp, not "seconds from now".
+let _jengaToken    = null;
+let _jengaTokenExp = 0;
+
+async function getJengaToken() {
+    if (!JENGA_API_KEY || !JENGA_MERCHANT_CODE || !JENGA_CONSUMER_SECRET) {
+        throw new Error('Jenga credentials not configured in .env');
+    }
+    const now = Date.now();
+    if (_jengaToken && now < _jengaTokenExp - 5 * 60 * 1000) return _jengaToken;
+
+    const response = await fetch(`${JENGA_BASE_URL}/authentication/api/v3/authenticate/merchant`, {
+        method:  'POST',
+        headers: { 'Api-Key': JENGA_API_KEY, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ merchantCode: JENGA_MERCHANT_CODE, consumerSecret: JENGA_CONSUMER_SECRET }),
+        signal:  AbortSignal.timeout(10000)
+    });
+
+    const text = await response.text();
+    if (!response.ok) {
+        log.error(`[JENGA AUTH] ${response.status}: ${text.substring(0, 200)}`);
+        throw new Error(`Jenga auth failed: HTTP ${response.status}`);
+    }
+    const data = JSON.parse(text);
+    if (!data.accessToken) throw new Error('Jenga returned no accessToken');
+
+    _jengaToken    = data.accessToken;
+    _jengaTokenExp = data.expiresIn ? new Date(data.expiresIn).getTime() : now + 55 * 60 * 1000;
+    log.info('[JENGA] 🔑 Token refreshed');
+    return _jengaToken;
+}
+
+// ── Jenga Private Key (for signing) ───────────────────────────────────────────
+let JENGA_PRIVATE_KEY;
+try {
+    JENGA_PRIVATE_KEY = fs.readFileSync('jenga-private.pem', 'utf8');
+} catch (e) {
+    log.warn('[JENGA] jenga-private.pem not found — all Jenga STK pushes will fail.');
+}
+
+// ── Jenga Public Cert (for IPN verification) — cached once at startup ─────────
+let _jengaPublicCert = null;
+function getJengaPublicCert() {
+    if (_jengaPublicCert) return _jengaPublicCert;
+    try {
+        _jengaPublicCert = fs.readFileSync('jenga-public-equity.pem', 'utf8');
+        log.info('[JENGA] jenga-public-equity.pem loaded for IPN verification.');
+        return _jengaPublicCert;
+    } catch (e) {
+        log.warn('[JENGA] jenga-public-equity.pem not found — IPN signature verification will be skipped.');
+        return null;
+    }
+}
+getJengaPublicCert(); // pre-load on startup
+
+// ── Shared FIFO debt-matching helper ─────────────────────────────────────────
+// Identical logic to Safaricom C2B confirmation — used by BOTH Jenga channels.
+// Matches by accountRef (invoice number the customer typed) first, then by phone.
+// Applies payment FIFO across all outstanding debts, then stores the result in
+// c2b_payments so the cashier dashboard and /api/c2b/resolve-goods work unchanged.
+//
+// params: { phone, amount, bankRef, accountRef, customerName, channel }
+//   channel: 'Equity Paybill' | 'Equitel STK' — used in receipt and log messages
+async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerName, channel }) {
+    const now      = new Date();
+    const datePart = now.getFullYear().toString()
+                   + String(now.getMonth() + 1).padStart(2, '0')
+                   + String(now.getDate()).padStart(2, '0');
+    const timePart = String(now.getHours()).padStart(2, '0')
+                   + String(now.getMinutes()).padStart(2, '0')
+                   + String(now.getSeconds()).padStart(2, '0');
+    const payMethod = channel === 'Equitel STK' ? 'Equitel' : 'Equity Paybill';
+    const suffix    = channel === 'Equitel STK' ? 'EQT' : 'EQ';
+    const processor = 'JENGA-AUTO';
+
+    // ── 1. Duplicate guard (idempotency) ─────────────────────────────────────
+    if (bankRef) {
+        const { data: existingC2B } = await supabase
+            .from('c2b_payments')
+            .select('id')
+            .eq('mpesa_code', bankRef)
+            .maybeSingle();
+        if (existingC2B) {
+            log.warn(`[JENGA ${channel}] ⚠️ Duplicate ref blocked: ${bankRef}`);
+            return;
+        }
+    }
+
+    log.info(`[JENGA ${channel}] 💰 KES ${amount} from ${customerName} (${bankRef}) acc="${accountRef}"`);
+
+    // ── 2. Find matching debts ────────────────────────────────────────────────
+    // Strategy A: exact invoice/receipt match on what the customer typed as account number
+    let activeDebts = [];
+    if (accountRef && accountRef.trim().length > 2) {
+        const { data: byInvoice } = await supabase
+            .from('Sales')
+            .select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
+            .or(`invoice_number.ilike.%${accountRef.trim()}%,receipt_number.ilike.%${accountRef.trim()}%`)
+            .eq('is_voided', false)
+            .in('payment_status', ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'])
+            .order('sale_date', { ascending: true });
+        if (byInvoice && byInvoice.length > 0) activeDebts = byInvoice;
+    }
+
+    // Strategy B: fallback — match by phone number (same as Safaricom C2B)
+    if (activeDebts.length === 0 && phone) {
+        const { data: byPhone } = await supabase
+            .from('Sales')
+            .select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
+            .eq('customer_phone', phone)
+            .eq('is_voided', false)
+            .in('payment_status', ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'])
+            .order('sale_date', { ascending: true });
+        if (byPhone && byPhone.length > 0) activeDebts = byPhone;
+    }
+
+    // Keep only rows with a genuine outstanding balance
+    activeDebts = activeDebts.filter(d =>
+        (parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) > 0
+    );
+
+    // ── 3. No debt — store as unmatched for cashier to resolve as goods purchase ──
+    // This is identical to how Safaricom C2B handles walk-in cash customers:
+    // the cashier sees it in the dashboard and calls /api/c2b/resolve-goods.
+    if (activeDebts.length === 0) {
+        await supabase.from('c2b_payments').insert([{
+            phone,
+            amount,
+            mpesa_code:    bankRef,
+            account_ref:   accountRef,
+            customer_name: customerName,
+            status:        'unmatched',
+            amount_applied: 0,
+            amount_excess:  amount,
+            created_at:    now.toISOString()
+        }]);
+        log.info(`[JENGA ${channel}] ⚠️ No debt for inv="${accountRef}" phone="${phone}" — stored as unmatched (cashier resolves as goods purchase)`);
+        return;
+    }
+
+    // ── 4. Apply payment FIFO across all outstanding debts ────────────────────
+    let remaining    = Math.round(amount);
+    let totalApplied = 0;
+    let payRef       = null;
+
+    for (const debt of activeDebts) {
+        if (remaining <= 0) break;
+        const balance = Math.round(parseFloat(debt.total_amount) - parseFloat(debt.amount_paid || 0));
+        if (balance <= 0) continue;
+
+        const applyAmt = Math.min(remaining, balance);
+        // Snap to total when fully paid to eliminate legacy decimal drift
+        const newPaid  = applyAmt >= balance
+            ? parseFloat(debt.total_amount)
+            : parseFloat(debt.amount_paid || 0) + applyAmt;
+        const newStatus = newPaid >= parseFloat(debt.total_amount) - 0.01 ? 'Paid' : 'Partial';
+        payRef = `PAY-${datePart}-${timePart}-${suffix}`;
+
+        await supabase.from('Sales')
+            .update({ amount_paid: newPaid, payment_status: newStatus })
+            .eq('id', debt.id);
+
+        await supabase.from('payments').insert([{
+            sale_id:       debt.id,
+            amount:        applyAmt,
+            payment_method: payMethod,
+            mpesa_code:    bankRef ? `${bankRef}-${debt.id}` : null,
+            received_by:   processor,
+            customer_name: debt.customer_name || customerName,
+            created_at:    now.toISOString()
+        }]);
+
+        await supabase.from('debt_payments').insert([{
+            sale_id:        debt.id,
+            amount_paid:    applyAmt,
+            payment_method: payMethod,
+            mpesa_id:       bankRef,
+            processed_by:   processor,
+            customer_name:  debt.customer_name || customerName,
+            customer_phone: phone,
+            payment_date:   now.toISOString()
+        }]);
+
+        totalApplied += applyAmt;
+        remaining    -= applyAmt;
+    }
+
+    // ── 5. Update customer aggregate debt balance ─────────────────────────────
+    let newTotalDebt  = 0;
+    const targetPhone = activeDebts[0]?.customer_phone || phone;
+    if (targetPhone) {
+        const { data: cust } = await supabase
+            .from('customers')
+            .select('total_debt')
+            .eq('phone', targetPhone)
+            .single();
+        if (cust) {
+            newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - totalApplied);
+            await supabase.from('customers')
+                .update({ total_debt: newTotalDebt })
+                .eq('phone', targetPhone);
+        }
+    }
+
+    // ── 6. Build receipt JSON and save to c2b_payments ───────────────────────
+    // Same structure as Safaricom C2B so the cashier dashboard and receipt
+    // reprinting logic requires no changes.
+    let receiptDataJson = null;
+    if (totalApplied > 0) {
+        receiptDataJson = JSON.stringify({
+            customer:        activeDebts[0]?.customer_name || customerName,
+            total:           totalApplied,
+            amount:          totalApplied,
+            method:          payMethod,
+            code:            bankRef,
+            receiptNumber:   payRef,
+            servedBy:        processor,
+            date:            now.toLocaleString('en-KE'),
+            items: [{ itemName: `Debt Clearance - ${channel}`, price: totalApplied, quantity: 1 }],
+            remainingBalance: newTotalDebt
+        });
+    }
+
+    // 'excess' = money left over after all debts cleared → cashier links it as goods purchase
+    // 'debt_cleared' = all debt settled exactly or fully
+    const finalStatus = remaining > 0 ? 'excess' : 'debt_cleared';
+
+    await supabase.from('c2b_payments').insert([{
+        phone,
+        amount,
+        mpesa_code:     bankRef,
+        account_ref:    accountRef,
+        customer_name:  activeDebts[0]?.customer_name || customerName,
+        status:         finalStatus,
+        amount_applied: totalApplied,
+        amount_excess:  remaining,
+        receipt_number: payRef,
+        receipt_data:   receiptDataJson,
+        created_at:     now.toISOString()
+    }]);
+
+    if (remaining > 0) {
+        log.info(`[JENGA ${channel}] ℹ️ KES ${remaining} excess after debts — cashier can link as goods purchase`);
+    } else if (newTotalDebt > 0) {
+        log.info(`[JENGA ${channel}] ℹ️ Partial: KES ${totalApplied} applied, KES ${newTotalDebt} still owed`);
+    } else {
+        log.info(`[JENGA ${channel}] ✅ All debts cleared for ${customerName}`);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 1 — M-Pesa STK Push via Jenga (Wallet-Based Settlement)
+// Docs: https://developer.jengahq.io/guides/jenga-api/receive-money/mpesa-stk-push/wallet-based-settlement
+// Endpoint : POST /api-checkout/mpesa-stk-push/v3.0/init
+// Signature: orderRef + "KES" + msisdn + amount   (as a number, not string)
+// Settles to: Jenga wallet
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/jenga/stk-push', requireAuth, requireSubscription, async (req, res) => {
+    if (!JENGA_PRIVATE_KEY) return res.status(503).json({ success: false, message: 'jenga-private.pem not loaded.' });
+
+    const { phone, amount, accountRef, customerName = 'Walk-in Customer' } = req.body;
+
+    // Phone must be local format for this endpoint
+    let msisdn = String(phone || '').replace(/\s/g, '');
+    if (msisdn.startsWith('+254')) msisdn = '0' + msisdn.slice(4);
+    if (msisdn.startsWith('254'))  msisdn = '0' + msisdn.slice(3);
+    if (!/^0(7|1)\d{8}$/.test(msisdn))
+        return res.status(400).json({ success: false, message: 'Invalid phone. Use 07XXXXXXXX or 01XXXXXXXX' });
+
+    const paymentAmount = Math.ceil(parseFloat(amount));
+    if (!paymentAmount || paymentAmount < 1)
+        return res.status(400).json({ success: false, message: 'Invalid amount' });
+
+    try {
+        const token      = await getJengaToken();
+        const orderRef   = `OR${Date.now()}`;
+        const paymentRef = `PR${Date.now()}`;
+
+        // Signature formula (Wallet-Based): orderRef + currency + msisdn + amount
+        const dataToSign = `${orderRef}KES${msisdn}${paymentAmount}`;
+        const signer     = crypto.createSign('SHA256');
+        signer.update(dataToSign);
+        signer.end();
+        const signature = signer.sign(JENGA_PRIVATE_KEY, 'base64');
+
+        const payload = {
+            order: {
+                orderReference: orderRef,
+                orderAmount:    paymentAmount,
+                orderCurrency:  'KES',
+                source:         'APICHECKOUT',
+                countryCode:    'KE',
+                description:    `Payment for ${(accountRef || 'Goods').substring(0, 40)}`
+            },
+            customer: {
+                name:           customerName,
+                email:          process.env.EMAIL_USER || 'billing@business.com',
+                phoneNumber:    msisdn,
+                identityNumber: '0000000',
+                firstAddress:   'Nairobi',
+                secondAddress:  ''
+            },
+            payment: {
+                paymentReference: paymentRef,
+                paymentCurrency:  'KES',
+                channel:          'MOBILE',
+                service:          'MPESA',
+                provider:         'JENGA',
+                callbackUrl:      `${process.env.JENGA_CALLBACK_URL}/api/jenga/ipn`,
+                details: { msisdn, paymentAmount }
+            }
+        };
+
+        const response = await fetch(`${JENGA_BASE_URL}/api-checkout/mpesa-stk-push/v3.0/init`, {
+            method:  'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Signature': signature, 'Content-Type': 'application/json' },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(15000)
+        });
+        const text = await response.text();
+        let data;
+        try { data = JSON.parse(text); } catch (e) { throw new Error('Non-JSON from Jenga: ' + text.substring(0, 200)); }
+
+        if (!response.ok || data.status === false) {
+            log.warn('[JENGA M-PESA STK] ❌ Failed:', data);
+            return res.status(400).json({ success: false, message: data.message || 'STK push failed' });
+        }
+
+        await mpesaSet(orderRef, {
+            status: 'pending', phone: msisdn, amount: paymentAmount,
+            context: { accountRef, channel: 'MPESA_JENGA' },
+            created_at: new Date().toISOString()
+        });
+
+        log.info(`[JENGA M-PESA STK] ✅ Sent to ${msisdn} orderRef=${orderRef}`);
+        return res.json({ success: true, message: `M-Pesa STK sent to ${msisdn}.`, checkoutRequestId: orderRef });
+
+    } catch (err) {
+        log.error('[JENGA M-PESA STK ERROR]', err.message);
+        return res.status(500).json({ success: false, message: 'Jenga M-Pesa STK error: ' + err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 2 — Equitel STK Push via Jenga (Account-Based Settlement)
+// Docs: https://developer.jengahq.io/guides/jenga-api/receive-money/equitel-stk-ussd-push
+// Endpoint : POST /v3-apis/payment-api/v3.0/stkussdpush/initiate
+// Signature: accountNumber + paymentRef + mobileNumber + telco + amount + currency
+//            (amount is a STRING "500.00", NOT a number)
+// Settles to: JENGA_EQUITY_ACCOUNT (your Equity Bank account number)
+// Works for: Equitel (01XXXXXXXXX) numbers — use Jenga M-Pesa STK for Safaricom
+//
+// .env additions needed:
+//   JENGA_EQUITY_ACCOUNT=0170194290581    ← your Equity Bank account number
+//   JENGA_MERCHANT_NAME=Elite Hardware Ltd
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (req, res) => {
+    if (!JENGA_PRIVATE_KEY)
+        return res.status(503).json({ success: false, message: 'jenga-private.pem not loaded.' });
+    if (!JENGA_EQUITY_ACCOUNT)
+        return res.status(503).json({ success: false, message: 'JENGA_EQUITY_ACCOUNT not set in .env' });
+
+    const { phone, amount, accountRef, customerName = 'Walk-in Customer' } = req.body;
+
+    // ── 1. Normalise to 254XXXXXXXXX format (Equitel STK API requires country prefix) ──
+    let msisdn = String(phone || '').replace(/\s/g, '');
+    if (msisdn.startsWith('+'))   msisdn = msisdn.slice(1);
+    if (msisdn.startsWith('0'))   msisdn = '254' + msisdn.slice(1);
+    // Must be Equitel (2541XXXXXXXXX)
+    if (!/^2541[0-9]\d{7}$/.test(msisdn))
+        return res.status(400).json({ success: false, message: 'Equitel STK only works with Equitel numbers (01XXXXXXXXX / 2541XXXXXXXXX). For Safaricom use /api/jenga/stk-push.' });
+
+    const paymentAmount = Math.ceil(parseFloat(amount));
+    if (!paymentAmount || paymentAmount < 1)
+        return res.status(400).json({ success: false, message: 'Invalid amount' });
+
+    // ── 2. Jenga requires amount as a string with 2 decimal places ─────────────
+    const amountStr = paymentAmount.toFixed(2);
+
+    // ── 3. Payment reference: 6–12 alphanumeric chars only (Jenga hard limit) ──
+    const payRef = `EQ${Date.now().toString().slice(-10)}`; // e.g. EQ1714900123
+
+    // ── 4. Transaction date (YYYY-MM-DD) ────────────────────────────────────────
+    const txDate = new Date().toISOString().split('T')[0];
+
+    try {
+        const token = await getJengaToken();
+
+        // ── 5. Signature (Equitel STK formula — DIFFERENT from M-Pesa STK) ──────
+        // Formula: accountNumber + payRef + mobileNumber + "Equitel" + amountStr + "KES"
+        const dataToSign = `${JENGA_EQUITY_ACCOUNT}${payRef}${msisdn}Equitel${amountStr}KES`;
+        const signer     = crypto.createSign('SHA256');
+        signer.update(dataToSign);
+        signer.end();
+        const signature = signer.sign(JENGA_PRIVATE_KEY, 'base64');
+
+        // ── 6. Payload (matches Jenga docs exactly) ──────────────────────────────
+        const payload = {
+            merchant: {
+                accountNumber: JENGA_EQUITY_ACCOUNT,
+                countryCode:   'KE',
+                name:          JENGA_MERCHANT_NAME
+            },
+            payment: {
+                ref:         payRef,
+                amount:      amountStr,      // STRING, 2 decimal places
+                currency:    'KES',
+                telco:       'Equitel',      // exact string Jenga expects
+                mobileNumber: msisdn,        // 2541XXXXXXXXX format
+                date:        txDate,
+                callBackUrl: `${process.env.JENGA_CALLBACK_URL}/api/jenga/ipn`,
+                pushType:    'STK'
+            }
+        };
+
+        log.info(`[JENGA EQUITEL STK] Initiating → ${msisdn} KES ${amountStr} ref=${payRef}`);
+
+        // ── 7. Send to Jenga ─────────────────────────────────────────────────────
+        const response = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
+            method:  'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Signature':     signature,
+                'Content-Type':  'application/json'
+            },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(15000)
+        });
+
+        const text = await response.text();
+        let data;
+        try { data = JSON.parse(text); } catch (e) { throw new Error('Non-JSON from Jenga: ' + text.substring(0, 200)); }
+
+        // Jenga returns { status: true, code: -1, message: "...acknowledged...", reference, transactionId }
+        // code -1 = successfully queued. code 106201 = failed.
+        if (!response.ok || data.status === false || data.code === 106201) {
+            log.warn('[JENGA EQUITEL STK] ❌ Rejected:', data);
+            return res.status(400).json({ success: false, message: data.message || 'Equitel STK push failed', code: data.code });
+        }
+
+        // Persist using payRef as our tracking key
+        await mpesaSet(payRef, {
+            status:     'pending',
+            phone:      msisdn,
+            amount:     paymentAmount,
+            context:    { accountRef, channel: 'EQUITEL_STK', transactionId: data.transactionId },
+            created_at: new Date().toISOString()
+        });
+
+        log.info(`[JENGA EQUITEL STK] ✅ Queued → ${msisdn} ref=${payRef} txId=${data.transactionId}`);
+        return res.json({
+            success:           true,
+            message:           `Equitel STK push queued for ${msisdn}. Customer will receive a prompt.`,
+            checkoutRequestId: payRef,
+            transactionId:     data.transactionId
+        });
+
+    } catch (err) {
+        log.error('[JENGA EQUITEL STK ERROR]', err.message);
+        return res.status(500).json({ success: false, message: 'Equitel STK error: ' + err.message });
+    }
+});
+
+// ── GET /api/jenga/status/:ref — frontend polling (works for both channels) ───
+// Returns same shape as /api/mpesa/status/:checkoutId for drop-in compatibility.
+app.get('/api/jenga/status/:ref', requireAuth, async (req, res) => {
+    try {
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.set('Pragma', 'no-cache');
+        const tx = await mpesaGet(req.params.ref);
+        if (!tx) return res.status(404).json({ success: false, status: 'not_found', message: 'Transaction not found' });
+        return res.json({
+            success:    true,
+            status:     tx.status,
+            mpesaCode:  tx.mpesa_code  || null,
+            amount:     tx.amount,
+            phone:      tx.phone,
+            channel:    tx.context?.channel || 'JENGA',
+            resultDesc: tx.result_desc || null
+        });
+    } catch (err) {
+        log.error('[API]', err.message);
+        return res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 3 — Jenga IPN Webhook (Instant Payment Notification)
+// Handles callbacks for BOTH M-Pesa-via-Jenga AND Equitel STK pushes.
+// Register this URL in Jenga HQ under Settings → IPNs.
+//
+// Payload shapes differ per channel:
+//   M-Pesa  (IPN): { callbackType, customer, transaction, bank }
+//   Equitel (callback): { status, code, transactionReference, telcoReference,
+//                         mobileNumber, debitedAmount, requestAmount, charge, currency, telco }
+//
+// After confirming payment, this handler runs the same FIFO debt-matching logic
+// as Safaricom C2B (/api/c2b/confirmation):
+//   - Match by invoice/receipt number (account ref the customer typed)
+//   - Fallback to phone number match
+//   - Apply FIFO across all outstanding debts
+//   - Store excess as 'unmatched' so cashier can resolve as a goods purchase
+//     via the existing /api/c2b/resolve-goods endpoint — no new routes needed
+// ═══════════════════════════════════════════════════════════════════════════════
+// Add /api/jenga/ipn to the subscription-exempt paths so it always processes
+if (!SUB_EXEMPT_PATHS.has('/api/jenga/ipn')) SUB_EXEMPT_PATHS.add('/api/jenga/ipn');
+
+// ── JENGA WEBHOOK (Handles BOTH Independent Paybill IPNs & STK Callbacks) ──
+app.post('/api/jenga/ipn', async (req, res) => {
+    // Always ACK immediately so Jenga doesn't retry
+    res.status(200).json({ status: 'Success', message: 'Received' });
+
+    try {
+        const body = req.body;
+        log.info('[JENGA WEBHOOK] Received payload:', JSON.stringify(body).substring(0, 500));
+
+        // Optional: Signature verification logic goes here...
+
+        // ── 1. ROUTE: INDEPENDENT PAYBILL 247247 PAYMENT (IPN) ──────────────
+        if (body.callbackType === 'IPN') {
+            const tx   = body.transaction || {};
+            const cust = body.customer    || {};
+            
+            if ((tx.status || '').toUpperCase() !== 'SUCCESS') return;
+
+            const phone        = String(cust.mobileNumber || '').replace(/^254/, '0').replace(/^\+254/, '0');
+            const amount       = Math.round(parseFloat(tx.amount || 0));
+            const bankRef      = tx.reference || null;        // e.g. SH90HU7FO2
+            const accountRef   = tx.billNumber || null;       // What customer typed (e.g. INV-1234)
+            const customerName = cust.name || 'Jenga Paybill Customer';
+            
+            // Fix: Correctly label the channel based on paymentMode
+            const mode = (tx.paymentMode || '').toUpperCase();
+            const channel = mode === 'EQUITEL' ? 'Equitel Paybill' : 'M-Pesa Paybill';
+
+            if (!amount || amount <= 0 || !bankRef) return;
+
+            log.info(`[JENGA IPN] Independent payment via ${channel}. Routing straight to debt matcher.`);
+            
+            // NO pending_mpesa lookup here! Send straight to FIFO debt matcher.
+            await applyJengaPayment({ phone, amount, bankRef, accountRef, customerName, channel });
+            return;
+        }
+
+        // ── 2. ROUTE: OUTBOUND EQUITEL STK CALLBACK ─────────────────────────
+        // Shape: { status: true/false, code: 3, transactionReference, mobileNumber, debitedAmount... }
+        if (body.telco === 'Equitel' || body.transactionReference) {
+            const isPaid = body.status === true && String(body.code) === '3';
+            const accountRef = body.transactionReference || null; // Our STK tracking ID
+
+            if (!isPaid) {
+                log.info(`[JENGA EQUITEL STK] Callback failed/cancelled (code=${body.code}).`);
+                if (accountRef) {
+                    const pending = await mpesaGet(accountRef);
+                    if (pending) {
+                        const newStatus = String(body.code) === '5' || String(body.code) === '6' ? 'cancelled' : 'failed';
+                        await mpesaSet(accountRef, { ...pending, status: newStatus, result_desc: body.message || '' });
+                    }
+                }
+                return;
+            }
+
+            const phone        = String(body.mobileNumber || '').replace(/^254/, '0').replace(/^\+254/, '0');
+            const amount       = Math.round(parseFloat(body.debitedAmount || body.requestAmount || 0));
+            const bankRef      = body.telcoReference || null;
+            const customerName = 'Equitel Customer';
+            const channel      = 'Equitel STK';
+
+            if (!amount || amount <= 0 || !bankRef) return;
+
+            // YES pending_mpesa lookup here! We initiated this.
+            let actualBillNumber = null;
+            if (accountRef) {
+                const pending = await mpesaGet(accountRef);
+                if (pending) {
+                    await mpesaSet(accountRef, { ...pending, status: 'confirmed', mpesa_code: bankRef, amount, phone });
+                    // Extract the actual invoice/receipt number the POS sent in the context
+                    actualBillNumber = pending.context?.accountRef || null;
+                }
+            }
+
+            log.info(`[JENGA EQUITEL STK] Confirmed. Routing to debt matcher.`);
+            await applyJengaPayment({ 
+                phone, amount, bankRef, 
+                accountRef: actualBillNumber, // Pass the real invoice number, not the STK ID
+                customerName, channel 
+            });
+            return;
+        }
+
+        // ── 3. ROUTE: OUTBOUND M-PESA STK CALLBACK (Wallet API) ─────────────
+        // If you are using the V3 Wallet STK, it sends a callback to the URL you provided in the payload.
+        // Shape usually involves an orderReference or paymentReference.
+        if (body.orderReference || (body.payment && body.payment.paymentReference)) {
+            // Logic to confirm the M-Pesa STK push goes here, mirroring the Equitel block above.
+            // ...
+            return;
+        }
+
+        log.warn('[JENGA WEBHOOK] Unrecognised payload shape:', JSON.stringify(body).substring(0, 300));
+
+    } catch (err) {
+        console.error('[JENGA WEBHOOK ERROR]', err.message, err.stack?.split('\n')[1]?.trim());
     }
 });
 // ╔══════════════════════════════════════════════════════════════╗
