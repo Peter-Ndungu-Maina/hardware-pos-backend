@@ -7363,7 +7363,7 @@ async function sendAlertEmail(subject, htmlBody, to = ADMIN_EMAIL) {
     }
     try {
         const info = await transporter.sendMail({
-            from: `"Elite Hardware POS" <${process.env.EMAIL_USER}>`,
+            from: `"Elite Hardware POS" <${process.env.FROM_EMAIL}>`,
             to,
             subject,
             html: `
