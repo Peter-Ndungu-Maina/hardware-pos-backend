@@ -5408,6 +5408,17 @@ const JENGA_BASE_URL = process.env.JENGA_ENV === 'live'
     ? 'https://api.finserve.africa'
     : 'https://uat.finserve.africa';
 
+// ── Startup diagnostic — printed once when server boots ───────────────────────
+// Check these values in your Render logs to confirm what the server actually sees.
+// If JENGA_ENV is not "live" your live credentials hit the UAT server → 401.
+log.info(`[JENGA CONFIG] ENV=${process.env.JENGA_ENV || '(not set — defaulting to UAT)'} BASE_URL=${JENGA_BASE_URL}`);
+log.info(`[JENGA CONFIG] MERCHANT_CODE=${process.env.JENGA_MERCHANT_CODE || '(NOT SET)'}`);
+log.info(`[JENGA CONFIG] API_KEY=${process.env.JENGA_API_KEY ? '✅ set' : '❌ NOT SET'}`);
+log.info(`[JENGA CONFIG] CONSUMER_SECRET=${process.env.JENGA_CONSUMER_SECRET ? '✅ set' : '❌ NOT SET'}`);
+log.info(`[JENGA CONFIG] EQUITY_ACCOUNT=${process.env.JENGA_EQUITY_ACCOUNT || '(NOT SET)'}`);
+log.info(`[JENGA CONFIG] MERCHANT_NAME=${process.env.JENGA_MERCHANT_NAME || '(NOT SET)'}`);
+log.info(`[JENGA CONFIG] CALLBACK_URL=${process.env.JENGA_CALLBACK_URL || '(NOT SET)'}`);
+
 if (!JENGA_API_KEY || !JENGA_MERCHANT_CODE || !JENGA_CONSUMER_SECRET) {
     log.warn('⚠️  Missing Jenga credentials (JENGA_API_KEY / JENGA_MERCHANT_CODE / JENGA_CONSUMER_SECRET). Jenga routes disabled.');
 }
@@ -5436,11 +5447,14 @@ async function getJengaToken() {
 
     const text = await response.text();
     if (!response.ok) {
-        log.error(`[JENGA AUTH] ${response.status}: ${text.substring(0, 200)}`);
+        log.error(`[JENGA AUTH] ❌ HTTP ${response.status} from ${JENGA_BASE_URL}. Body: ${text.substring(0, 400)}`);
         throw new Error(`Jenga auth failed: HTTP ${response.status}`);
     }
     const data = JSON.parse(text);
-    if (!data.accessToken) throw new Error('Jenga returned no accessToken');
+    if (!data.accessToken) {
+        log.error(`[JENGA AUTH] ❌ No accessToken in response: ${JSON.stringify(data).substring(0, 400)}`);
+        throw new Error('Jenga returned no accessToken');
+    }
 
     _jengaToken    = data.accessToken;
     _jengaTokenExp = data.expiresIn ? new Date(data.expiresIn).getTime() : now + 55 * 60 * 1000;
@@ -5762,6 +5776,8 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
         };
 
         log.info(`[JENGA STK] Initiating → ${msisdn} (${telco}) KES ${amountStr} ref=${payRef}`);
+        log.info(`[JENGA STK] Signature input: "${JENGA_EQUITY_ACCOUNT}${payRef}${msisdn}${telco}${amountStr}KES"`);
+        log.info(`[JENGA STK] Payload: ${JSON.stringify(payload)}`);
 
         // ── 5. Send to Jenga ─────────────────────────────────────────────────────
         const response = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
@@ -5781,7 +5797,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
 
         // code -1 = queued successfully. code 106201 / status false = rejected.
         if (!response.ok || data.status === false || data.code === 106201) {
-            log.warn(`[JENGA STK] ❌ Rejected (${telco}):`, data);
+            log.warn(`[JENGA STK] ❌ Rejected (${telco}) HTTP=${response.status} full response: ${JSON.stringify(data)}`);
             return res.status(400).json({ success: false, message: data.message || 'STK push rejected by Jenga', code: data.code });
         }
 
