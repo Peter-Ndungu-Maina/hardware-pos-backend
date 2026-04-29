@@ -3651,23 +3651,22 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
 
     if (!Array.isArray(items) || items.length === 0)
         return res.status(400).json({ success: false, message: 'Cart is empty.' });
-    if (!['Cash', 'M-Pesa', 'Credit', 'Equity'].includes(paymentMethod))
+    if (!['Cash', 'M-Pesa', 'Credit'].includes(paymentMethod))
         return res.status(400).json({ success: false, message: 'Invalid payment method.' });
 
     const linkedPhone = (mpesaId && mpesaId.trim()) ? mpesaId.trim() : null;
 
-    if ((paymentMethod === 'M-Pesa' || paymentMethod === 'Credit' || paymentMethod === 'Equity') && !linkedPhone)
+    if ((paymentMethod === 'M-Pesa' || paymentMethod === 'Credit') && !linkedPhone)
         return res.status(400).json({ success: false, message: 'Phone number required.' });
 
-    // Both M-Pesa and Equity require a transaction reference code
-    if (paymentMethod === 'M-Pesa' || paymentMethod === 'Equity') {
+    if (paymentMethod === 'M-Pesa') {
         if (!mpesaCode || !mpesaCode.trim()) {
-            const label = paymentMethod === 'Equity' ? 'Equity transaction reference' : 'M-Pesa Code';
-            return res.status(400).json({ success: false, message: `${label} required.` });
+            return res.status(400).json({ success: false, message: 'M-Pesa Code required.' });
         }
 
         const sanitizedCode = mpesaCode.trim().toUpperCase();
 
+        // FIX: Only enforce strict uniqueness if this is NOT a C2B split payment
         if (!isC2B) {
             const { data: existingPayment } = await supabase
                 .from('payments')
@@ -3676,8 +3675,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 .maybeSingle();
 
             if (existingPayment) {
-                const label = paymentMethod === 'Equity' ? 'Equity transaction reference' : 'M-Pesa code';
-                return res.status(400).json({ success: false, message: `This ${label} has already been used.` });
+                return res.status(400).json({ success: false, message: 'M-Pesa code already used.' });
             }
         }
     }
@@ -3703,10 +3701,9 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
         const invoiceNumber = isCredit ? `INV-${datePart}-${seq}-${timePart}` : null;
         const dnNumber      = isCredit ? `DN-${datePart}-${seq}-${timePart}`  : null;
 
-        // Determine stored payment method label
-        const storedMethod = paymentMethod === 'Equity'                  ? 'Equity Paybill'
-                           : (mpesaCode && mpesaCode.trim())             ? 'M-Pesa'
-                           : (paymentMethod === 'M-Pesa' || isC2B)      ? 'M-Pesa'
+        // Determine method BEFORE the loop
+        const storedMethod = (mpesaCode && mpesaCode.trim()) ? 'M-Pesa'
+                           : (paymentMethod === 'M-Pesa' || isC2B)  ? 'M-Pesa'
                            : (paymentMethod || 'Cash');
 
         let cartTotal = 0;
@@ -4093,11 +4090,17 @@ app.post('/api/sell', requireAuth, requireSubscription, validateBody({
 app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
     saleId:        { type: 'string', required: true },
     paymentAmount: { type: 'number', required: true, min: 0.01 },
-    paymentMethod: { type: 'string', required: true, enum: ['Cash', 'M-Pesa'] },
+    paymentMethod: { type: 'string', required: true, enum: ['Cash', 'M-Pesa', 'Equity', 'Safaricom'] },
 }), async (req, res) => {
-    const { saleId, paymentAmount, paymentMethod, mpesaId } = req.body;
+    let { saleId, paymentAmount, paymentMethod, mpesaId } = req.body;
     const processedBy = req.user.name;
     const userRole    = req.user.role?.toLowerCase();
+
+    // Normalise frontend method values to canonical DB labels
+    // 'Safaricom' → 'M-Pesa'  (Daraja STK, same as M-Pesa paybill)
+    // 'Equity'    → 'Equity Paybill'
+    if (paymentMethod === 'Safaricom') paymentMethod = 'M-Pesa';
+    if (paymentMethod === 'Equity')    paymentMethod = 'Equity Paybill';
 
     if (!saleId || !paymentAmount) return res.status(400).json({ success: false, message: 'Missing Sale ID or Amount.' });
 
@@ -4150,7 +4153,7 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
                 .from('debt_payments').select('id')
                 .eq('sale_id', saleId).eq('mpesa_id', mpesaId).limit(1);
             if (existingMpesa && existingMpesa.length > 0) {
-                log.warn(`[clear-debt] Duplicate M-Pesa code ${mpesaId} for sale ${saleId} — blocked`);
+                log.warn(`[clear-debt] Duplicate ref ${mpesaId} for sale ${saleId} — blocked`);
                 return res.json({ success: true, message: 'Payment already recorded (duplicate M-Pesa code).', receiptNumber: sale.receipt_number || 'PAY-DUP', alreadyRecorded: true });
             }
         } else {
