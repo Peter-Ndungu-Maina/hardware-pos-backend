@@ -514,29 +514,35 @@ async function syncStockWithEtims(digitaxItemId, quantity, reason, movementType 
 // ============================================================
 //  2. EMAIL CONFIGURATION
 // ============================================================
+// ── SMTP Transporter ─────────────────────────────────────────────────────────
+// Render free tier blocks direct Gmail SMTP. Use Brevo (free, 300 emails/day):
+//   SMTP_HOST  = smtp-relay.brevo.com
+//   SMTP_PORT  = 587
+//   EMAIL_USER = your Brevo login email
+//   EMAIL_PASS = Brevo SMTP key (Brevo dashboard → SMTP & API → Generate key)
+//   ADMIN_EMAIL = delivery address for all alerts/reports
+// ─────────────────────────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
-    host:   'smtp.gmail.com',
-    port:   587,           // 587 STARTTLS — port 465 is blocked on Render's free tier
-    secure: false,         // STARTTLS upgrade after connect (must be false for port 587)
+    host:   process.env.SMTP_HOST || 'smtp-relay.brevo.com',
+    port:   parseInt(process.env.SMTP_PORT || '587', 10),
+    secure: false,
     auth: {
         user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS   // ← Gmail App Password (16 chars) — NOT your login password
+        pass: process.env.EMAIL_PASS
     },
-    tls: {
-        rejectUnauthorized: false,     // avoids cert chain issues on Render's network
-        ciphers: 'SSLv3'
-    },
+    tls: { rejectUnauthorized: false },
     connectionTimeout: 10000,
     greetingTimeout:   10000,
     socketTimeout:     15000
 });
 
-// Verify SMTP on startup — will log clearly if App Password is wrong or port is blocked
 transporter.verify((err) => {
     if (err) {
-        log.error('[EMAIL] ✗ SMTP connection failed — emails will NOT send. Check EMAIL_USER / EMAIL_PASS env vars (App Password required):', err.message);
+        log.error('[EMAIL] ✗ SMTP connection failed:', err.message,
+            '| HOST:', process.env.SMTP_HOST || 'smtp-relay.brevo.com',
+            '| USER:', process.env.EMAIL_USER || '(not set)');
     } else {
-        log.info(`[EMAIL] ✅ SMTP ready — sending as ${process.env.EMAIL_USER}`);
+        log.info(`[EMAIL] ✅ SMTP ready — ${process.env.SMTP_HOST || 'smtp-relay.brevo.com'} — sending as ${process.env.EMAIL_USER}`);
     }
 });
 
