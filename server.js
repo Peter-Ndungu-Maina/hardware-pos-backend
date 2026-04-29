@@ -520,7 +520,7 @@ async function syncStockWithEtims(digitaxItemId, quantity, reason, movementType 
 //   SMTP_PORT  = 587
 //   EMAIL_USER = your Brevo login email
 //   EMAIL_PASS = Brevo SMTP key (Brevo dashboard → SMTP & API → Generate key)
-//   ADMIN_EMAIL = delivery address for all alerts/reports
+//   FROM_EMAIL = delivery address for all alerts/reports
 // ─────────────────────────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
     host:   process.env.SMTP_HOST || 'smtp-relay.brevo.com',
@@ -7350,13 +7350,13 @@ app.get('/api/digitax/reconcile', requireAuth, requireRole('admin'), async (req,
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║                  ELITE HARDWARE POS — AUTOMATED SCRIPTS                     ║
 // ║  All scripts run on server startup and on a recurring schedule.             ║
-// ║  Configure recipients via ADMIN_EMAIL in .env (falls back to EMAIL_USER).  ║
+// ║  Configure recipients via FROM_EMAIL in .env (falls back to EMAIL_USER).  ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || process.env.EMAIL_USER;
+const FROM_EMAIL = process.env.FROM_EMAIL || process.env.EMAIL_USER;
 
 // ─── Helper: send a formatted HTML email ───────────────────────────────────────
-async function sendAlertEmail(subject, htmlBody, to = ADMIN_EMAIL) {
+async function sendAlertEmail(subject, htmlBody, to = FROM_EMAIL) {
     if (!to || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
         log.warn('[EMAIL] Skipping send — EMAIL_USER or EMAIL_PASS not configured in environment.');
         return;
@@ -7461,7 +7461,7 @@ setInterval(retryPendingEtims, 15 * 60 * 1000);
 // credit sales made, debt recovered, eTIMS pending count.
 // ════════════════════════════════════════════════════════════════════════════════
 async function sendEodSummary() {
-    if (!ADMIN_EMAIL) return;
+    if (!FROM_EMAIL) return;
     try {
         const today    = new Date();
         const dateStr  = today.toISOString().split('T')[0];
@@ -7586,7 +7586,7 @@ scheduleEod();
 // Only emails if there are debts older than 30 days.
 // ════════════════════════════════════════════════════════════════════════════════
 async function runCreditAgingAlert() {
-    if (!ADMIN_EMAIL) return;
+    if (!FROM_EMAIL) return;
     try {
         const { data: credits, error } = await supabase
             .from('Sales')
@@ -7694,7 +7694,7 @@ scheduleAgingAlert();
 // Only runs if the system has been active for at least 60 days.
 // ════════════════════════════════════════════════════════════════════════════════
 async function runDeadStockDetector() {
-    if (!ADMIN_EMAIL) return;
+    if (!FROM_EMAIL) return;
     try {
         // ── 1. SYSTEM AGE CHECK (The "Cold Start" Fix) ──────────────
         const { data: firstSale, error: firstSaleErr } = await supabase
@@ -7813,7 +7813,7 @@ scheduleDeadStock();
 // immediately with full details so fraud can be investigated in real time.
 // ════════════════════════════════════════════════════════════════════════════════
 async function checkSuspiciousVoids() {
-    if (!ADMIN_EMAIL) return;
+    if (!FROM_EMAIL) return;
     try {
         const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
         const todayStart = new Date(); todayStart.setHours(0,0,0,0);
@@ -8027,8 +8027,8 @@ async function runDailyBackup() {
     if (_backupArchive.length > 7) _backupArchive.pop();
 
     // ── Email the backup as a JSON attachment ──────────────────────────────
-    if (!ADMIN_EMAIL || !process.env.EMAIL_USER) {
-        log.warn('[BACKUP] EMAIL_USER or ADMIN_EMAIL not set — skipping email delivery');
+    if (!FROM_EMAIL || !process.env.EMAIL_USER) {
+        log.warn('[BACKUP] EMAIL_USER or FROM_EMAIL not set — skipping email delivery');
         return;
     }
 
@@ -8091,7 +8091,7 @@ async function runDailyBackup() {
     try {
         await transporter.sendMail({
             from:    `"Elite Hardware POS" <${process.env.EMAIL_USER}>`,
-            to:      ADMIN_EMAIL,
+            to:      FROM_EMAIL,
             subject: `🗄️ Daily Backup — ${startedAt.toLocaleDateString('en-KE')} — ${totalRows.toLocaleString()} rows — ${sizeKb} KB`,
             html:    `<div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;">
                         <div style="background:#0a0f1e;padding:20px 24px;border-radius:8px 8px 0 0;">
@@ -8111,7 +8111,7 @@ async function runDailyBackup() {
                 contentType: 'application/json'
             }]
         });
-        log.info(`[BACKUP] ✅ Backup email sent to ${ADMIN_EMAIL} — ${sizeKb} KB attachment`);
+        log.info(`[BACKUP] ✅ Backup email sent to ${FROM_EMAIL} — ${sizeKb} KB attachment`);
     } catch (mailErr) {
         log.error('[BACKUP] ✗ Failed to email backup:', mailErr.message);
         // Backup is still in _backupArchive — admin can download manually via API
