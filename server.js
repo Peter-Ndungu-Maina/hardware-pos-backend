@@ -515,8 +515,23 @@ async function syncStockWithEtims(digitaxItemId, quantity, reason, movementType 
 //  2. EMAIL CONFIGURATION
 // ============================================================
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+    host:   'smtp.gmail.com',
+    port:   465,
+    secure: true,                      // SSL — required for port 465
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS   // ← must be a Gmail App Password (16-char), NOT your login password
+    },
+    tls: { rejectUnauthorized: false } // avoids cert issues on some hosts
+});
+
+// Verify SMTP connection at startup — logs clearly if credentials are wrong
+transporter.verify((err) => {
+    if (err) {
+        log.error('[EMAIL] ✗ SMTP connection failed — emails will NOT send. Check EMAIL_USER / EMAIL_PASS (must be Gmail App Password):', err.message);
+    } else {
+        log.info(`[EMAIL] ✅ SMTP ready — sending as ${process.env.EMAIL_USER}`);
+    }
 });
 
 // ============================================================
@@ -7330,26 +7345,34 @@ app.get('/api/digitax/reconcile', requireAuth, requireRole('admin'), async (req,
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || process.env.EMAIL_USER;
 
 // ─── Helper: send a formatted HTML email ───────────────────────────────────────
-function sendAlertEmail(subject, htmlBody, to = ADMIN_EMAIL) {
-    if (!to || !process.env.EMAIL_USER) return;
-    transporter.sendMail({
-        from: `"Elite Hardware POS" <${process.env.EMAIL_USER}>`,
-        to,
-        subject,
-        html: `
-            <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
-                <div style="background:#0a0f1e;padding:20px 24px;border-radius:8px 8px 0 0;">
-                    <h2 style="color:#00e5a0;margin:0;font-size:16px;letter-spacing:1px;">🛠️ ELITE HARDWARE POS</h2>
-                    <p style="color:#64748b;font-size:11px;margin:4px 0 0;">Automated Alert System</p>
-                </div>
-                <div style="background:#111827;padding:24px;border-radius:0 0 8px 8px;color:#e2e8f0;">
-                    ${htmlBody}
-                </div>
-                <p style="text-align:center;font-size:10px;color:#64748b;margin-top:12px;">
-                    Sent by Elite Hardware POS · ${new Date().toLocaleString('en-KE')}
-                </p>
-            </div>`
-    }, err => { if (err) log.warn('[EMAIL] Failed to send alert:', err.message); });
+async function sendAlertEmail(subject, htmlBody, to = ADMIN_EMAIL) {
+    if (!to || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+        log.warn('[EMAIL] Skipping — EMAIL_USER or EMAIL_PASS not set in environment.');
+        return;
+    }
+    try {
+        const info = await transporter.sendMail({
+            from: `"Elite Hardware POS" <${process.env.EMAIL_USER}>`,
+            to,
+            subject,
+            html: `
+                <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+                    <div style="background:#0a0f1e;padding:20px 24px;border-radius:8px 8px 0 0;">
+                        <h2 style="color:#00e5a0;margin:0;font-size:16px;letter-spacing:1px;">🛠️ ELITE HARDWARE POS</h2>
+                        <p style="color:#64748b;font-size:11px;margin:4px 0 0;">Automated Alert System</p>
+                    </div>
+                    <div style="background:#111827;padding:24px;border-radius:0 0 8px 8px;color:#e2e8f0;">
+                        ${htmlBody}
+                    </div>
+                    <p style="text-align:center;font-size:10px;color:#64748b;margin-top:12px;">
+                        Sent by Elite Hardware POS · ${new Date().toLocaleString('en-KE')}
+                    </p>
+                </div>`
+        });
+        log.info(`[EMAIL] ✅ Sent "${subject}" → ${to} (msgId: ${info.messageId})`);
+    } catch (err) {
+        log.error(`[EMAIL] ✗ Failed to send "${subject}" → ${to}:`, err.message);
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
