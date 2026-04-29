@@ -516,19 +516,25 @@ async function syncStockWithEtims(digitaxItemId, quantity, reason, movementType 
 // ============================================================
 const transporter = nodemailer.createTransport({
     host:   'smtp.gmail.com',
-    port:   465,
-    secure: true,                      // SSL — required for port 465
+    port:   587,           // 587 STARTTLS — port 465 is blocked on Render's free tier
+    secure: false,         // STARTTLS upgrade after connect (must be false for port 587)
     auth: {
         user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS   // ← must be a Gmail App Password (16-char), NOT your login password
+        pass: process.env.EMAIL_PASS   // ← Gmail App Password (16 chars) — NOT your login password
     },
-    tls: { rejectUnauthorized: false } // avoids cert issues on some hosts
+    tls: {
+        rejectUnauthorized: false,     // avoids cert chain issues on Render's network
+        ciphers: 'SSLv3'
+    },
+    connectionTimeout: 10000,
+    greetingTimeout:   10000,
+    socketTimeout:     15000
 });
 
-// Verify SMTP connection at startup — logs clearly if credentials are wrong
+// Verify SMTP on startup — will log clearly if App Password is wrong or port is blocked
 transporter.verify((err) => {
     if (err) {
-        log.error('[EMAIL] ✗ SMTP connection failed — emails will NOT send. Check EMAIL_USER / EMAIL_PASS (must be Gmail App Password):', err.message);
+        log.error('[EMAIL] ✗ SMTP connection failed — emails will NOT send. Check EMAIL_USER / EMAIL_PASS env vars (App Password required):', err.message);
     } else {
         log.info(`[EMAIL] ✅ SMTP ready — sending as ${process.env.EMAIL_USER}`);
     }
@@ -7347,7 +7353,7 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL || process.env.EMAIL_USER;
 // ─── Helper: send a formatted HTML email ───────────────────────────────────────
 async function sendAlertEmail(subject, htmlBody, to = ADMIN_EMAIL) {
     if (!to || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-        log.warn('[EMAIL] Skipping — EMAIL_USER or EMAIL_PASS not set in environment.');
+        log.warn('[EMAIL] Skipping send — EMAIL_USER or EMAIL_PASS not configured in environment.');
         return;
     }
     try {
@@ -7371,7 +7377,7 @@ async function sendAlertEmail(subject, htmlBody, to = ADMIN_EMAIL) {
         });
         log.info(`[EMAIL] ✅ Sent "${subject}" → ${to} (msgId: ${info.messageId})`);
     } catch (err) {
-        log.error(`[EMAIL] ✗ Failed to send "${subject}" → ${to}:`, err.message);
+        log.error(`[EMAIL] ✗ Failed to send "${subject}" → ${to}: ${err.message}`);
     }
 }
 
