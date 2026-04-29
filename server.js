@@ -538,9 +538,8 @@ const transporter = nodemailer.createTransport({
 
 transporter.verify((err) => {
     if (err) {
-        log.error('[EMAIL] ✗ SMTP connection failed:', err.message,
-            '| HOST:', process.env.SMTP_HOST || 'smtp-relay.brevo.com',
-            '| USER:', process.env.EMAIL_USER || '(not set)');
+        // We combined everything into one string using backticks so the logger doesn't choke
+        log.error(`[EMAIL] ✗ SMTP connection failed: ${err.message} | HOST: ${process.env.SMTP_HOST || 'smtp-relay.brevo.com'} | USER: ${process.env.EMAIL_USER}`);
     } else {
         log.info(`[EMAIL] ✅ SMTP ready — ${process.env.SMTP_HOST || 'smtp-relay.brevo.com'} — sending as ${process.env.EMAIL_USER}`);
     }
