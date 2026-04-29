@@ -5483,7 +5483,8 @@ async function getJengaToken() {
     }
 
     _jengaToken    = data.accessToken;
-    _jengaTokenExp = data.expiresIn ? new Date(data.expiresIn).getTime() : now + 55 * 60 * 1000;
+   // Ignore Jenga's timezone-confused date string. Force a strict 50-minute TTL.
+    _jengaTokenExp = now + 50 * 60 * 1000;
     log.info('[JENGA] 🔑 Token refreshed');
     return _jengaToken;
 }
@@ -5821,8 +5822,19 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
         let data;
         try { data = JSON.parse(text); } catch (e) { throw new Error('Non-JSON from Jenga: ' + text.substring(0, 300)); }
 
-        // code -1 = queued successfully. code 106201 / status false = rejected.
+       // code -1 = queued successfully. code 106201 / status false = rejected.
         if (!response.ok || data.status === false || data.code === 106201) {
+            
+            // ── THE SELF-HEALING FIX ──
+            if (response.status === 401 || data.code === 401) {
+                _jengaTokenExp = 0; // Instantly kill the dead token in memory
+                log.warn('[JENGA STK] Token expired on Jenga side. Cache cleared.');
+                return res.status(401).json({ 
+                    success: false, 
+                    message: 'Bank session refreshed. Please click "Send Prompt" one more time.' 
+                });
+            }
+
             log.warn(`[JENGA STK] ❌ Rejected (${telco}) HTTP=${response.status} full response: ${JSON.stringify(data)}`);
             return res.status(400).json({ success: false, message: data.message || 'STK push rejected by Jenga', code: data.code });
         }
