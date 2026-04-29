@@ -5962,7 +5962,9 @@ app.post('/api/jenga/ipn', async (req, res) => {
         // { status, code, transactionReference, telcoReference, mobileNumber,
         //   debitedAmount, requestAmount, telco: "Safaricom"|"Equitel", ... }
         if (body.telco || body.transactionReference) {
-            const isPaid      = body.status === true && String(body.code) === '3';
+          // Jenga Code 3 = Settled to Equity Bank. 
+// Jenga Code 4 = Customer paid successfully, but Jenga's internal transfer to Equity is delayed.
+            const isPaid = (body.status === true && String(body.code) === '3') || String(body.code) === '4';
             const jengaTxId   = body.transactionReference || null;
             const callbackTelco = body.telco || 'Unknown';
 
@@ -6000,7 +6002,7 @@ app.post('/api/jenga/ipn', async (req, res) => {
 
             const phone        = String(body.mobileNumber || '').replace(/^(?:\+?254)/, '0');
             const amount       = Math.round(parseFloat(body.debitedAmount || body.requestAmount || 0));
-            const bankRef      = body.telcoReference || null;
+            const bankRef = body.telcoReference || body.transactionReference || null;
             const channel      = callbackTelco === 'Equitel' ? 'Equitel STK' : 'Safaricom STK via Equity';
 
             if (!amount || amount <= 0 || !bankRef) return;
