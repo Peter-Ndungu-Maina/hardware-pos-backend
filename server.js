@@ -3651,22 +3651,23 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
 
     if (!Array.isArray(items) || items.length === 0)
         return res.status(400).json({ success: false, message: 'Cart is empty.' });
-    if (!['Cash', 'M-Pesa', 'Credit'].includes(paymentMethod))
+    if (!['Cash', 'M-Pesa', 'Credit', 'Equity'].includes(paymentMethod))
         return res.status(400).json({ success: false, message: 'Invalid payment method.' });
 
     const linkedPhone = (mpesaId && mpesaId.trim()) ? mpesaId.trim() : null;
 
-    if ((paymentMethod === 'M-Pesa' || paymentMethod === 'Credit') && !linkedPhone)
+    if ((paymentMethod === 'M-Pesa' || paymentMethod === 'Credit' || paymentMethod === 'Equity') && !linkedPhone)
         return res.status(400).json({ success: false, message: 'Phone number required.' });
 
-    if (paymentMethod === 'M-Pesa') {
+    // Both M-Pesa and Equity require a transaction reference code
+    if (paymentMethod === 'M-Pesa' || paymentMethod === 'Equity') {
         if (!mpesaCode || !mpesaCode.trim()) {
-            return res.status(400).json({ success: false, message: 'M-Pesa Code required.' });
+            const label = paymentMethod === 'Equity' ? 'Equity transaction reference' : 'M-Pesa Code';
+            return res.status(400).json({ success: false, message: `${label} required.` });
         }
 
         const sanitizedCode = mpesaCode.trim().toUpperCase();
 
-        // FIX: Only enforce strict uniqueness if this is NOT a C2B split payment
         if (!isC2B) {
             const { data: existingPayment } = await supabase
                 .from('payments')
@@ -3675,7 +3676,8 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 .maybeSingle();
 
             if (existingPayment) {
-                return res.status(400).json({ success: false, message: 'M-Pesa code already used.' });
+                const label = paymentMethod === 'Equity' ? 'Equity transaction reference' : 'M-Pesa code';
+                return res.status(400).json({ success: false, message: `This ${label} has already been used.` });
             }
         }
     }
@@ -3701,9 +3703,10 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
         const invoiceNumber = isCredit ? `INV-${datePart}-${seq}-${timePart}` : null;
         const dnNumber      = isCredit ? `DN-${datePart}-${seq}-${timePart}`  : null;
 
-        // Determine method BEFORE the loop
-        const storedMethod = (mpesaCode && mpesaCode.trim()) ? 'M-Pesa'
-                           : (paymentMethod === 'M-Pesa' || isC2B)  ? 'M-Pesa'
+        // Determine stored payment method label
+        const storedMethod = paymentMethod === 'Equity'                  ? 'Equity Paybill'
+                           : (mpesaCode && mpesaCode.trim())             ? 'M-Pesa'
+                           : (paymentMethod === 'M-Pesa' || isC2B)      ? 'M-Pesa'
                            : (paymentMethod || 'Cash');
 
         let cartTotal = 0;
