@@ -7959,31 +7959,39 @@ const BACKUP_TABLES = [
 // Rolling in-memory archive — keeps last 7 backups so admin can re-download
 const _backupArchive = []; // [{ createdAt, label, sizeKb, tables, json }]
 
+// ── Helper: Convert JSON Array to CSV String ──
+function jsonToCsv(items) {
+    if (!items || !items.length) return '';
+    // Extract headers from the first object
+    const head = Object.keys(items[0]);
+    const csv = [
+        head.join(','), // Header row
+        ...items.map(row => head.map(fieldName => {
+            let val = row[fieldName] === null ? '' : row[fieldName];
+            // If value is a string, escape double quotes and wrap in quotes
+            if (typeof val === 'string') {
+                val = `"${val.replace(/"/g, '""')}"`;
+            }
+            return val;
+        }).join(','))
+    ].join('\r\n');
+    return csv;
+}
+
 async function runDailyBackup() {
     const startedAt = new Date();
-    log.info('[BACKUP] Starting daily database backup...');
+    log.info('[BACKUP] Starting daily database backup (CSV Format)...');
 
-    const snapshot = {
-        meta: {
-            generatedAt:  startedAt.toISOString(),
-            generatedBy:  'Elite Hardware POS — Automated Backup',
-            supabaseUrl:  supabaseUrl,
-            tables:       BACKUP_TABLES,
-            version:      '1.0'
-        },
-        data: {}
-    };
-
-    const results  = [];  // summary for email
-    let   totalRows = 0;
+    const results = [];
+    const attachments = [];
+    let totalRows = 0;
 
     for (const table of BACKUP_TABLES) {
         try {
-            // Fetch all rows — paginate in 1000-row chunks to handle large tables
-            let allRows  = [];
-            let from     = 0;
-            const chunk  = 1000;
-            let hasMore  = true;
+            let allRows = [];
+            let from = 0;
+            const chunk = 1000;
+            let hasMore = true;
 
             while (hasMore) {
                 const { data, error } = await supabase
@@ -7998,126 +8006,90 @@ async function runDailyBackup() {
                     hasMore = false;
                 } else {
                     allRows = allRows.concat(data);
-                    from   += chunk;
-                    hasMore = data.length === chunk; // if less than chunk, we're done
+                    from += chunk;
+                    hasMore = data.length === chunk;
                 }
             }
 
-            snapshot.data[table] = allRows;
-            totalRows += allRows.length;
-            results.push({ table, rows: allRows.length, status: 'ok' });
-            log.info(`[BACKUP] ✓ ${table}: ${allRows.length} rows`);
+            if (allRows.length > 0) {
+                const csvContent = jsonToCsv(allRows);
+                attachments.push({
+                    filename: `${table}_${startedAt.toISOString().slice(0, 10)}.csv`,
+                    content: csvContent,
+                    contentType: 'text/csv'
+                });
+                totalRows += allRows.length;
+                results.push({ table, rows: allRows.length, status: 'ok' });
+                log.info(`[BACKUP] ✓ ${table}: ${allRows.length} rows converted to CSV`);
+            } else {
+                results.push({ table, rows: 0, status: 'empty' });
+            }
 
         } catch (err) {
-            snapshot.data[table] = [];
             results.push({ table, rows: 0, status: 'error', error: err.message });
             log.warn(`[BACKUP] ✗ ${table}: ${err.message}`);
         }
     }
 
-    const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
-    const label       = `backup-${startedAt.toISOString().slice(0, 10)}`;
-    const jsonStr     = JSON.stringify(snapshot, null, 2);
-    const sizeKb      = Math.round(Buffer.byteLength(jsonStr, 'utf8') / 1024);
-
-    log.info(`[BACKUP] Complete — ${totalRows} rows across ${BACKUP_TABLES.length} tables — ${sizeKb} KB — ${durationSec}s`);
-
-    // Store in rolling archive (keep last 7)
-    _backupArchive.unshift({ createdAt: startedAt.toISOString(), label, sizeKb, totalRows, results, json: jsonStr });
-    if (_backupArchive.length > 7) _backupArchive.pop();
-
-    // ── Email the backup as a JSON attachment ──────────────────────────────
-    if (!FROM_EMAIL || !process.env.EMAIL_USER) {
-        log.warn('[BACKUP] EMAIL_USER or FROM_EMAIL not set — skipping email delivery');
+    if (attachments.length === 0) {
+        log.warn('[BACKUP] No data found to back up — skipping email.');
         return;
     }
 
-    const okTables   = results.filter(r => r.status === 'ok');
-    const failTables = results.filter(r => r.status === 'error');
+    // ── Prepare Email ──
+    const RECIPIENT = process.env.FROM_EMAIL;
+    const dateLabel = startedAt.toLocaleDateString('en-KE', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
+    
+    // Calculate approximate size for logging
+    const totalSizeKb = Math.round(attachments.reduce((sum, att) => sum + Buffer.byteLength(att.content, 'utf8'), 0) / 1024);
 
-    const tableRows  = results.map(r => `
+    const tableRowsHtml = results.map(r => `
         <tr>
             <td style="padding:7px 12px;border-bottom:1px solid #1e293b;font-family:monospace;font-size:12px;color:#e2e8f0;">${r.table}</td>
-            <td style="padding:7px 12px;border-bottom:1px solid #1e293b;text-align:right;font-family:monospace;font-size:12px;color:${r.status === 'ok' ? '#00e5a0' : '#ff4d6d'};">${r.rows.toLocaleString()}</td>
-            <td style="padding:7px 12px;border-bottom:1px solid #1e293b;font-size:11px;color:${r.status === 'ok' ? '#00e5a0' : '#ff4d6d'};">${r.status === 'ok' ? '✓ OK' : '✗ ' + (r.error || 'Error')}</td>
+            <td style="padding:7px 12px;border-bottom:1px solid #1e293b;text-align:right;font-family:monospace;font-size:12px;color:${r.status === 'ok' ? '#00e5a0' : '#64748b'};">${r.rows.toLocaleString()}</td>
+            <td style="padding:7px 12px;border-bottom:1px solid #1e293b;font-size:11px;color:${r.status === 'ok' ? '#00e5a0' : r.status === 'error' ? '#ff4d6d' : '#64748b'};">
+                ${r.status === 'ok' ? '✓ CSV Ready' : r.status === 'empty' ? 'Empty' : '✗ ' + (r.error || 'Error')}
+            </td>
         </tr>`).join('');
 
-    const htmlBody = `
-        <h3 style="color:#00e5a0;margin:0 0 16px;">Daily Database Backup — ${startedAt.toLocaleDateString('en-KE', { weekday:'long', year:'numeric', month:'long', day:'numeric' })}</h3>
-
-        <div style="display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap;">
-            <div style="background:#0a0f1e;padding:14px 20px;border-radius:8px;border-left:3px solid #00e5a0;min-width:120px;">
-                <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Total Rows</div>
-                <div style="font-size:22px;font-weight:900;color:#00e5a0;font-family:monospace;">${totalRows.toLocaleString()}</div>
-            </div>
-            <div style="background:#0a0f1e;padding:14px 20px;border-radius:8px;border-left:3px solid #569cd6;min-width:120px;">
-                <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">File Size</div>
-                <div style="font-size:22px;font-weight:900;color:#569cd6;font-family:monospace;">${sizeKb} KB</div>
-            </div>
-            <div style="background:#0a0f1e;padding:14px 20px;border-radius:8px;border-left:3px solid ${failTables.length ? '#ff4d6d' : '#00e5a0'};min-width:120px;">
-                <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Tables</div>
-                <div style="font-size:22px;font-weight:900;color:${failTables.length ? '#ff4d6d' : '#00e5a0'};font-family:monospace;">${okTables.length}/${BACKUP_TABLES.length}</div>
-            </div>
-            <div style="background:#0a0f1e;padding:14px 20px;border-radius:8px;border-left:3px solid #f59e0b;min-width:120px;">
-                <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Duration</div>
-                <div style="font-size:22px;font-weight:900;color:#f59e0b;font-family:monospace;">${durationSec}s</div>
-            </div>
-        </div>
-
-        ${failTables.length ? `<div style="background:rgba(255,77,109,0.1);border:1px solid #ff4d6d;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
-            <strong style="color:#ff4d6d;">⚠ ${failTables.length} table(s) failed to export:</strong>
-            <span style="color:#fca5a5;font-size:12px;margin-left:8px;">${failTables.map(t => t.table).join(', ')}</span>
-        </div>` : ''}
-
-        <table style="width:100%;border-collapse:collapse;background:#0a0f1e;border-radius:8px;overflow:hidden;">
-            <thead>
-                <tr style="background:#111827;">
-                    <th style="padding:10px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#64748b;">Table</th>
-                    <th style="padding:10px 12px;text-align:right;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#64748b;">Rows</th>
-                    <th style="padding:10px 12px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#64748b;">Status</th>
-                </tr>
-            </thead>
-            <tbody>${tableRows}</tbody>
-        </table>
-
-        <p style="margin-top:20px;font-size:12px;color:#64748b;">
-            The full database snapshot is attached as <code style="background:#1e293b;padding:2px 6px;border-radius:4px;color:#e2e8f0;">${label}.json</code>.
-            Keep this file secure — it contains all business data including sales, inventory, customer records and employee details.
-        </p>
-        <p style="font-size:11px;color:#475569;">
-            To restore: import the JSON into Supabase via the Table Editor, or use the Supabase CLI: <code style="background:#1e293b;padding:2px 6px;border-radius:4px;">supabase db restore</code>
-        </p>`;
-
     try {
-        await transporter.sendMail({
-            from:    `"Elite Hardware POS" <${process.env.EMAIL_USER}>`,
-            to:      FROM_EMAIL,
-            subject: `🗄️ Daily Backup — ${startedAt.toLocaleDateString('en-KE')} — ${totalRows.toLocaleString()} rows — ${sizeKb} KB`,
-            html:    `<div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;">
-                        <div style="background:#0a0f1e;padding:20px 24px;border-radius:8px 8px 0 0;">
-                            <h2 style="color:#00e5a0;margin:0;font-size:16px;letter-spacing:1px;">🛠️ ELITE HARDWARE POS</h2>
-                            <p style="color:#64748b;font-size:11px;margin:4px 0 0;">Automated Backup System</p>
-                        </div>
-                        <div style="background:#111827;padding:24px;border-radius:0 0 8px 8px;color:#e2e8f0;">
-                            ${htmlBody}
-                        </div>
-                        <p style="text-align:center;font-size:10px;color:#64748b;margin-top:12px;">
-                            Sent by Elite Hardware POS · ${startedAt.toLocaleString('en-KE')}
-                        </p>
-                      </div>`,
-            attachments: [{
-                filename:    `${label}.json`,
-                content:     jsonStr,
-                contentType: 'application/json'
-            }]
+        const info = await transporter.sendMail({
+            from: `"Elite Hardware POS" <${process.env.FROM_EMAIL}>`,
+            to:   RECIPIENT,
+            subject: `🗄️ Daily CSV Backup — ${startedAt.toISOString().slice(0, 10)} — ${totalRows.toLocaleString()} rows`,
+            html: `
+                <div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;background:#0a0f1e;padding:20px;border-radius:12px;">
+                    <h2 style="color:#00e5a0;margin-top:0;">Daily Database Backup</h2>
+                    <p style="color:#94a3b8;font-size:14px;">Backup generated on <strong>${dateLabel}</strong>.</p>
+                    
+                    <div style="background:#111827;padding:16px;border-radius:8px;margin:20px 0;border-left:4px solid #00e5a0;">
+                        <p style="color:#e2e8f0;margin:0;font-size:13px;">Total Tables: <b>${attachments.length}</b></p>
+                        <p style="color:#e2e8f0;margin:5px 0 0;font-size:13px;">Total Rows: <b>${totalRows.toLocaleString()}</b></p>
+                    </div>
+
+                    <table style="width:100%;border-collapse:collapse;background:#111827;border-radius:8px;overflow:hidden;">
+                        <thead>
+                            <tr style="background:#1f2937;color:#64748b;font-size:10px;text-transform:uppercase;">
+                                <th style="padding:10px 12px;text-align:left;">Table</th>
+                                <th style="padding:10px 12px;text-align:right;">Rows</th>
+                                <th style="padding:10px 12px;text-align:left;">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>${tableRowsHtml}</tbody>
+                    </table>
+
+                    <p style="color:#64748b;font-size:11px;margin-top:20px;">
+                        Attached are individual CSV files for each table. These can be opened directly in Excel, Google Sheets, or Numbers.
+                    </p>
+                </div>`,
+            attachments: attachments
         });
-        log.info(`[BACKUP] ✅ Backup email sent to ${FROM_EMAIL} — ${sizeKb} KB attachment`);
+
+        log.info(`[BACKUP] ✅ CSV Backup email sent to ${RECIPIENT} (msgId: ${info.messageId}) — Total Size: ~${totalSizeKb} KB`);
     } catch (mailErr) {
-        log.error('[BACKUP] ✗ Failed to email backup:', mailErr.message);
-        // Backup is still in _backupArchive — admin can download manually via API
+        log.error(`[BACKUP] ✗ Failed to email CSV backup: ${mailErr.message}`);
     }
 }
-
 // Schedule: 2:00 AM EAT = 23:00 UTC (previous day)
 function scheduleBackup() {
     function msToNext23UTC() {
