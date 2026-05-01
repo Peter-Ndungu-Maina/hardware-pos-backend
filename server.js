@@ -5999,15 +5999,31 @@ app.post('/api/jenga/ipn', async (req, res) => {
                     if (pending) {
                         let newStatus = 'failed';
                         const codeStr = String(body.code);
-                        const msg     = (body.message || '').toLowerCase();
-                        if (codeStr === '5' || msg.includes('cancel') || msg.includes('abort') || msg.includes('decline')) {
+                        // Combine all text fields Jenga may use to describe the failure
+                        const msg = (
+                            (body.message       || '') + ' ' +
+                            (body.description   || '') + ' ' +
+                            (body.reason        || '') + ' ' +
+                            (body.errorMessage  || '') + ' ' +
+                            (body.resultDesc    || '')
+                        ).toLowerCase();
+
+                        if (codeStr === '5' || msg.includes('cancel') || msg.includes('abort') || msg.includes('decline') || msg.includes('reject')) {
                             newStatus = 'cancelled';
-                        } else if (codeStr === '6' || msg.includes('timeout') || msg.includes('expired')) {
+                        } else if (codeStr === '6' || msg.includes('timeout') || msg.includes('timed out') || msg.includes('expired') || msg.includes('no response')) {
                             newStatus = 'timeout';
-                        } else if (codeStr === '11' || codeStr === '12' || msg.includes('insufficient') || msg.includes('balance') || msg.includes('funds')) {
+                        } else if (
+                            // Jenga numeric codes for balance/limit failures
+                            ['1','2','7','8','10','11','12','17'].includes(codeStr) ||
+                            // Keyword catch-all — covers Jenga, Equitel, and Safaricom-via-Jenga phrasing
+                            msg.includes('insufficient') || msg.includes('balance') ||
+                            msg.includes('funds')        || msg.includes('low bal') ||
+                            msg.includes('limit')        || msg.includes('exceed')  ||
+                            msg.includes('not enough')   || msg.includes('no funds')
+                        ) {
                             newStatus = 'insufficient_funds';
                         }
-                        await mpesaSet(primaryRef, { ...pending, status: newStatus, result_desc: body.message || 'Payment failed' });
+                        await mpesaSet(primaryRef, { ...pending, status: newStatus, result_desc: body.message || body.description || 'Payment failed' });
                     }
                 }
                 return;
