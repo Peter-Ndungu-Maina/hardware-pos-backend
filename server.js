@@ -6008,20 +6008,30 @@ app.post('/api/jenga/ipn', async (req, res) => {
                             (body.resultDesc    || '')
                         ).toLowerCase();
 
-                        if (codeStr === '5' || msg.includes('cancel') || msg.includes('abort') || msg.includes('decline') || msg.includes('reject')) {
-                            newStatus = 'cancelled';
-                        } else if (codeStr === '6' || msg.includes('timeout') || msg.includes('timed out') || msg.includes('expired') || msg.includes('no response')) {
-                            newStatus = 'timeout';
-                        } else if (
-                            // Jenga numeric codes for balance/limit failures
-                            ['1','2','7','8','10','11','12','17'].includes(codeStr) ||
-                            // Keyword catch-all — covers Jenga, Equitel, and Safaricom-via-Jenga phrasing
+                        // IMPORTANT: Check message keywords FIRST before numeric codes.
+                        // Jenga reuses code 6 for both timeout AND insufficient funds —
+                        // the message text is the only reliable signal.
+                        // Confirmed from live logs: code=6, msg="The balance is insufficient for the transaction."
+                        const isInsufficientFunds =
                             msg.includes('insufficient') || msg.includes('balance') ||
                             msg.includes('funds')        || msg.includes('low bal') ||
                             msg.includes('limit')        || msg.includes('exceed')  ||
-                            msg.includes('not enough')   || msg.includes('no funds')
-                        ) {
+                            msg.includes('not enough')   || msg.includes('no funds') ||
+                            ['1','2','7','8','10','11','12','17'].includes(codeStr);
+
+                        const isTimeout =
+                            !isInsufficientFunds && (
+                                codeStr === '6' ||
+                                msg.includes('timeout') || msg.includes('timed out') ||
+                                msg.includes('expired')  || msg.includes('no response')
+                            );
+
+                        if (isInsufficientFunds) {
                             newStatus = 'insufficient_funds';
+                        } else if (codeStr === '5' || msg.includes('cancel') || msg.includes('abort') || msg.includes('decline') || msg.includes('reject')) {
+                            newStatus = 'cancelled';
+                        } else if (isTimeout) {
+                            newStatus = 'timeout';
                         }
                         await mpesaSet(primaryRef, { ...pending, status: newStatus, result_desc: body.message || body.description || 'Payment failed' });
                     }
