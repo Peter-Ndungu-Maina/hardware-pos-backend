@@ -3746,7 +3746,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
         const etimsCartItems = []; 
 
         for (const cartItem of items) {
-            const qty = parseInt(cartItem.quantity);
+            const qty = parseFloat(cartItem.quantity); // Allows fractional units
             if (!qty || qty <= 0) continue;
 
             const { data: invItem, error: fetchErr } = await supabase
