@@ -1475,7 +1475,7 @@ app.get('/api/inventory', requireAuth, async (req, res) => {
     const role = req.user.role;
     let columns = role?.toLowerCase() === 'admin'
         ? '*, stock_batches(*)'
-        : 'id, item_name, category, price, stock_quantity, unit, barcode, stock_batches(*)'; // <--- ADDED barcode
+        : 'id, item_name, category, price, cost_price, stock_quantity, unit, barcode, fundi_price, wholesale_price, wholesale_min_qty, bulk_unit, sub_unit, sub_unit_qty, sub_unit_price, stock_batches(*)';
     let query = supabase.from('Inventory').select(columns, { count: 'exact' });
     if (search) query = query.ilike('item_name', `%${sanitize(search)}%`);
     if (category && category !== 'All') query = query.eq('category', category);
@@ -1504,16 +1504,26 @@ app.get('/api/inventory', requireAuth, async (req, res) => {
 });
 
 app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), requireSubscription, validateBody({
-    itemName:      { type: 'string', required: true, maxLen: 200 },
-    sellingPrice:  { type: 'number', required: true, min: 0 },
-    costPrice:     { type: 'number', min: 0 },
-    stockQty:      { type: 'number', min: 0 },
-    unit:          { type: 'string', maxLen: 50 },
-    category:      { type: 'string', maxLen: 100 },
-    barcode:       { type: 'string', maxLen: 100 },
+    itemName:        { type: 'string', required: true, maxLen: 200 },
+    sellingPrice:    { type: 'number', required: true, min: 0 },
+    costPrice:       { type: 'number', min: 0 },
+    stockQty:        { type: 'number', min: 0 },
+    unit:            { type: 'string', maxLen: 50 },
+    category:        { type: 'string', maxLen: 100 },
+    barcode:         { type: 'string', maxLen: 100 },
+    fundiPrice:      { type: 'number', min: 0 },
+    wholesalePrice:  { type: 'number', min: 0 },
+    wholesaleMinQty: { type: 'number', min: 1 },
+    bulkUnit:        { type: 'string', maxLen: 50 },
+    subUnit:         { type: 'string', maxLen: 50 },
+    subUnitQty:      { type: 'number', min: 0 },
+    subUnitPrice:    { type: 'number', min: 0 },
 }), async (req, res) => {
-    const { itemName, category, unit, costPrice, sellingPrice, stockQty, deliveryNote, barcode } = req.body;
+    const { itemName, category, unit, costPrice, sellingPrice, stockQty, deliveryNote, barcode,
+            fundiPrice, wholesalePrice, wholesaleMinQty, bulkUnit, subUnit, subUnitQty, subUnitPrice } = req.body;
     const userName = req.user.name;
+    // DEBUG — remove after confirming fields arrive
+    log.info('[DEBUG] /api/inventory req.body', { fundiPrice, wholesalePrice, wholesaleMinQty, bulkUnit, subUnit, subUnitQty, subUnitPrice });
     try {
         const { data: existing } = await supabase.from('stock_batches').select('delivery_number')
             .eq('delivery_number', deliveryNote?.trim().toUpperCase()).maybeSingle();
@@ -1527,7 +1537,22 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), require
         })();
 
         const { data: newItem, error: invError } = await supabase.from('Inventory')
-            .insert([{ item_name: itemName, category, unit, cost_price: parseFloat(costPrice), price: parseFloat(sellingPrice), stock_quantity: parseInt(stockQty), barcode: finalBarcode }])
+            .insert([{
+                item_name:          itemName,
+                category,
+                unit,
+                cost_price:         parseFloat(costPrice),
+                price:              parseFloat(sellingPrice),
+                stock_quantity:     parseInt(stockQty),
+                barcode:            finalBarcode,
+                fundi_price:        fundiPrice       ? parseFloat(fundiPrice)     : null,
+                wholesale_price:    wholesalePrice   ? parseFloat(wholesalePrice) : null,
+                wholesale_min_qty:  wholesaleMinQty  ? parseInt(wholesaleMinQty)  : null,
+                bulk_unit:          bulkUnit?.trim()  || null,
+                sub_unit:           subUnit?.trim()   || null,
+                sub_unit_qty:       subUnitQty        ? parseFloat(subUnitQty)    : null,
+                sub_unit_price:     subUnitPrice      ? parseFloat(subUnitPrice)  : null,
+            }])
             .select().single();
         if (invError) throw invError;
 
@@ -3646,8 +3671,9 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
 //  POST /api/sell/cart  →  ONE receipt/invoice/DN for ALL items
 // ============================================================
 app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) => {
-    let { items, paymentMethod, mpesaId, mpesaCode, customerName, customerPin, amountPaid, isC2B } = req.body;
+    let { items, paymentMethod, mpesaId, mpesaCode, customerName, customerPin, amountPaid, isC2B, priceTier } = req.body;
     const soldBy = req.user.name;
+    const tier = (priceTier || 'retail').toLowerCase();
 
     if (!Array.isArray(items) || items.length === 0)
         return res.status(400).json({ success: false, message: 'Cart is empty.' });
@@ -3724,12 +3750,34 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             if (!qty || qty <= 0) continue;
 
             const { data: invItem, error: fetchErr } = await supabase
-                .from('Inventory').select('stock_quantity, item_name, price').eq('id', cartItem.itemId).single();
+                .from('Inventory').select('stock_quantity, item_name, price, fundi_price, wholesale_price, wholesale_min_qty, sub_unit, sub_unit_qty, sub_unit_price, bulk_unit, cost_price').eq('id', cartItem.itemId).single();
             if (fetchErr || !invItem) throw new Error(`Item ${cartItem.itemId} not found.`);
 
-            const price     = invItem.price;
+            // ── Price tier resolution ─────────────────────────────────────────
+            let price = invItem.price; // default retail (bulk unit price)
+            const sellUnit = cartItem.sellUnit || 'bulk';
+
+            if (sellUnit === 'sub' && invItem.sub_unit_price) {
+                // Selling by sub_unit (e.g. Kg) — use dedicated sub_unit_price
+                price = invItem.sub_unit_price;
+            } else if (tier === 'fundi' && invItem.fundi_price) {
+                price = invItem.fundi_price;
+            } else if (tier === 'wholesale' && invItem.wholesale_price) {
+                price = invItem.wholesale_price;
+            } else if (tier === 'retail' && invItem.wholesale_price && invItem.wholesale_min_qty && qty >= invItem.wholesale_min_qty) {
+                // Auto-upgrade to wholesale if qty threshold met
+                price = invItem.wholesale_price;
+            }
+
+            // ── Fractional stock deduction for sub_unit sales ─────────────────
+            // e.g. selling 5 Kg from a 20 Kg carton → deduct 0.25 cartons
+            const stockDeductionQty = (sellUnit === 'sub' && invItem.sub_unit_qty)
+                ? parseFloat((qty / parseFloat(invItem.sub_unit_qty)).toFixed(6))
+                : qty;
+
+            const displayUnit = (sellUnit === 'sub' && invItem.sub_unit) ? invItem.sub_unit : (invItem.bulk_unit || invItem.unit || 'PCS');
             const itemName  = invItem.item_name;
-            const itemTotal = qty * price;
+            const itemTotal = parseFloat((qty * price).toFixed(2));
 
             etimsCartItems.push({
                 itemName: itemName,
@@ -3742,11 +3790,11 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 .eq('inventory_id', cartItem.itemId).gt('remaining_qty', 0)
                 .order('created_at', { ascending: true });
 
-            let remaining = qty, itemCost = 0;
+            let remaining = stockDeductionQty, itemCost = 0;
             for (const batch of (batches || [])) {
                 if (remaining <= 0) break;
-                const take   = Math.min(batch.remaining_qty, remaining);
-                const newQty = batch.remaining_qty - take;
+                const take   = Math.min(parseFloat(batch.remaining_qty), remaining);
+                const newQty = parseFloat((batch.remaining_qty - take).toFixed(6));
                 itemCost    += take * parseFloat(batch.unit_cost || 0);
                 await supabase.from('stock_batches').update({ remaining_qty: newQty }).eq('id', batch.id);
                 if (newQty === 0) {
@@ -3758,10 +3806,10 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                         text: `Batch for "${itemName}" depleted. Next: ${next ? 'KES ' + next.unit_cost : 'NO STOCK LEFT'}`
                     }, e => { if (e) log.warn('Batch email failed', e); });
                 }
-                remaining -= take;
+                remaining = parseFloat((remaining - take).toFixed(6));
             }
 
-            const avgCost  = qty > 0 ? itemCost / qty : 0;
+            const avgCost  = stockDeductionQty > 0 ? itemCost / stockDeductionQty : 0;
             const itemPaid = isCredit ? 0 : itemTotal;
             cartTotal += itemTotal;
 
@@ -3783,6 +3831,8 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 receipt_number: receiptNumber,
                 invoice_number: invoiceNumber,
                 dn_number:      dnNumber,
+                price_tier:     tier !== 'retail' ? tier : null,
+                sell_unit:      displayUnit,
             }]).select().single();
             if (insertErr) throw insertErr;
             saleIds.push(saleRow.id);
@@ -3801,7 +3851,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             }
 
             const { error: rpcErr } = await supabase.rpc('decrement_stock', {
-                p_item_id: cartItem.itemId, p_quantity: qty
+                p_item_id: cartItem.itemId, p_quantity: stockDeductionQty
             });
             if (rpcErr) throw new Error(rpcErr.message);
 
