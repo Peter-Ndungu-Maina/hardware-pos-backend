@@ -171,20 +171,24 @@ async function submitSaleToEtims(saleData) {
             };
             const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'U';
 
-            // Map the cart array into DigiTax format
+           // Map the cart array into DigiTax format
             payloadItems = saleData.cartItems.map(item => {
-                const qty = parseFloat(item.quantity) || 1;
-                const price = parseFloat(item.unitPrice) || 0;
+                let qty = parseFloat(item.quantity) || 1;
+                let price = parseFloat(item.unitPrice) || 0;
 
-                // For sub-unit sales (e.g. 4 Kg from a 20 Kg/Carton item):
-                //   - quantity = 4 (Kg entered by cashier)  ← already correct
-                //   - unit_price = sub_unit_price (KES 150/Kg)  ← already correct
-                //   - quantity_unit_code = 'KGM' so KRA knows it's 4 Kg, not 4 Cartons
-                // For bulk sales (e.g. 2 Cartons):
-                //   - quantity_unit_code = 'U' (generic)
-                const activeUnit = (item.sellUnit === 'sub' && item.subUnit)
-                    ? item.subUnit      // 'Kg'
-                    : item.bulkUnit;    // 'Carton', 'Bag', 'Pcs', etc.
+                const hasSub = !!(item.subUnit && item.subUnitQty);
+
+                // ── THE FIX: Translate Bulk sales into Sub-unit sales for KRA ──
+                // If the cashier sold by 'Carton' but the item is tracked in 'Pieces',
+                // multiply the quantity by 1000 and divide the unit price by 1000.
+                if (item.sellUnit !== 'sub' && hasSub) {
+                    const subQty = parseFloat(item.subUnitQty);
+                    qty = parseFloat((qty * subQty).toFixed(4));
+                    price = price / subQty; 
+                }
+
+                // KRA must always see the sub-unit if the item has one configured
+                const activeUnit = hasSub ? item.subUnit : item.bulkUnit;
                 const quantityUnitCode = resolveUnitCode(activeUnit);
 
                 return {
