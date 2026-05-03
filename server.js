@@ -155,10 +155,38 @@ async function submitSaleToEtims(saleData) {
         let payloadItems = [];
         
         if (saleData.cartItems && Array.isArray(saleData.cartItems)) {
+            // UN/CEFACT unit codes used by KRA eTIMS
+            // 'U'   = generic unit (cartons, pieces, bags, etc.)
+            // 'KGM' = kilogram
+            // 'GRM' = gram
+            // 'LTR' = litre
+            // 'MTR' = metre
+            // 'MTK' = square metre
+            const unitCodeMap = {
+                'kg':  'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
+                'g':   'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
+                'l':   'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
+                'm':   'MTR', 'mtr': 'MTR', 'metre': 'MTR', 'meter': 'MTR', 'metres': 'MTR', 'meters': 'MTR',
+                'm2':  'MTK', 'sqm': 'MTK', 'sq m': 'MTK',
+            };
+            const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'U';
+
             // Map the cart array into DigiTax format
             payloadItems = saleData.cartItems.map(item => {
                 const qty = parseFloat(item.quantity) || 1;
                 const price = parseFloat(item.unitPrice) || 0;
+
+                // For sub-unit sales (e.g. 4 Kg from a 20 Kg/Carton item):
+                //   - quantity = 4 (Kg entered by cashier)  ← already correct
+                //   - unit_price = sub_unit_price (KES 150/Kg)  ← already correct
+                //   - quantity_unit_code = 'KGM' so KRA knows it's 4 Kg, not 4 Cartons
+                // For bulk sales (e.g. 2 Cartons):
+                //   - quantity_unit_code = 'U' (generic)
+                const activeUnit = (item.sellUnit === 'sub' && item.subUnit)
+                    ? item.subUnit      // 'Kg'
+                    : item.bulkUnit;    // 'Carton', 'Bag', 'Pcs', etc.
+                const quantityUnitCode = resolveUnitCode(activeUnit);
+
                 return {
                     item_name:             item.itemName,
                     item_class_code:       '99010000',
@@ -166,7 +194,7 @@ async function submitSaleToEtims(saleData) {
                     item_bar_code:         String((item.itemName || 'ITEM').split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)).padStart(8, '0'),
                     item_tax_type_code:    'B',
                     quantity:              qty,
-                    quantity_unit_code:    'U',
+                    quantity_unit_code:    quantityUnitCode,
                     package_unit_code:     'NT',
                     package_unit_quantity: 1,
                     unit_price:            price,
@@ -357,14 +385,39 @@ async function registerItemWithEtims(item) {
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
+        // UN/CEFACT unit code map
+        const regUnitCodeMap = {
+            'kg': 'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
+            'g':  'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
+            'l':  'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
+            'm':  'MTR', 'mtr': 'MTR', 'metre': 'MTR', 'meter': 'MTR', 'metres': 'MTR', 'meters': 'MTR',
+            'm2': 'MTK', 'sqm': 'MTK',
+        };
+
+        // ── Sub-unit items: register and track in the sub-unit (e.g. Kg) not the bulk unit (Carton) ──
+        // KRA cannot reconcile stock registered in 'Cartons' against sales reported in 'Kg'.
+        // The cleanest approach: register in the unit you actually sell in.
+        // For nails: stockQty=12 cartons, sub_unit_qty=20 Kg/carton → register 240 Kg at KES 150/Kg.
+        const hasSub = !!(item.sub_unit && item.sub_unit_qty && item.sub_unit_price);
+        const etimsUnit      = hasSub ? item.sub_unit : (item.bulk_unit || item.unit || 'PCS');
+        const etimsUnitCode  = regUnitCodeMap[etimsUnit.toLowerCase().trim()] || 'U';
+        // Total stock in the etims unit: 12 cartons × 20 Kg = 240 Kg (or just stockQty if no sub-unit)
+        const etimsStockQty  = hasSub
+            ? parseFloat((item.stockQty * parseFloat(item.sub_unit_qty)).toFixed(4))
+            : parseFloat(item.stockQty) || 0;
+        // Unit price for KRA: sub-unit price (KES 150/Kg) if selling by sub-unit, else bulk price
+        const etimsUnitPrice = hasSub
+            ? parseFloat(item.sub_unit_price)
+            : parseFloat(item.sellingPrice) || 0;
+
         const payload = {
             item_name:          item.itemName,
             item_class_code:    classCodeMap[item.category] || '99010000',
             item_type_code:     '2',
             item_bar_code:      barCode,
             tax_type_code:      'B',  // B = 16% VAT
-            default_unit_price: parseFloat(item.sellingPrice) || 0,
-            quantity_unit_code: 'U',
+            default_unit_price: etimsUnitPrice,
+            quantity_unit_code: etimsUnitCode,
             package_unit_code:  'NT',
             origin_nation_code: 'KE',
             active:             true,
@@ -397,13 +450,13 @@ async function registerItemWithEtims(item) {
                     log.info('[eTIMS] ✅ Item registered with fallback code', { item: item.itemName, digitaxItemId: fallbackId });
 
                     // ── Phase 2: push stock qty for fallback-registered item ──
-                    const stockQtyFallback = parseFloat(item.stockQty || item.stock_quantity) || 0;
-                    if (fallbackId && stockQtyFallback > 0) {
-                        log.info(`[eTIMS] Waiting 3s before pushing ${stockQtyFallback} units (fallback)...`);
+                    // Use the same etimsStockQty (converted to sub-unit if applicable)
+                    if (fallbackId && etimsStockQty > 0) {
+                        log.info(`[eTIMS] Waiting 3s before pushing ${etimsStockQty} ${etimsUnit} (fallback)...`);
                         await new Promise(resolve => setTimeout(resolve, 3000));
                         const stockPayload = {
                             item_id:       fallbackId,
-                            quantity:      stockQtyFallback,
+                            quantity:      etimsStockQty,
                             movement_type: '04',
                             action:        'ADD',
                             branch_id:     '01',
@@ -436,16 +489,17 @@ async function registerItemWithEtims(item) {
         log.info('[eTIMS] ✅ Identity registered', { item: item.itemName, digitaxItemId });
 
         // ════════ PHASE 2: IMMEDIATELY UPLOAD STOCK QUANTITY ════════
-        // We use the ID from Phase 1 to push the stock count so KRA doesn't show 0
-        const stockQty = parseFloat(item.stockQty || item.stock_quantity) || 0;
+        // Push stock in the same unit we registered with (etimsStockQty).
+        // For sub-unit items: 12 cartons × 20 Kg = 240 Kg pushed to KRA.
+        // For regular items: stockQty as-is.
 
-        if (digitaxItemId && stockQty > 0) {
-            log.info(`[eTIMS] Waiting 3s before pushing ${stockQty} units...`);
+        if (digitaxItemId && etimsStockQty > 0) {
+            log.info(`[eTIMS] Waiting 3s before pushing ${etimsStockQty} ${etimsUnit}...`);
             await new Promise(resolve => setTimeout(resolve, 3000));
 
            const stockPayload = {
     item_id:       digitaxItemId,
-    quantity:      stockQty,
+    quantity:      etimsStockQty,
     movement_type: '04',
     action:        'ADD',
     branch_id:     '01', // Standard KRA branch code
@@ -511,6 +565,15 @@ async function syncStockWithEtims(digitaxItemId, quantity, reason, movementType 
         return null;
     }
 } 
+/** 
+ * Converts internal bulk quantity (e.g., Cartons) to KRA-facing sub-unit quantity (e.g., Kg).
+ * If no sub-unit exists, it returns the original quantity. 
+ */
+function toEtimsQty(rawQty, item) {
+    const qty = parseFloat(rawQty) || 0;
+    const hasSub = !!(item.sub_unit && item.sub_unit_qty && item.sub_unit_price);
+    return hasSub ? parseFloat((qty * parseFloat(item.sub_unit_qty)).toFixed(4)) : qty;
+}
 // ============================================================
 //  2. EMAIL CONFIGURATION
 // ============================================================
@@ -1590,11 +1653,16 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), require
         // ── Register item with DigiTax/KRA (non-blocking) ──────────────────
         let digitaxItemId = null;
         const etimsItem = await registerItemWithEtims({
-            itemName: itemName.trim(),
-            category: category || 'General',
+            itemName:    itemName.trim(),
+            category:    category || 'General',
             sellingPrice: sellingPrice,
-            unit: unit || 'PCS',
-            stockQty:     qty
+            unit:         unit || 'PCS',
+            stockQty:     qty,
+            // Sub-unit fields — needed so KRA stock is registered in the traded unit (e.g. Kg)
+            bulk_unit:    bulkUnit?.trim()  || null,
+            sub_unit:     subUnit?.trim()   || null,
+            sub_unit_qty: subUnitQty        ? parseFloat(subUnitQty)  : null,
+            sub_unit_price: subUnitPrice    ? parseFloat(subUnitPrice) : null,
         });
         if (etimsItem) {
             digitaxItemId = etimsItem;
@@ -1657,13 +1725,13 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
         }]);
         if (auditErr2) console.error('Audit log error (RESTOCK_FIFO):', auditErr2.message);
 
-        // Sync restocked quantity with KRA
-        const { data: restockedItem } = await supabase
-            .from('Inventory').select('digitax_item_id').eq('id', inventory_id).single();
-        if (restockedItem?.digitax_item_id) {
-            await syncStockWithEtims(restockedItem.digitax_item_id, added, `Restock — DN: ${delivery_number}`);
+       // Sync restocked quantity with KRA using correct sub-unit conversion
+        if (item.digitax_item_id) {
+            const etimsQty = toEtimsQty(added, item);
+            await syncStockWithEtims(item.digitax_item_id, etimsQty, `Restock — DN: ${delivery_note_ref}`);
         }
 
+        res.json({ success: true, message: `Added ${added}. Total: ${newTotal}` });
         res.json({ success: true, message: 'Restock successful!' });
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
@@ -1679,7 +1747,7 @@ app.post('/api/inventory/bulk-restock', requireAuth, requireRole('admin', 'manag
             const { data: existing } = await supabase.from('stock_batches').select('id')
                 .eq('inventory_id', inventory_id).eq('delivery_number', String(delivery_number)).maybeSingle();
             if (existing) continue;
-            const { data: invItem } = await supabase.from('Inventory').select('stock_quantity, item_name').eq('id', inventory_id).single();
+            const { data: invItem } = await supabase.from('Inventory').select('stock_quantity, item_name, digitax_item_id, sub_unit, sub_unit_qty, sub_unit_price').eq('id', inventory_id).single();
             const oldStock = parseInt(invItem.stock_quantity) || 0;
             const added = parseInt(batch_qty);
             const newTotal = oldStock + added;
@@ -1702,7 +1770,13 @@ app.post('/api/inventory/bulk-restock', requireAuth, requireRole('admin', 'manag
                 details: `BULK RESTOCK: ${invItem.item_name} | DN: ${delivery_number} | Added: ${added} units | Stock: ${oldStock} → ${newTotal} | Cost: KES ${unit_cost} | New Price: KES ${new_selling_price}`,
                 timestamp: new Date().toISOString()
             }]);
-            if (auditErr3) console.error('Audit log error (BULK_RESTOCK):', auditErr3.message);
+           if (auditErr3) console.error('Audit log error (BULK_RESTOCK):', auditErr3.message);
+            
+            // Sync with KRA using correct sub-unit conversion
+            if (invItem.digitax_item_id) {
+                const etimsQty = toEtimsQty(added, invItem);
+                await syncStockWithEtims(invItem.digitax_item_id, etimsQty, `Bulk Restock — DN: ${delivery_number}`);
+            }
         }
         res.json({ success: true, message: 'Bulk restock processed.' });
     } catch (err) {
@@ -1791,12 +1865,12 @@ app.patch('/api/inventory/:id', requireAuth, requireRole('admin', 'manager'), re
     const userName = req.user.name;
     
     try {
-        // 1. Fetch item to get old stock and cost price for the batch
+       // 1. Fetch item to get old stock, cost price, and sub-unit details
         const { data: item, error: fetchError } = await supabase
             .from('Inventory')
-            .select('item_name, stock_quantity, cost_price')
+            .select('item_name, stock_quantity, cost_price, digitax_item_id, sub_unit, sub_unit_qty, sub_unit_price')
             .eq('id', id)
-            .single();
+            .single();;
             
         if (fetchError || !item) throw new Error('Item not found');
         
@@ -2421,6 +2495,10 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
                 const sellingPrice = parseFloat(recv.selling_price) || unitCost * 1.3; // fallback: 30% markup
                 const category     = recv.category?.trim() || 'General';
                 const unit         = recv.unit?.trim()     || 'PCS';
+                const bulkUnit     = recv.bulk_unit?.trim() || unit;
+                const subUnit      = recv.sub_unit?.trim()  || null;
+                const subUnitQty   = recv.sub_unit_qty ? parseFloat(recv.sub_unit_qty) : null;
+                const subUnitPrice = recv.sub_unit_price ? parseFloat(recv.sub_unit_price) : null;
 
                 log.info('[PO RECEIVE] New item — auto-creating in Inventory', { item: poItem.item_name });
 
@@ -2431,6 +2509,10 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
                         item_name:      poItem.item_name.trim(),
                         category,
                         unit,
+                        bulk_unit:      bulkUnit,
+                        sub_unit:       subUnit,
+                        sub_unit_qty:   subUnitQty,
+                        sub_unit_price: subUnitPrice,
                         cost_price:     unitCost,
                         price:          sellingPrice,
                         stock_quantity: qtyToReceive,
@@ -2480,7 +2562,11 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
                         category,
                         sellingPrice,
                         unit,
-                        stockQty:     qtyToReceive
+                        stockQty:     qtyToReceive,
+                        bulk_unit:    bulkUnit,
+                        sub_unit:     subUnit,
+                        sub_unit_qty: subUnitQty,
+                        sub_unit_price: subUnitPrice
                     });
                     if (newId) {
                         await supabase.from('Inventory')
@@ -2503,7 +2589,7 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
             const sellingPrice = recv.new_selling_price || poItem.new_selling_price || null;
             const { data: invItem, error: invErr } = await supabase
                 .from('Inventory')
-                .select('item_name, stock_quantity, price, category, unit, digitax_item_id, kra_registered')
+                .select('item_name, stock_quantity, price, category, unit, digitax_item_id, kra_registered, sub_unit, sub_unit_qty, sub_unit_price')
                 .eq('id', poItem.inventory_id).single();
             if (invErr) throw invErr;
 
@@ -2562,9 +2648,10 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
                         kraStatus = 'failed';
                     }
                 } else {
-                    log.info('[eTIMS] PO receive — syncing qty to DigiTax', { item: invItem.item_name, qty: qtyToReceive });
+                    const etimsQty = toEtimsQty(qtyToReceive, invItem);
+                    log.info('[eTIMS] PO receive — syncing qty to DigiTax', { item: invItem.item_name, qty: etimsQty });
                     const syncResult = await syncStockWithEtims(
-                        digitaxItemId, qtyToReceive,
+                        digitaxItemId, etimsQty,
                         `PO Receive — ${po.po_number} DN: ${delivery_note}`, '01'
                     );
                     kraStatus = syncResult ? 'synced' : 'failed';
@@ -3780,9 +3867,13 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             const itemTotal = parseFloat((qty * price).toFixed(2));
 
             etimsCartItems.push({
-                itemName: itemName,
-                quantity: qty,
-                unitPrice: price
+                itemName:   itemName,
+                quantity:   qty,
+                unitPrice:  price,
+                sellUnit:   sellUnit,
+                bulkUnit:   invItem.bulk_unit || invItem.unit || 'Carton',
+                subUnit:    invItem.sub_unit  || null,
+                subUnitQty: invItem.sub_unit_qty || null,
             });
 
             // FIFO batch drain
@@ -6659,7 +6750,7 @@ app.post('/api/supplier-returns/:id/confirm', requireAuth, requireRole('admin', 
         if (inventory_id) {
             const { data: invItem } = await supabase
                 .from('Inventory')
-                .select('stock_quantity, digitax_item_id')
+                .select('stock_quantity, digitax_item_id, sub_unit, sub_unit_qty, sub_unit_price')
                 .eq('id', inventory_id).single();
 
             if (invItem) {
@@ -6684,8 +6775,9 @@ app.post('/api/supplier-returns/:id/confirm', requireAuth, requireRole('admin', 
                 // ── Sync to DigiTax ───────────────────────────────────────────
                 if (invItem.digitax_item_id && DIGITAX_API_KEY) {
                     try {
+                      const etimsQty = toEtimsQty(qtyNum, invItem);
                         await syncStockWithEtims(
-                            invItem.digitax_item_id, qtyNum,
+                            invItem.digitax_item_id, etimsQty,
                             `Supplier Return Confirmed — ${reason}`,
                             '06', 'DEDUCT'
                         );
@@ -6816,9 +6908,9 @@ app.post('/api/supplier-returns', requireAuth, requireRole('admin', 'manager'), 
                 // ── CONFIRMED: supplier acknowledged return ───────────────────
                 // Only now do we: deduct stock, sync DigiTax, reduce balance
                 if (item.inventory_id) {
-                    const { data: invItem } = await supabase
+                   const { data: invItem } = await supabase
                         .from('Inventory')
-                        .select('stock_quantity, item_name, digitax_item_id')
+                        .select('stock_quantity, item_name, digitax_item_id, sub_unit, sub_unit_qty, sub_unit_price')
                         .eq('id', item.inventory_id).single();
 
                     if (invItem) {
@@ -6843,8 +6935,9 @@ app.post('/api/supplier-returns', requireAuth, requireRole('admin', 'manager'), 
                         // Sync stock deduction to DigiTax
                         if (invItem.digitax_item_id && DIGITAX_API_KEY) {
                             try {
+                                const etimsQty = toEtimsQty(qty, invItem);
                                 await syncStockWithEtims(
-                                    invItem.digitax_item_id, qty,
+                                    invItem.digitax_item_id, etimsQty,
                                     `Supplier Return — ${po_id} | ${item.reason || return_reason}`,
                                     '06', 'DEDUCT'
                                 );
@@ -6949,10 +7042,10 @@ app.post('/api/inventory/:id/write-off', requireAuth, requireRole('admin', 'mana
         return res.status(400).json({ success: false, message: `Reason must be one of: ${validReasons.join(', ')}` });
 
     try {
-        // Fetch item details
+       // Fetch item details
         const { data: item, error: fetchErr } = await supabase
             .from('Inventory')
-            .select('id, item_name, stock_quantity, cost_price, category, unit, digitax_item_id, kra_registered')
+            .select('id, item_name, stock_quantity, cost_price, category, unit, digitax_item_id, kra_registered, sub_unit, sub_unit_qty, sub_unit_price')
             .eq('id', id).single();
 
         if (fetchErr || !item)
@@ -7011,9 +7104,10 @@ app.post('/api/inventory/:id/write-off', requireAuth, requireRole('admin', 'mana
         let kraNotified = false;
         if (item.digitax_item_id && DIGITAX_API_KEY) {
             try {
+                const etimsQty = toEtimsQty(writeOffQty, item);
                 const syncResult = await syncStockWithEtims(
                 item.digitax_item_id,      // The ID linked to DigiTax
-                writeOffQty,               // The amount damaged (e.g., 2)
+                etimsQty,                  // Converted sub-unit amount damaged               // The amount damaged (e.g., 2)
                 `Stock write-off: ${reasonLabel}${reason_detail ? ' — ' + reason_detail : ''}`, // Description
                 '05',                      // KRA Movement Type 05 = "Waste/Write-off"
                 'DEDUCT'                      // Correct direction: Removes from KRA balance
