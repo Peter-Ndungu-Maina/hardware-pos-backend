@@ -3850,10 +3850,22 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 });
             }
 
-            const { error: rpcErr } = await supabase.rpc('decrement_stock', {
-                p_item_id: cartItem.itemId, p_quantity: stockDeductionQty
-            });
-            if (rpcErr) throw new Error(rpcErr.message);
+            // decrement_stock RPC is typed INTEGER — cannot accept fractional values.
+            // For sub-unit sales (e.g. 0.2 Cartons deducted when selling 4 Kg from a 20-Kg carton),
+            // fall back to a direct UPDATE so that decimal deductions work correctly.
+            if (!Number.isInteger(stockDeductionQty)) {
+                const newQty = parseFloat(((invItem.stock_quantity || 0) - stockDeductionQty).toFixed(6));
+                const { error: updErr } = await supabase
+                    .from('Inventory')
+                    .update({ stock_quantity: Math.max(0, newQty) })
+                    .eq('id', cartItem.itemId);
+                if (updErr) throw new Error(updErr.message);
+            } else {
+                const { error: rpcErr } = await supabase.rpc('decrement_stock', {
+                    p_item_id: cartItem.itemId, p_quantity: stockDeductionQty
+                });
+                if (rpcErr) throw new Error(rpcErr.message);
+            }
 
             const newStock = (invItem.stock_quantity || 0) - qty;
             if (newStock <= 10) {
