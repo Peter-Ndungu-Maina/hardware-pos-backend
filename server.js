@@ -3845,19 +3845,36 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             if (fetchErr || !invItem) throw new Error(`Item ${cartItem.itemId} not found.`);
 
             // ── Price tier resolution ─────────────────────────────────────────
-            let price = invItem.price; // default retail (bulk unit price)
+            let price = parseFloat(invItem.price); // default retail (bulk unit price)
             const sellUnit = cartItem.sellUnit || 'bulk';
 
+            // Derive discount % from stored carton prices — same % then applies to loose sales.
+            // e.g. carton retail=750, fundi=700 → fundiPct=6.67%; loose retail=37.50 → fundi loose=35.00
+            const cartonRetail  = parseFloat(invItem.price) || 0;
+            const fundiPct      = (cartonRetail > 0 && invItem.fundi_price)
+                ? (1 - parseFloat(invItem.fundi_price)     / cartonRetail) : null;
+            const wholesalePct  = (cartonRetail > 0 && invItem.wholesale_price)
+                ? (1 - parseFloat(invItem.wholesale_price) / cartonRetail) : null;
+
+            // Wholesale auto-upgrade — only when tier is retail and qty threshold met
+            const wsAutoApplies = tier === 'retail' && invItem.wholesale_price
+                && invItem.wholesale_min_qty && qty >= invItem.wholesale_min_qty;
+
             if (sellUnit === 'sub' && invItem.sub_unit_price) {
-                // Selling by sub_unit (e.g. Kg) — use dedicated sub_unit_price
-                price = invItem.sub_unit_price;
+                // Loose sale — apply tier discount to sub-unit retail price
+                const looseRetail = parseFloat(invItem.sub_unit_price);
+                if (tier === 'fundi' && fundiPct !== null)
+                    price = parseFloat((looseRetail * (1 - fundiPct)).toFixed(2));
+                else if ((tier === 'wholesale' || wsAutoApplies) && wholesalePct !== null)
+                    price = parseFloat((looseRetail * (1 - wholesalePct)).toFixed(2));
+                else
+                    price = looseRetail;
             } else if (tier === 'fundi' && invItem.fundi_price) {
-                price = invItem.fundi_price;
+                price = parseFloat(invItem.fundi_price);
             } else if (tier === 'wholesale' && invItem.wholesale_price) {
-                price = invItem.wholesale_price;
-            } else if (tier === 'retail' && invItem.wholesale_price && invItem.wholesale_min_qty && qty >= invItem.wholesale_min_qty) {
-                // Auto-upgrade to wholesale if qty threshold met
-                price = invItem.wholesale_price;
+                price = parseFloat(invItem.wholesale_price);
+            } else if (wsAutoApplies) {
+                price = parseFloat(invItem.wholesale_price);
             }
 
             // ── Fractional stock deduction for sub_unit sales ─────────────────
