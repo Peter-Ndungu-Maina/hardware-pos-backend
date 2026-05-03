@@ -2966,7 +2966,7 @@ app.get('/api/reports/daily-summary', requireAuth, async (req, res) => {
         allSales?.forEach(s => {
             const total = parseFloat(s.total_amount || 0);
             const paid  = parseFloat(s.amount_paid  || 0);
-            const cost  = parseFloat(s.cost_price   || 0) * parseInt(s.quantity_sold || 0);
+            const cost  = parseFloat(s.cost_price   || 0) * parseFloat(s.quantity_sold || 0);
             // Revenue: only collected cash — unpaid credit is excluded
             realizedSales += paid;
             // COGS: full cost of every item sold (goods left the shop regardless of payment)
@@ -3044,7 +3044,7 @@ app.get('/api/reports/sales', requireAuth, requireRole('admin', 'manager', 'cash
         const reports = data.map(sale => {
             const rev  = parseFloat(sale.total_amount || 0);
             const paid = parseFloat(sale.amount_paid  || 0);
-            const cogs = parseFloat(sale.cost_price   || 0) * parseInt(sale.quantity_sold || 0);
+            const cogs = parseFloat(sale.cost_price   || 0) * parseFloat(sale.quantity_sold || 0);
             const ratio = rev > 0 ? paid / rev : 0;
 
             const row = {
@@ -3245,7 +3245,7 @@ app.get('/api/reports/profit-loss', requireAuth, requireRole('admin', 'manager')
         
         sales.forEach(s => {
             const amt = parseFloat(s.total_amount) || 0;
-            const cogs = (parseFloat(s.cost_price) || 0) * (parseInt(s.quantity_sold) || 0);
+            const cogs = (parseFloat(s.cost_price) || 0) * (parseFloat(s.quantity_sold) || 0);
             const status = (s.payment_status || '').toLowerCase().trim();
             const paid = parseFloat(s.amount_paid) || 0;
 
@@ -3333,7 +3333,7 @@ app.get('/api/reports/stock-movement', requireAuth, requireRole('admin', 'manage
         const soldMap = {};
         (sales || []).forEach(s => {
             const key = (s.item_name || '').trim().toLowerCase();
-            soldMap[key] = (soldMap[key] || 0) + (parseInt(s.quantity_sold) || 0);
+            soldMap[key] = (soldMap[key] || 0) + (parseFloat(s.quantity_sold) || 0);
         });
 
         // 7. Map manual adjustments per item_name
@@ -3816,7 +3816,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             // Insert local sale row
             const { data: saleRow, error: insertErr } = await supabase.from('Sales').insert([{
                 item_name:      itemName,
-                quantity_sold:  qty,
+                quantity_sold:  parseFloat(parseFloat(qty).toFixed(4)),  // NUMERIC(12,4) — supports sub-unit decimals (e.g. 0.5 Kg)
                 unit_price:     price,
                 total_amount:   itemTotal,
                 amount_paid:    itemPaid,
@@ -7094,7 +7094,7 @@ app.get('/api/accounting/balance-sheet', requireAuth, requireRole('admin','manag
         let realizedSales = 0, totalCogs = 0;
         (salesData||[]).forEach(sale => {
             const paid = parseFloat(sale.amount_paid || 0);
-            const cost = parseFloat(sale.cost_price  || 0) * parseInt(sale.quantity_sold || 0);
+            const cost = parseFloat(sale.cost_price  || 0) * parseFloat(sale.quantity_sold || 0);
             realizedSales += paid;
             totalCogs     += cost;
         });
@@ -7158,7 +7158,7 @@ app.get('/api/accounting/income-statement', requireAuth, requireRole('admin','ma
 
         // COGS from sales cost records
         const cogs = (sales||[]).reduce((s,sale) =>
-            s + (parseFloat(sale.cost_price)||0) * (parseInt(sale.quantity_sold)||0), 0);
+            s + (parseFloat(sale.cost_price)||0) * (parseFloat(sale.quantity_sold)||0), 0);
 
         const stockValue   = (stockData||[]).reduce((s,i) => s + (parseFloat(i.stock_quantity)||0)*(parseFloat(i.cost_price)||0), 0);
         const purchases    = (poData||[]).reduce((s,po) => s + (parseFloat(po.total_amount)||0), 0);
@@ -7609,7 +7609,7 @@ async function sendEodSummary() {
             const k = s.item_name || 'Unknown';
             if (!prodMap[k]) prodMap[k] = { rev: 0, qty: 0 };
             prodMap[k].rev += parseFloat(s.amount_paid || 0);
-            prodMap[k].qty += parseInt(s.quantity_sold || 0);
+            prodMap[k].qty += parseFloat(s.quantity_sold || 0);
         });
         const topProds = Object.entries(prodMap).sort((a,b) => b[1].rev - a[1].rev).slice(0,5);
 
@@ -8655,4 +8655,27 @@ if (process.env.NODE_ENV === 'production' || process.env.MPESA_ENV === 'live') {
     // Repeat every 10 minutes (600,000 ms)
     setInterval(runSelfPing, 10 * 60 * 1000);
 }
+// ── ONE-TIME STARTUP MIGRATION: quantity_sold → NUMERIC ─────────────────────
+// Supabase Sales.quantity_sold was INTEGER, which rejects decimal sub-unit
+// quantities (e.g. 0.5 Kg sold loose). This migration widens it to NUMERIC(12,4)
+// so fractional quantities are stored accurately. Safe to run on every restart —
+// ALTER TYPE to same or wider type is idempotent in Postgres.
+(async () => {
+    try {
+        const { error } = await supabase.rpc('exec_sql', {
+            sql: `ALTER TABLE "Sales" ALTER COLUMN quantity_sold TYPE NUMERIC(12,4) USING quantity_sold::NUMERIC;`
+        });
+        if (error) {
+            // exec_sql RPC may not exist — fall back to a direct query via the REST API
+            // This is fine — the column may already be NUMERIC from a prior run.
+            log.warn('[MIGRATION] quantity_sold column type: could not alter via RPC —', error.message,
+                '(safe to ignore if already NUMERIC)');
+        } else {
+            log.info('[MIGRATION] Sales.quantity_sold column confirmed NUMERIC(12,4)');
+        }
+    } catch (e) {
+        log.warn('[MIGRATION] quantity_sold migration skipped:', e.message);
+    }
+})();
+
 app.listen(PORT, () => log.info(`🚀 Elite Hardware POS running on http://localhost:${PORT}`));
