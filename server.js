@@ -8731,19 +8731,37 @@ app.get('/api/sales-orders', requireAuth, async (req, res) => {
     }
 });
 
+// ── GET All Sales Orders ──────────────────────────────────────────────────────
+app.get('/api/sales-orders', requireAuth, async (req, res) => {
+    try {
+        // Using Supabase Join to fetch orders and items together securely
+        const { data, error } = await supabase
+            .from('sales_orders')
+            .select('*, sales_order_items(*)')
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.json(data || []);
+    } catch (err) {
+        log.error('[API GET Sales Orders]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
 // ── GET Single Sales Order ────────────────────────────────────────────────────
 app.get('/api/sales-orders/:id', requireAuth, async (req, res) => {
     try {
-        const { data: order, error: ordErr } = await supabase
-            .from('sales_orders').select('*').eq('id', req.params.id).single();
-        if (ordErr || !order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+        const { data, error } = await supabase
+            .from('sales_orders')
+            .select('*, sales_order_items(*)')
+            .eq('id', req.params.id)
+            .single();
 
-        const { data: lineItems } = await supabase
-            .from('sales_order_items').select('*').eq('so_id', req.params.id).order('id');
-
-        res.json({ ...order, sales_order_items: lineItems || [] });
+        if (error || !data) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+        res.json(data);
     } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+        log.error('[API GET Single Sales Order]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -8754,9 +8772,12 @@ app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res)
     if (!items || !items.length) return res.status(400).json({ success: false, message: 'Add at least one item.' });
 
     try {
-        const so_number = generateSONumber();
+        const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+        const timePart = Date.now().toString().slice(-4);
+        const so_number = `SO-${datePart}-${timePart}`;
         const total_amount = items.reduce((s, i) => s + (parseFloat(i.qty_ordered) * parseFloat(i.unit_price)), 0);
 
+        // 1. Insert Order
         const { data: so, error: soErr } = await supabase
             .from('sales_orders')
             .insert([{
@@ -8767,20 +8788,30 @@ app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res)
         
         if (soErr) throw soErr;
 
+        // 2. Prepare Items
         const lineItems = items.map(i => ({
             so_id:        so.id,
             inventory_id: i.inventory_id,
             item_name:    i.item_name,
-            qty_ordered:  parseFloat(parseFloat(i.qty_ordered).toFixed(4)),   // supports decimal sub-unit qty (e.g. 0.5 Kg)
+            qty_ordered:  parseFloat(parseFloat(i.qty_ordered).toFixed(4)),
             unit_price:   parseFloat(i.unit_price),
             line_total:   parseFloat(i.qty_ordered) * parseFloat(i.unit_price),
-            sell_unit:    i.sell_unit || 'bulk',   // 'bulk' | 'sub'
-            price_tier:   i.price_tier || 'retail', // 'retail' | 'fundi' | 'wholesale'
-            display_unit: i.display_unit || null,   // e.g. 'Kg', 'Carton', 'Bag'
+            sell_unit:    i.sell_unit || 'bulk',
+            price_tier:   i.price_tier || 'retail',
+            display_unit: i.display_unit || null,
         }));
 
-        await supabase.from('sales_order_items').insert(lineItems);
+        // 3. Insert Items WITH ERROR CHECK
+        const { error: itemsErr } = await supabase.from('sales_order_items').insert(lineItems);
         
+        // If items fail to save, rollback the quote creation!
+        if (itemsErr) {
+            log.error('[POST Sales Order Items Error]', itemsErr);
+            await supabase.from('sales_orders').delete().eq('id', so.id);
+            return res.status(500).json({ success: false, message: `Items failed to save: ${itemsErr.message}` });
+        }
+
+        // 4. Audit Log
         await supabase.from('audit_logs').insert([{
             performed_by: req.user.name, action: 'SO_CREATED', item_name: so_number,
             details: `Quote ${so_number} created for ${customerName}. Total: KES ${total_amount}`,
@@ -8789,7 +8820,8 @@ app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res)
 
         res.json({ success: true, message: 'Quotation created successfully.', data: so });
     } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+        log.error('[POST Sales Order]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -8801,7 +8833,7 @@ app.put('/api/sales-orders/:id/status', requireAuth, requireSubscription, async 
         return res.status(400).json({ success: false, message: `Invalid status. Must be one of: ${ALLOWED_STATUSES.join(', ')}.` });
     }
     try {
-        // Validate state machine transitions — prevent going backwards
+        // Validate state machine transitions
         const { data: current, error: fetchErr } = await supabase
             .from('sales_orders').select('status').eq('id', req.params.id).single();
         if (fetchErr || !current) return res.status(404).json({ success: false, message: 'Sales order not found.' });
@@ -8809,8 +8841,8 @@ app.put('/api/sales-orders/:id/status', requireAuth, requireSubscription, async 
         const TRANSITIONS = {
             'Quote':     ['Confirmed', 'Cancelled'],
             'Confirmed': ['Fulfilled', 'Cancelled'],
-            'Fulfilled': [],   // terminal
-            'Cancelled': [],   // terminal
+            'Fulfilled': [],
+            'Cancelled': [],
         };
         const allowed = TRANSITIONS[current.status] || [];
         if (!allowed.includes(status)) {
@@ -8820,8 +8852,9 @@ app.put('/api/sales-orders/:id/status', requireAuth, requireSubscription, async 
             });
         }
 
+        // THE FIX: removed updated_at since it doesn't exist in the DB schema
         const { error } = await supabase.from('sales_orders')
-            .update({ status, updated_at: new Date().toISOString() })
+            .update({ status })
             .eq('id', req.params.id);
         if (error) throw error;
 
@@ -8835,7 +8868,8 @@ app.put('/api/sales-orders/:id/status', requireAuth, requireSubscription, async 
 
         res.json({ success: true, message: `Order marked as ${status}.` });
     } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+        log.error('[PUT SO Status]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 // ════════════════════════════════════════════════════════════════════════════════
