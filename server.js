@@ -8700,12 +8700,32 @@ function generateSONumber() {
 // ── GET All Sales Orders ──────────────────────────────────────────────────────
 app.get('/api/sales-orders', requireAuth, async (req, res) => {
     try {
-        const { data, error } = await supabase
+        // Fetch orders
+        const { data: orders, error: ordErr } = await supabase
             .from('sales_orders')
-            .select('*, sales_order_items(*)')
+            .select('*')
             .order('created_at', { ascending: false });
-        if (error) throw error;
-        res.json(data || []);
+        if (ordErr) throw ordErr;
+        if (!orders || !orders.length) return res.json([]);
+
+        // Fetch ALL line items for these orders in one query
+        const soIds = orders.map(o => o.id);
+        const { data: lineItems, error: liErr } = await supabase
+            .from('sales_order_items')
+            .select('*')
+            .in('so_id', soIds)
+            .order('id', { ascending: true });
+        if (liErr) throw liErr;
+
+        // Attach items to their parent order
+        const itemsBySoId = {};
+        (lineItems || []).forEach(li => {
+            if (!itemsBySoId[li.so_id]) itemsBySoId[li.so_id] = [];
+            itemsBySoId[li.so_id].push(li);
+        });
+        const result = orders.map(o => ({ ...o, sales_order_items: itemsBySoId[o.id] || [] }));
+
+        res.json(result);
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
@@ -8714,13 +8734,14 @@ app.get('/api/sales-orders', requireAuth, async (req, res) => {
 // ── GET Single Sales Order ────────────────────────────────────────────────────
 app.get('/api/sales-orders/:id', requireAuth, async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('sales_orders')
-            .select('*, sales_order_items(*)')
-            .eq('id', req.params.id)
-            .single();
-        if (error || !data) return res.status(404).json({ success: false, message: 'Sales order not found.' });
-        res.json(data);
+        const { data: order, error: ordErr } = await supabase
+            .from('sales_orders').select('*').eq('id', req.params.id).single();
+        if (ordErr || !order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+
+        const { data: lineItems } = await supabase
+            .from('sales_order_items').select('*').eq('so_id', req.params.id).order('id');
+
+        res.json({ ...order, sales_order_items: lineItems || [] });
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
