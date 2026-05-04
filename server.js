@@ -8747,9 +8747,15 @@ app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res)
         if (soErr) throw soErr;
 
         const lineItems = items.map(i => ({
-            so_id: so.id, inventory_id: i.inventory_id,
-            item_name: i.item_name, qty_ordered: parseInt(i.qty_ordered),
-            unit_price: parseFloat(i.unit_price), line_total: parseFloat(i.qty_ordered) * parseFloat(i.unit_price)
+            so_id:        so.id,
+            inventory_id: i.inventory_id,
+            item_name:    i.item_name,
+            qty_ordered:  parseFloat(parseFloat(i.qty_ordered).toFixed(4)),   // supports decimal sub-unit qty (e.g. 0.5 Kg)
+            unit_price:   parseFloat(i.unit_price),
+            line_total:   parseFloat(i.qty_ordered) * parseFloat(i.unit_price),
+            sell_unit:    i.sell_unit || 'bulk',   // 'bulk' | 'sub'
+            price_tier:   i.price_tier || 'retail', // 'retail' | 'fundi' | 'wholesale'
+            display_unit: i.display_unit || null,   // e.g. 'Kg', 'Carton', 'Bag'
         }));
 
         await supabase.from('sales_order_items').insert(lineItems);
@@ -8774,8 +8780,38 @@ app.put('/api/sales-orders/:id/status', requireAuth, requireSubscription, async 
         return res.status(400).json({ success: false, message: `Invalid status. Must be one of: ${ALLOWED_STATUSES.join(', ')}.` });
     }
     try {
-        const { error } = await supabase.from('sales_orders').update({ status }).eq('id', req.params.id);
+        // Validate state machine transitions — prevent going backwards
+        const { data: current, error: fetchErr } = await supabase
+            .from('sales_orders').select('status').eq('id', req.params.id).single();
+        if (fetchErr || !current) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+
+        const TRANSITIONS = {
+            'Quote':     ['Confirmed', 'Cancelled'],
+            'Confirmed': ['Fulfilled', 'Cancelled'],
+            'Fulfilled': [],   // terminal
+            'Cancelled': [],   // terminal
+        };
+        const allowed = TRANSITIONS[current.status] || [];
+        if (!allowed.includes(status)) {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot move from "${current.status}" to "${status}". Allowed: ${allowed.join(', ') || 'none (terminal state)'}.`
+            });
+        }
+
+        const { error } = await supabase.from('sales_orders')
+            .update({ status, updated_at: new Date().toISOString() })
+            .eq('id', req.params.id);
         if (error) throw error;
+
+        await supabase.from('audit_logs').insert([{
+            performed_by: req.user?.name || 'System',
+            action:       'SO_STATUS_CHANGED',
+            item_name:    req.params.id,
+            details:      `Sales Order #${req.params.id} moved from ${current.status} → ${status}`,
+            timestamp:    new Date().toISOString()
+        }]);
+
         res.json({ success: true, message: `Order marked as ${status}.` });
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
