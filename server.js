@@ -3848,23 +3848,31 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             let price = parseFloat(invItem.price);
             const sellUnit = cartItem.sellUnit || 'bulk';
 
-            // Derive discount % from stored carton tier prices — same % applies to loose sales too.
-            const cartonRetail  = parseFloat(invItem.price) || 0;
-            const fundiPct      = (cartonRetail > 0 && invItem.fundi_price)
+            const cartonRetail = parseFloat(invItem.price) || 0;
+            // Derive discount % from carton-level tier prices — applied to piece prices too
+            const fundiPct     = (cartonRetail > 0 && invItem.fundi_price)
                 ? (1 - parseFloat(invItem.fundi_price)     / cartonRetail) : null;
-            const wholesalePct  = (cartonRetail > 0 && invItem.wholesale_price)
+            const wholesalePct = (cartonRetail > 0 && invItem.wholesale_price)
                 ? (1 - parseFloat(invItem.wholesale_price) / cartonRetail) : null;
-            const wsAutoApplies = tier === 'retail' && invItem.wholesale_price
-                && invItem.wholesale_min_qty && qty >= invItem.wholesale_min_qty;
+
+            // Wholesale auto-upgrade:
+            // - BULK only (never pieces), tier must be 'retail', wsQty >= 2
+            const wsQty = parseInt(invItem.wholesale_min_qty) || 0;
+            const wsAutoApplies = sellUnit !== 'sub'
+                && tier === 'retail'
+                && wsQty >= 2
+                && qty >= wsQty
+                && invItem.wholesale_price;
 
             if (sellUnit === 'sub' && invItem.sub_unit_price) {
+                // Piece sale — apply explicit tier discount; never auto-wholesale
                 const looseRetail = parseFloat(invItem.sub_unit_price);
                 if (tier === 'fundi' && fundiPct !== null)
                     price = parseFloat((looseRetail * (1 - fundiPct)).toFixed(2));
-                else if ((tier === 'wholesale' || wsAutoApplies) && wholesalePct !== null)
+                else if (tier === 'wholesale' && wholesalePct !== null)
                     price = parseFloat((looseRetail * (1 - wholesalePct)).toFixed(2));
                 else
-                    price = looseRetail;
+                    price = looseRetail; // retail piece price — default for all non-explicit tiers
             } else if (tier === 'fundi' && invItem.fundi_price) {
                 price = parseFloat(invItem.fundi_price);
             } else if (tier === 'wholesale' && invItem.wholesale_price) {
