@@ -2337,13 +2337,21 @@ app.post('/api/purchase-orders', requireAuth, requireRole('admin', 'manager'), r
 
         const lineItems = items.map(i => ({
             po_id:             po.id,
-            inventory_id:      i.inventory_id || null,
+            inventory_id:      i.inventory_id   || null,
             item_name:         i.item_name.trim(),
-            unit:              i.unit || null,
+            unit:              i.unit            || null,
             qty_ordered:       parseFloat(i.qty_ordered),
             qty_received:      0,
             unit_cost:         parseFloat(i.unit_cost),
-            new_selling_price: i.new_selling_price ? parseFloat(i.new_selling_price) : null,
+            new_selling_price: i.selling_price   ? parseFloat(i.selling_price)   : null,
+            // Sub-unit config — carried through so receive can seed inventory correctly
+            sub_unit:          i.sub_unit?.trim()           || null,
+            sub_unit_qty:      i.sub_unit_qty               ? parseFloat(i.sub_unit_qty)    : null,
+            sub_unit_price:    i.sub_unit_price             ? parseFloat(i.sub_unit_price)  : null,
+            // Pricing tiers
+            fundi_price:       i.fundi_price                ? parseFloat(i.fundi_price)     : null,
+            wholesale_price:   i.wholesale_price            ? parseFloat(i.wholesale_price) : null,
+            wholesale_min_qty: i.wholesale_min_qty          ? parseInt(i.wholesale_min_qty) : null,
         }));
 
         const { error: itemsErr } = await supabase.from('purchase_order_items').insert(lineItems);
@@ -2507,19 +2515,27 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
                 log.info('[PO RECEIVE] New item — auto-creating in Inventory', { item: poItem.item_name });
 
                 // Create inventory record
+                // Pricing tiers — prefer PO-level values, fall back to poItem-stored values
+                const fundiPrice     = recv.fundi_price     ? parseFloat(recv.fundi_price)     : (poItem.fundi_price     ? parseFloat(poItem.fundi_price)     : null);
+                const wholesalePrice = recv.wholesale_price ? parseFloat(recv.wholesale_price) : (poItem.wholesale_price ? parseFloat(poItem.wholesale_price) : null);
+                const wholesaleMinQty= recv.wholesale_min_qty ? parseInt(recv.wholesale_min_qty) : (poItem.wholesale_min_qty ? parseInt(poItem.wholesale_min_qty) : null);
+
                 const { data: newInvItem, error: createErr } = await supabase
                     .from('Inventory')
                     .insert([{
-                        item_name:      poItem.item_name.trim(),
+                        item_name:        poItem.item_name.trim(),
                         category,
                         unit,
-                        bulk_unit:      bulkUnit,
-                        sub_unit:       subUnit,
-                        sub_unit_qty:   subUnitQty,
-                        sub_unit_price: subUnitPrice,
-                        cost_price:     unitCost,
-                        price:          sellingPrice,
-                        stock_quantity: qtyToReceive,
+                        bulk_unit:        bulkUnit,
+                        sub_unit:         subUnit,
+                        sub_unit_qty:     subUnitQty,
+                        sub_unit_price:   subUnitPrice,
+                        cost_price:       unitCost,
+                        price:            sellingPrice,
+                        stock_quantity:   qtyToReceive,
+                        fundi_price:      fundiPrice,
+                        wholesale_price:  wholesalePrice,
+                        wholesale_min_qty: wholesaleMinQty,
                     }])
                     .select().single();
 
@@ -2562,15 +2578,17 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
                 try {
                     log.info('[eTIMS] Registering new item from PO receive', { item: poItem.item_name });
                     const newId = await registerItemWithEtims({
-                        itemName:     poItem.item_name.trim(),
+                        itemName:      poItem.item_name.trim(),
                         category,
                         sellingPrice,
                         unit,
-                        stockQty:     qtyToReceive,
-                        bulk_unit:    bulkUnit,
-                        sub_unit:     subUnit,
-                        sub_unit_qty: subUnitQty,
-                        sub_unit_price: subUnitPrice
+                        stockQty:      qtyToReceive,
+                        bulk_unit:     bulkUnit,
+                        sub_unit:      subUnit,
+                        sub_unit_qty:  subUnitQty,
+                        sub_unit_price: subUnitPrice,
+                        fundi_price:    fundiPrice,
+                        wholesale_price: wholesalePrice,
                     });
                     if (newId) {
                         await supabase.from('Inventory')
@@ -2601,8 +2619,17 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
             const newTotal = oldStock + qtyToReceive;
             const newPrice = sellingPrice ? parseFloat(sellingPrice) : parseFloat(invItem.price);
 
+            // Update pricing tiers if the PO line carries them (manager can update at restock time)
+            const updatePayload = { stock_quantity: newTotal, cost_price: unitCost, price: newPrice };
+            if (poItem.fundi_price)       updatePayload.fundi_price       = parseFloat(poItem.fundi_price);
+            if (poItem.wholesale_price)   updatePayload.wholesale_price   = parseFloat(poItem.wholesale_price);
+            if (poItem.wholesale_min_qty) updatePayload.wholesale_min_qty = parseInt(poItem.wholesale_min_qty);
+            if (poItem.sub_unit)          updatePayload.sub_unit          = poItem.sub_unit;
+            if (poItem.sub_unit_qty)      updatePayload.sub_unit_qty      = parseFloat(poItem.sub_unit_qty);
+            if (poItem.sub_unit_price)    updatePayload.sub_unit_price    = parseFloat(poItem.sub_unit_price);
+
             await supabase.from('Inventory')
-                .update({ stock_quantity: newTotal, cost_price: unitCost, price: newPrice })
+                .update(updatePayload)
                 .eq('id', poItem.inventory_id);
 
             const { data: batch } = await supabase.from('stock_batches').insert([{
