@@ -163,12 +163,20 @@ async function submitSaleToEtims(saleData) {
             // 'MTR' = metre
             // 'MTK' = square metre
             const unitCodeMap = {
+                'pcs': 'PCE', 'pc': 'PCE', 'piece': 'PCE', 'pieces': 'PCE',
                 'kg':  'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
                 'g':   'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
                 'l':   'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
                 'm':   'MTR', 'mtr': 'MTR', 'metre': 'MTR', 'meter': 'MTR', 'metres': 'MTR', 'meters': 'MTR',
                 'm2':  'MTK', 'sqm': 'MTK', 'sq m': 'MTK',
+                'box': 'BOX', 'boxes': 'BOX',
+                'ctn': 'CTN', 'carton': 'CTN', 'cartons': 'CTN',
+                'bag': 'BAG', 'bags': 'BAG',
+                'roll': 'ROL', 'rolls': 'ROL',
+                'tin':  'TIN', 'tins': 'TIN',
+                'bundle':'BND', 'bundles':'BND'
             };
+            const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'PCE';
             const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'U';
 
            // Map the cart array into DigiTax format
@@ -224,7 +232,7 @@ async function submitSaleToEtims(saleData) {
                 item_bar_code:         barCode,
                 item_tax_type_code:    'B',
                 quantity:              quantity,
-                quantity_unit_code:    'U',
+                quantity_unit_code:    'PCE',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
                 unit_price:            unitPrice,
@@ -389,14 +397,22 @@ async function registerItemWithEtims(item) {
             item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
         ).padStart(8, '0');
 
-        // UN/CEFACT unit code map
-        const regUnitCodeMap = {
+       const regUnitCodeMap = {
+            'pcs': 'PCE', 'pc': 'PCE', 'piece': 'PCE', 'pieces': 'PCE',
             'kg': 'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
             'g':  'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
             'l':  'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
             'm':  'MTR', 'mtr': 'MTR', 'metre': 'MTR', 'meter': 'MTR', 'metres': 'MTR', 'meters': 'MTR',
             'm2': 'MTK', 'sqm': 'MTK',
+            'box': 'BOX', 'boxes': 'BOX',
+            'ctn': 'CTN', 'carton': 'CTN', 'cartons': 'CTN',
+            'bag': 'BAG', 'bags': 'BAG',
+            'roll': 'ROL', 'rolls': 'ROL',
+            'tin':  'TIN', 'tins': 'TIN',
+            'bundle':'BND', 'bundles':'BND'
         };
+       
+       
 
         // ── Sub-unit items: register and track in the sub-unit (e.g. Kg) not the bulk unit (Carton) ──
         // KRA cannot reconcile stock registered in 'Cartons' against sales reported in 'Kg'.
@@ -404,7 +420,7 @@ async function registerItemWithEtims(item) {
         // For nails: stockQty=12 cartons, sub_unit_qty=20 Kg/carton → register 240 Kg at KES 150/Kg.
         const hasSub = !!(item.sub_unit && item.sub_unit_qty && item.sub_unit_price);
         const etimsUnit      = hasSub ? item.sub_unit : (item.bulk_unit || item.unit || 'PCS');
-        const etimsUnitCode  = regUnitCodeMap[etimsUnit.toLowerCase().trim()] || 'U';
+       const etimsUnitCode  = regUnitCodeMap[etimsUnit.toLowerCase().trim()] || 'PCE';
         // Total stock in the etims unit: 12 cartons × 20 Kg = 240 Kg (or just stockQty if no sub-unit)
         const etimsStockQty  = hasSub
             ? parseFloat((item.stockQty * parseFloat(item.sub_unit_qty)).toFixed(4))
@@ -5222,7 +5238,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
                         item_bar_code:         barcode(retItem.item_name),
                         item_tax_type_code:    'B',
                         quantity:              retQty,
-                        quantity_unit_code:    'U',
+                        quantity_unit_code:    'PCE',
                         package_unit_code:     'NT',
                         package_unit_quantity: 1,
                         unit_price:            Math.abs(sellingPrice),
