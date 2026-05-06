@@ -163,18 +163,31 @@ async function submitSaleToEtims(saleData) {
             // 'MTR' = metre
             // 'MTK' = square metre
             const unitCodeMap = {
-                'pcs': 'PCE', 'pc': 'PCE', 'piece': 'PCE', 'pieces': 'PCE',
+                // ── Valid DigiTax measurement unit codes ──
+                'pcs': 'PCE', 'pc': 'PCE', 'piece': 'PCE', 'pieces': 'PCE', 'unit': 'PCE', 'units': 'PCE', 'no': 'PCE', 'nos': 'PCE', 'number': 'PCE',
                 'kg':  'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
                 'g':   'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
                 'l':   'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
+                'ml':  'MLT', 'millilitre': 'MLT', 'milliliter': 'MLT',
                 'm':   'MTR', 'mtr': 'MTR', 'metre': 'MTR', 'meter': 'MTR', 'metres': 'MTR', 'meters': 'MTR',
                 'm2':  'MTK', 'sqm': 'MTK', 'sq m': 'MTK',
-                'box': 'BOX', 'boxes': 'BOX',
-                'ctn': 'CTN', 'carton': 'CTN', 'cartons': 'CTN',
-                'bag': 'BAG', 'bags': 'BAG',
-                'roll': 'ROL', 'rolls': 'ROL',
-                'tin':  'TIN', 'tins': 'TIN',
-                'bundle':'BND', 'bundles':'BND'
+                'm3':  'MTQ', 'cbm': 'MTQ',
+                'doz': 'DZN', 'dozen': 'DZN', 'dzn': 'DZN',
+                'set': 'SET', 'sets': 'SET',
+                'pair':'PAR', 'pairs': 'PAR', 'pr': 'PAR',
+                // ── Container units — not valid DigiTax quantity_unit_codes → fall back to PCE ──
+                'box': 'PCE', 'boxes': 'PCE',
+                'ctn': 'PCE', 'carton': 'PCE', 'cartons': 'PCE',
+                'bag': 'PCE', 'bags': 'PCE',
+                'roll':'PCE', 'rolls': 'PCE', 'rl': 'PCE',
+                'tin': 'PCE', 'tins': 'PCE',
+                'bundle':'PCE', 'bundles':'PCE', 'bnd': 'PCE',
+                'pack':'PCE', 'packs': 'PCE', 'pkt': 'PCE', 'packet': 'PCE', 'packets': 'PCE',
+                'drum':'PCE', 'drums': 'PCE',
+                'sack':'PCE', 'sacks': 'PCE',
+                'coil':'PCE', 'coils': 'PCE',
+                'sheet':'PCE','sheets': 'PCE',
+                'length':'PCE','lengths':'PCE',
             };
             const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'PCE';
 
@@ -397,18 +410,34 @@ async function registerItemWithEtims(item) {
         ).padStart(8, '0');
 
        const regUnitCodeMap = {
-            'pcs': 'PCE', 'pc': 'PCE', 'piece': 'PCE', 'pieces': 'PCE',
+            // ── Measurement units — DigiTax accepts these directly ──
+            'pcs': 'PCE', 'pc': 'PCE', 'piece': 'PCE', 'pieces': 'PCE', 'unit': 'PCE', 'units': 'PCE', 'no': 'PCE', 'nos': 'PCE', 'number': 'PCE',
             'kg': 'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
             'g':  'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
             'l':  'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
+            'ml': 'MLT', 'millilitre': 'MLT', 'milliliter': 'MLT',
             'm':  'MTR', 'mtr': 'MTR', 'metre': 'MTR', 'meter': 'MTR', 'metres': 'MTR', 'meters': 'MTR',
-            'm2': 'MTK', 'sqm': 'MTK',
-            'box': 'BOX', 'boxes': 'BOX',
-            'ctn': 'CTN', 'carton': 'CTN', 'cartons': 'CTN',
-            'bag': 'BAG', 'bags': 'BAG',
-            'roll': 'ROL', 'rolls': 'ROL',
-            'tin':  'TIN', 'tins': 'TIN',
-            'bundle':'BND', 'bundles':'BND'
+            'm2': 'MTK', 'sqm': 'MTK', 'sq m': 'MTK', 'square metre': 'MTK', 'square meter': 'MTK',
+            'm3': 'MTQ', 'cbm': 'MTQ', 'cubic metre': 'MTQ',
+            'doz': 'DZN', 'dozen': 'DZN', 'dzn': 'DZN',
+            'set': 'SET', 'sets': 'SET',
+            'pair': 'PAR', 'pairs': 'PAR', 'pr': 'PAR',
+
+            // ── Container / packaging units — DigiTax does NOT accept these as quantity_unit_code.
+            // They describe packaging, not measurement. Always fall back to PCE so KRA gets a valid code.
+            // The actual item count per container is handled via sub-unit logic.
+            'box': 'PCE', 'boxes': 'PCE',
+            'ctn': 'PCE', 'carton': 'PCE', 'cartons': 'PCE',
+            'bag': 'PCE', 'bags': 'PCE',
+            'roll': 'PCE', 'rolls': 'PCE', 'rl': 'PCE',
+            'tin':  'PCE', 'tins': 'PCE',
+            'bundle': 'PCE', 'bundles': 'PCE', 'bnd': 'PCE',
+            'pack': 'PCE', 'packs': 'PCE', 'pkt': 'PCE', 'packet': 'PCE', 'packets': 'PCE',
+            'drum': 'PCE', 'drums': 'PCE',
+            'sack': 'PCE', 'sacks': 'PCE',
+            'coil': 'PCE', 'coils': 'PCE',
+            'sheet': 'PCE', 'sheets': 'PCE',
+            'length': 'PCE', 'lengths': 'PCE',
         };
        
        
@@ -498,6 +527,37 @@ async function registerItemWithEtims(item) {
                     return fallbackId;
                 }
                 log.warn('[eTIMS] Item registration failed even with fallback', { item: item.itemName, body: JSON.stringify(retryData) });
+            } else if (data?.metadata?.argument === 'quantity_unit_code' ||
+                       (data?.message || '').toLowerCase().includes('quantity_unit_code')) {
+                // Container units (BOX, CTN, BAG etc.) are not valid DigiTax quantity_unit_codes.
+                // Retry with PCE — the universal safe fallback accepted by DigiTax.
+                log.warn('[eTIMS] quantity_unit_code rejected — retrying with PCE fallback', { item: item.itemName, attempted: payload.quantity_unit_code });
+                payload.quantity_unit_code = 'PCE';
+                const retry = await fetch(`${DIGITAX_BASE_URL}/items`, {
+                    method: 'POST',
+                    headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: AbortSignal.timeout(10000)
+                });
+                const retryData = await retry.json();
+                if (retry.ok) {
+                    const fallbackId = retryData?.id || retryData?.item_id || retryData?.data?.id || null;
+                    log.info('[eTIMS] ✅ Item registered with PCE unit fallback', { item: item.itemName, digitaxItemId: fallbackId });
+                    if (fallbackId && etimsStockQty > 0) {
+                        log.info(`[eTIMS] Waiting 3s before pushing ${etimsStockQty} (PCE fallback)...`);
+                        await new Promise(resolve => setTimeout(resolve, 3000));
+                        const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
+                            method: 'PUT',
+                            headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ item_id: fallbackId, quantity: etimsStockQty, movement_type: '04', action: 'ADD', branch_id: '01', store_id: '01', remarks: 'Initial System Upload' }),
+                            signal: AbortSignal.timeout(10000)
+                        });
+                        if (stockRes.ok) log.info('[eTIMS] ✅ Stock pushed for PCE-fallback item');
+                        else { const sd = await stockRes.json(); log.warn('[eTIMS] Stock push failed (PCE fallback)', { body: sd }); }
+                    }
+                    return fallbackId;
+                }
+                log.warn('[eTIMS] Item registration failed even with PCE fallback', { item: item.itemName, body: JSON.stringify(retryData) });
             } else {
                 log.warn('[eTIMS] Item registration rejected', { status: res.status, item: item.itemName, body: JSON.stringify(data) });
             }
