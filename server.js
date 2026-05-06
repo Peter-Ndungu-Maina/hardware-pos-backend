@@ -164,7 +164,7 @@ async function submitSaleToEtims(saleData) {
             // 'MTK' = square metre
             const unitCodeMap = {
                 // ── Valid DigiTax measurement unit codes ──
-                'pcs': 'PCE', 'pc': 'PCE', 'piece': 'PCE', 'pieces': 'PCE', 'unit': 'PCE', 'units': 'PCE', 'no': 'PCE', 'nos': 'PCE', 'number': 'PCE',
+                'pcs': 'U', 'pc': 'U', 'piece': 'U', 'pieces': 'U', 'unit': 'U', 'units': 'U', 'no': 'U', 'nos': 'U', 'number': 'U',
                 'kg':  'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
                 'g':   'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
                 'l':   'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
@@ -175,21 +175,21 @@ async function submitSaleToEtims(saleData) {
                 'doz': 'DZN', 'dozen': 'DZN', 'dzn': 'DZN',
                 'set': 'SET', 'sets': 'SET',
                 'pair':'PAR', 'pairs': 'PAR', 'pr': 'PAR',
-                // ── Container units — not valid DigiTax quantity_unit_codes → fall back to PCE ──
-                'box': 'PCE', 'boxes': 'PCE',
-                'ctn': 'PCE', 'carton': 'PCE', 'cartons': 'PCE',
-                'bag': 'PCE', 'bags': 'PCE',
-                'roll':'PCE', 'rolls': 'PCE', 'rl': 'PCE',
-                'tin': 'PCE', 'tins': 'PCE',
-                'bundle':'PCE', 'bundles':'PCE', 'bnd': 'PCE',
-                'pack':'PCE', 'packs': 'PCE', 'pkt': 'PCE', 'packet': 'PCE', 'packets': 'PCE',
-                'drum':'PCE', 'drums': 'PCE',
-                'sack':'PCE', 'sacks': 'PCE',
-                'coil':'PCE', 'coils': 'PCE',
-                'sheet':'PCE','sheets': 'PCE',
-                'length':'PCE','lengths':'PCE',
+                // ── Container units — not valid DigiTax quantity_unit_codes → fall back to U ──
+                'box': 'U', 'boxes': 'U',
+                'ctn': 'U', 'carton': 'U', 'cartons': 'U',
+                'bag': 'U', 'bags': 'U',
+                'roll':'U', 'rolls': 'U', 'rl': 'U',
+                'tin': 'U', 'tins': 'U',
+                'bundle':'U', 'bundles':'U', 'bnd': 'U',
+                'pack':'U', 'packs': 'U', 'pkt': 'U', 'packet': 'U', 'packets': 'U',
+                'drum':'U', 'drums': 'U',
+                'sack':'U', 'sacks': 'U',
+                'coil':'U', 'coils': 'U',
+                'sheet':'U','sheets': 'U',
+                'length':'U','lengths':'U',
             };
-            const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'PCE';
+            const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'U';
 
            // Map the cart array into DigiTax format
             payloadItems = saleData.cartItems.map(item => {
@@ -244,7 +244,7 @@ async function submitSaleToEtims(saleData) {
                 item_bar_code:         barCode,
                 item_tax_type_code:    'B',
                 quantity:              quantity,
-                quantity_unit_code:    'PCE',
+                quantity_unit_code:    'U',
                 package_unit_code:     'NT',
                 package_unit_quantity: 1,
                 unit_price:            unitPrice,
@@ -411,7 +411,7 @@ async function registerItemWithEtims(item) {
 
        const regUnitCodeMap = {
             // ── Measurement units — DigiTax accepts these directly ──
-            'pcs': 'PCE', 'pc': 'PCE', 'piece': 'PCE', 'pieces': 'PCE', 'unit': 'PCE', 'units': 'PCE', 'no': 'PCE', 'nos': 'PCE', 'number': 'PCE',
+            'pcs': 'U', 'pc': 'U', 'piece': 'U', 'pieces': 'U', 'unit': 'U', 'units': 'U', 'no': 'U', 'nos': 'U', 'number': 'U',
             'kg': 'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
             'g':  'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
             'l':  'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
@@ -424,20 +424,20 @@ async function registerItemWithEtims(item) {
             'pair': 'PAR', 'pairs': 'PAR', 'pr': 'PAR',
 
             // ── Container / packaging units — DigiTax does NOT accept these as quantity_unit_code.
-            // They describe packaging, not measurement. Always fall back to PCE so KRA gets a valid code.
+            // They describe packaging, not measurement. Always fall back to U so KRA gets a valid code.
             // The actual item count per container is handled via sub-unit logic.
-            'box': 'PCE', 'boxes': 'PCE',
-            'ctn': 'PCE', 'carton': 'PCE', 'cartons': 'PCE',
-            'bag': 'PCE', 'bags': 'PCE',
-            'roll': 'PCE', 'rolls': 'PCE', 'rl': 'PCE',
-            'tin':  'PCE', 'tins': 'PCE',
-            'bundle': 'PCE', 'bundles': 'PCE', 'bnd': 'PCE',
-            'pack': 'PCE', 'packs': 'PCE', 'pkt': 'PCE', 'packet': 'PCE', 'packets': 'PCE',
-            'drum': 'PCE', 'drums': 'PCE',
-            'sack': 'PCE', 'sacks': 'PCE',
-            'coil': 'PCE', 'coils': 'PCE',
-            'sheet': 'PCE', 'sheets': 'PCE',
-            'length': 'PCE', 'lengths': 'PCE',
+            'box': 'U', 'boxes': 'U',
+            'ctn': 'U', 'carton': 'U', 'cartons': 'U',
+            'bag': 'U', 'bags': 'U',
+            'roll': 'U', 'rolls': 'U', 'rl': 'U',
+            'tin':  'U', 'tins': 'U',
+            'bundle': 'U', 'bundles': 'U', 'bnd': 'U',
+            'pack': 'U', 'packs': 'U', 'pkt': 'U', 'packet': 'U', 'packets': 'U',
+            'drum': 'U', 'drums': 'U',
+            'sack': 'U', 'sacks': 'U',
+            'coil': 'U', 'coils': 'U',
+            'sheet': 'U', 'sheets': 'U',
+            'length': 'U', 'lengths': 'U',
         };
        
        
@@ -448,7 +448,7 @@ async function registerItemWithEtims(item) {
         // For nails: stockQty=12 cartons, sub_unit_qty=20 Kg/carton → register 240 Kg at KES 150/Kg.
         const hasSub = !!(item.sub_unit && item.sub_unit_qty && item.sub_unit_price);
         const etimsUnit      = hasSub ? item.sub_unit : (item.bulk_unit || item.unit || 'PCS');
-       const etimsUnitCode  = regUnitCodeMap[etimsUnit.toLowerCase().trim()] || 'PCE';
+       const etimsUnitCode  = regUnitCodeMap[etimsUnit.toLowerCase().trim()] || 'U';
         // Total stock in the etims unit: 12 cartons × 20 Kg = 240 Kg (or just stockQty if no sub-unit)
         const etimsStockQty  = hasSub
             ? parseFloat((item.stockQty * parseFloat(item.sub_unit_qty)).toFixed(4))
@@ -530,9 +530,9 @@ async function registerItemWithEtims(item) {
             } else if (data?.metadata?.argument === 'quantity_unit_code' ||
                        (data?.message || '').toLowerCase().includes('quantity_unit_code')) {
                 // Container units (BOX, CTN, BAG etc.) are not valid DigiTax quantity_unit_codes.
-                // Retry with PCE — the universal safe fallback accepted by DigiTax.
-                log.warn('[eTIMS] quantity_unit_code rejected — retrying with PCE fallback', { item: item.itemName, attempted: payload.quantity_unit_code });
-                payload.quantity_unit_code = 'PCE';
+                // Retry with U — the universal safe fallback accepted by DigiTax.
+                log.warn('[eTIMS] quantity_unit_code rejected — retrying with U fallback', { item: item.itemName, attempted: payload.quantity_unit_code });
+                payload.quantity_unit_code = 'U';
                 const retry = await fetch(`${DIGITAX_BASE_URL}/items`, {
                     method: 'POST',
                     headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
@@ -542,9 +542,9 @@ async function registerItemWithEtims(item) {
                 const retryData = await retry.json();
                 if (retry.ok) {
                     const fallbackId = retryData?.id || retryData?.item_id || retryData?.data?.id || null;
-                    log.info('[eTIMS] ✅ Item registered with PCE unit fallback', { item: item.itemName, digitaxItemId: fallbackId });
+                    log.info('[eTIMS] ✅ Item registered with U unit fallback', { item: item.itemName, digitaxItemId: fallbackId });
                     if (fallbackId && etimsStockQty > 0) {
-                        log.info(`[eTIMS] Waiting 3s before pushing ${etimsStockQty} (PCE fallback)...`);
+                        log.info(`[eTIMS] Waiting 3s before pushing ${etimsStockQty} (U fallback)...`);
                         await new Promise(resolve => setTimeout(resolve, 3000));
                         const stockRes = await fetch(`${DIGITAX_BASE_URL}/stock/adjust`, {
                             method: 'PUT',
@@ -552,12 +552,12 @@ async function registerItemWithEtims(item) {
                             body: JSON.stringify({ item_id: fallbackId, quantity: etimsStockQty, movement_type: '04', action: 'ADD', branch_id: '01', store_id: '01', remarks: 'Initial System Upload' }),
                             signal: AbortSignal.timeout(10000)
                         });
-                        if (stockRes.ok) log.info('[eTIMS] ✅ Stock pushed for PCE-fallback item');
-                        else { const sd = await stockRes.json(); log.warn('[eTIMS] Stock push failed (PCE fallback)', { body: sd }); }
+                        if (stockRes.ok) log.info('[eTIMS] ✅ Stock pushed for U-fallback item');
+                        else { const sd = await stockRes.json(); log.warn('[eTIMS] Stock push failed (U fallback)', { body: sd }); }
                     }
                     return fallbackId;
                 }
-                log.warn('[eTIMS] Item registration failed even with PCE fallback', { item: item.itemName, body: JSON.stringify(retryData) });
+                log.warn('[eTIMS] Item registration failed even with U fallback', { item: item.itemName, body: JSON.stringify(retryData) });
             } else {
                 log.warn('[eTIMS] Item registration rejected', { status: res.status, item: item.itemName, body: JSON.stringify(data) });
             }
@@ -5297,7 +5297,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
                         item_bar_code:         barcode(retItem.item_name),
                         item_tax_type_code:    'B',
                         quantity:              retQty,
-                        quantity_unit_code:    'PCE',
+                        quantity_unit_code:    'U',
                         package_unit_code:     'NT',
                         package_unit_quantity: 1,
                         unit_price:            Math.abs(sellingPrice),
