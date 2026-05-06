@@ -4140,7 +4140,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             success: true,
             message: `${saleIds.length} item(s) sold. Total: KES ${cartTotal.toFixed(2)}`,
             receiptNumber, invoiceNumber, dnNumber, saleIds, total: cartTotal,
-            kraReceiptNo, kraQrUrl: qrDataString, kraQrDataUrl: qrDataUrl,etimsNo: etimsResult.etimsNo,
+            kraReceiptNo, kraQrUrl: qrDataString, kraQrDataUrl: qrDataUrl,
             Control_unit_number: controlUnitNumber
         });
 
