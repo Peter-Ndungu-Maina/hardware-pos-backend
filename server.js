@@ -177,7 +177,6 @@ async function submitSaleToEtims(saleData) {
                 'bundle':'BND', 'bundles':'BND'
             };
             const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'PCE';
-            const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'U';
 
            // Map the cart array into DigiTax format
             payloadItems = saleData.cartItems.map(item => {
