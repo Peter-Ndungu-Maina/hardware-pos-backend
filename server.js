@@ -4378,7 +4378,7 @@ app.post('/api/sell', requireAuth, requireSubscription, validateBody({
 });
 
 // ============================================================
-//  9. DEBT CLEARANCE
+//  9. DEBT CLEARANCE (CUSTOMER-LEVEL FIFO)
 // ============================================================
 app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
     saleId:        { type: 'string', required: true },
@@ -4390,8 +4390,6 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
     const userRole    = req.user.role?.toLowerCase();
 
     // Normalise frontend method values to canonical DB labels
-    // 'Safaricom' → 'M-Pesa'  (Daraja STK, same as M-Pesa paybill)
-    // 'Equity'    → 'Equity Paybill'
     if (paymentMethod === 'Safaricom') paymentMethod = 'M-Pesa';
     if (paymentMethod === 'Equity')    paymentMethod = 'Equity Paybill';
 
@@ -4404,7 +4402,7 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
         return res.status(400).json({ success: false, message: 'Payment amount exceeds maximum allowed.' });
 
     try {
-        // ── Fetch the anchor sale row ─────────────────────────────────────────
+        // ── Fetch the anchor sale row to identify the customer ────────────────
         const { data: sale, error: getErr } = await supabase
             .from('Sales').select('*, customer_phone').eq('id', saleId).single();
         if (getErr || !sale) throw new Error('Sale record not found.');
@@ -4412,33 +4410,40 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
         if (userRole === 'cashier' && sale.sold_by !== processedBy)
             return res.status(403).json({ success: false, message: 'Access denied. You can only process payments for your own sales.' });
 
-        // ── Fetch ALL sibling rows for this transaction ───────────────────────
-        // Multi-item carts create N Sale rows that all share the same invoice_number.
-        // ROOT CAUSE OF BUG: previously we only updated the one row passed in saleId,
-        // so amount_paid on the other rows stayed 0 → remaining balance was exaggerated.
-        // Fix: operate on every row in the transaction together.
-        let allSaleRows = [sale];
-        const transactionRef = sale.invoice_number || sale.receipt_number;
-        if (transactionRef) {
-            const refField = sale.invoice_number ? 'invoice_number' : 'receipt_number';
-            const { data: siblings } = await supabase
-                .from('Sales')
-                .select('id, total_amount, amount_paid, payment_status')
-                .eq(refField, transactionRef)
-                .eq('is_voided', false);
-            if (siblings && siblings.length > 0) allSaleRows = siblings;
+        // ── Fetch ALL unpaid rows for this CUSTOMER (FIFO logic) ──────────────
+        let query = supabase
+            .from('Sales')
+            .select('id, total_amount, amount_paid, payment_status, sale_date')
+            .eq('is_voided', false)
+            .in('payment_status', ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'])
+            .order('sale_date', { ascending: true }); // Oldest first (FIFO)
+
+        // Match by phone if it exists, otherwise by exact name
+        if (sale.customer_phone && sale.customer_phone.trim() !== 'No Phone' && sale.customer_phone.trim() !== '') {
+            query = query.eq('customer_phone', sale.customer_phone);
+        } else {
+            query = query.eq('customer_name', sale.customer_name);
         }
 
-        // ── True cart totals across ALL sibling rows ──────────────────────────
-        const cartTotal       = allSaleRows.reduce((s, r) => s + parseFloat(r.total_amount || 0), 0);
-        const cartAlreadyPaid = allSaleRows.reduce((s, r) => s + parseFloat(r.amount_paid  || 0), 0);
-        const cartRemaining   = parseFloat((cartTotal - cartAlreadyPaid).toFixed(2));
+        const { data: customerSales, error: custErr } = await query;
+        if (custErr) throw new Error('Could not fetch customer sales records.');
 
-        if (amountToPay > cartRemaining + 0.01)
+        // Filter to rows that actually have a balance
+        const activeDebts = (customerSales || []).filter(d =>
+            Math.round((parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) * 100) / 100 > 0
+        );
+
+        // ── True total across ALL customer debts ──────────────────────────────
+        const customerTotalRemaining = activeDebts.reduce((s, r) => 
+            s + (parseFloat(r.total_amount) - parseFloat(r.amount_paid || 0)), 0
+        );
+
+        if (amountToPay > customerTotalRemaining + 0.01) {
             return res.status(400).json({
                 success: false,
-                message: `Payment KES ${amountToPay.toFixed(2)} exceeds outstanding balance of KES ${cartRemaining.toFixed(2)}.`
+                message: `Payment KES ${amountToPay.toFixed(2)} exceeds the customer's total outstanding balance of KES ${customerTotalRemaining.toFixed(2)}.`
             });
+        }
 
         // ── Idempotency guard ─────────────────────────────────────────────────
         if (mpesaId) {
@@ -4471,17 +4476,14 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
                      + String(now.getSeconds()).padStart(2, '0');
         const payReceiptNumber = 'PAY-' + dp + '-' + tp;
 
-       // ── Distribute payment FIFO across all sibling rows ─────────
+        // ── Distribute payment FIFO across ALL customer rows ──────────────────
         let toDistribute = Math.round(amountToPay);
-        const rowsOwing  = allSaleRows.filter(r => Math.round(parseFloat(r.total_amount||0) - parseFloat(r.amount_paid||0)) > 0);
+        let totalApplied = 0;
 
-        // Sort to ensure deterministic FIFO
-        rowsOwing.sort((a,b) => a.id - b.id);
-
-        for (let i = 0; i < rowsOwing.length; i++) {
+        for (let i = 0; i < activeDebts.length; i++) {
             if (toDistribute <= 0) break;
 
-            const row      = rowsOwing[i];
+            const row      = activeDebts[i];
             const rowTotal = parseFloat(row.total_amount || 0);
             const rowPaid  = parseFloat(row.amount_paid  || 0);
             const rowOwing = Math.round(rowTotal - rowPaid);
@@ -4498,13 +4500,39 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
             }
 
             toDistribute -= applyAmt;
+            totalApplied += applyAmt;
 
+            // 1. Update the Sale row
             const { error: rowErr } = await supabase.from('Sales').update({
                 amount_paid:    rowNewPaid,
                 payment_status: rowNewPaid >= rowTotal - 0.01 ? 'Paid' : 'Partial'
             }).eq('id', row.id);
             if (rowErr) throw new Error(`Failed to update sale row ${row.id}: ${rowErr.message}`);
+
+            // 2. Insert payment log mapped to THIS specific row
+            await supabase.from('payments').insert([{
+                sale_id:        row.id,
+                amount:         applyAmt,
+                payment_method: paymentMethod,
+                mpesa_code:     mpesaId ? `${mpesaId.trim().toUpperCase()}-${row.id}` : null,
+                received_by:    processedBy,
+                customer_name:  sale.customer_name,
+                created_at:     now.toISOString()
+            }]);
+
+            // 3. Insert debt log mapped to THIS specific row
+            await supabase.from('debt_payments').insert([{
+                sale_id:        row.id,
+                amount_paid:    applyAmt,
+                payment_method: paymentMethod,
+                mpesa_id:       mpesaId || null,
+                processed_by:   processedBy,
+                customer_name:  sale.customer_name,
+                customer_phone: sale.customer_phone,
+                payment_date:   now.toISOString()
+            }]);
         }
+
         // ── Update customer aggregate debt ────────────────────────────────────
         if (sale.customer_phone) {
             const { data: cust } = await supabase.from('customers')
@@ -4513,32 +4541,11 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
             await supabase.from('customers').update({ total_debt: newDebt }).eq('phone', sale.customer_phone);
         }
 
-        // ── Record audit rows (anchored to anchor saleId) ─────────────────────
-        await supabase.from('payments').insert([{
-            sale_id:        saleId,
-            amount:         amountToPay,
-            payment_method: paymentMethod,
-           mpesa_code:     mpesaId ? `${mpesaId.trim().toUpperCase()}-${saleId}` : null,
-            received_by:    processedBy,
-            customer_name:  sale.customer_name,
-            created_at:     new Date().toISOString()
-        }]);
-        await supabase.from('debt_payments').insert([{
-            sale_id:        saleId,
-            amount_paid:    amountToPay,
-            payment_method: paymentMethod,
-            mpesa_id:       mpesaId || null,
-            processed_by:   processedBy,
-            customer_name:  sale.customer_name,
-            customer_phone: sale.customer_phone,
-            payment_date:   new Date().toISOString()
-        }]);
-
-        const newRemaining = parseFloat(Math.max(0, cartRemaining - amountToPay).toFixed(2));
+        const newRemaining = parseFloat(Math.max(0, customerTotalRemaining - amountToPay).toFixed(2));
         const debtQrData   = `PIN:A014661185V|REF:${payReceiptNumber}|AMT:${amountToPay.toFixed(2)}|CUST:${sale.customer_name||'Customer'}|DATE:${new Date().toLocaleDateString()}`;
         const debtQrDataUrl = await generateQrDataUrl(debtQrData);
 
-        log.info(`[clear-debt] ✅ KES ${amountToPay} from ${sale.customer_name} | rows: ${rowsOwing.length} | cart total: ${cartTotal} | remaining: ${newRemaining}`);
+        log.info(`[clear-debt] ✅ KES ${amountToPay} from ${sale.customer_name} | items cleared: ${activeDebts.length} | remaining: ${newRemaining}`);
 
         res.json({
             success:          true,
@@ -4548,7 +4555,7 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
             kraQrDataUrl:     debtQrDataUrl,
             amountPaid:       amountToPay,
             remainingBalance: newRemaining,
-            rowsUpdated:      rowsOwing.length,
+            rowsUpdated:      activeDebts.length,
         });
 
     } catch (err) {
