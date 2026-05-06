@@ -156,38 +156,49 @@ async function submitSaleToEtims(saleData) {
         
         if (saleData.cartItems && Array.isArray(saleData.cartItems)) {
             // UN/CEFACT unit codes used by KRA eTIMS
-            // 'U'   = generic unit (cartons, pieces, bags, etc.)
-            // 'KGM' = kilogram
-            // 'GRM' = gram
-            // 'LTR' = litre
-            // 'MTR' = metre
-            // 'MTK' = square metre
+            // Valid DigiTax quantity_unit_codes (from ke.docs.digitax.tech/docs/item-attributes-items)
+            // 'U'   = Pieces/item — generic unit
+            // 'KG'  = Kilo-Gramme  (NOT KGM)
+            // 'GRM' = Gram
+            // 'LTR' = Litre
+            // 'MTR' = Metre
+            // 'M2'  = Square Metre (NOT MTK)
+            // 'M3'  = Cubic Metre  (NOT MTQ)
+            // 'DZ'  = Dozen        (NOT DZN)
+            // 'PR'  = Pair         (NOT PAR)
+            // 'BX'  = Box, 'BG' = Bag, 'RO' = Roll, 'DR' = Drum, 'ST' = Sheet
             const unitCodeMap = {
-                // ── Valid DigiTax measurement unit codes ──
-                'pcs': 'U', 'pc': 'U', 'piece': 'U', 'pieces': 'U', 'unit': 'U', 'units': 'U', 'no': 'U', 'nos': 'U', 'number': 'U',
-                'kg':  'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
-                'g':   'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
+                // ── Measurement units ──
+                'pcs': 'U',   'pc': 'U',    'piece': 'U',   'pieces': 'U',
+                'unit': 'U',  'units': 'U', 'no': 'NO',     'nos': 'NO',  'number': 'NO',
+                'kg':  'KG',  'kgs': 'KG',  'kilogram': 'KG', 'kilograms': 'KG',
+                'g':   'GRM', 'gm': 'GRM',  'gram': 'GRM',  'grams': 'GRM',
                 'l':   'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
-                'ml':  'MLT', 'millilitre': 'MLT', 'milliliter': 'MLT',
+                'ml':  'LTR', 'millilitre': 'LTR', 'milliliter': 'LTR',   // no mL code — use LTR
                 'm':   'MTR', 'mtr': 'MTR', 'metre': 'MTR', 'meter': 'MTR', 'metres': 'MTR', 'meters': 'MTR',
-                'm2':  'MTK', 'sqm': 'MTK', 'sq m': 'MTK',
-                'm3':  'MTQ', 'cbm': 'MTQ',
-                'doz': 'DZN', 'dozen': 'DZN', 'dzn': 'DZN',
+                'm2':  'M2',  'sqm': 'M2',  'sq m': 'M2',   'square metre': 'M2', 'square meter': 'M2',
+                'm3':  'M3',  'cbm': 'M3',  'cubic metre': 'M3',
+                'doz': 'DZ',  'dozen': 'DZ', 'dzn': 'DZ',
                 'set': 'SET', 'sets': 'SET',
-                'pair':'PAR', 'pairs': 'PAR', 'pr': 'PAR',
-                // ── Container units — not valid DigiTax quantity_unit_codes → fall back to U ──
-                'box': 'U', 'boxes': 'U',
-                'ctn': 'U', 'carton': 'U', 'cartons': 'U',
-                'bag': 'U', 'bags': 'U',
-                'roll':'U', 'rolls': 'U', 'rl': 'U',
-                'tin': 'U', 'tins': 'U',
-                'bundle':'U', 'bundles':'U', 'bnd': 'U',
-                'pack':'U', 'packs': 'U', 'pkt': 'U', 'packet': 'U', 'packets': 'U',
-                'drum':'U', 'drums': 'U',
-                'sack':'U', 'sacks': 'U',
-                'coil':'U', 'coils': 'U',
-                'sheet':'U','sheets': 'U',
-                'length':'U','lengths':'U',
+                'pair': 'PR', 'pairs': 'PR', 'pr': 'PR',
+                'yd':  'YRD', 'yard': 'YRD', 'yards': 'YRD',
+                'lb':  'LBR', 'lbs': 'LBR', 'pound': 'LBR', 'pounds': 'LBR',
+                // ── Container/packaging units — DigiTax HAS valid codes for these ──
+                'box':    'BX',  'boxes':   'BX',
+                'bag':    'BG',  'bags':    'BG',
+                'roll':   'RO',  'rolls':   'RO',  'rl': 'RO',
+                'drum':   'DR',  'drums':   'DR',
+                'sheet':  'ST',  'sheets':  'ST',
+                'reel':   'RL',  'reels':   'RL',
+                'tube':   'TU',  'tubes':   'TU',
+                'bundle': 'BE',  'bundles': 'BE',  'bnd': 'BE',
+                'pack':   'PA',  'packs':   'PA',  'pkt': 'PA', 'packet': 'PA', 'packets': 'PA',
+                // ── No specific code — safest fallback is U ──
+                'ctn':    'U',   'carton':  'U',   'cartons': 'U',
+                'tin':    'U',   'tins':    'U',
+                'sack':   'U',   'sacks':   'U',
+                'coil':   'U',   'coils':   'U',
+                'length': 'U',   'lengths': 'U',
             };
             const resolveUnitCode = (unit) => unitCodeMap[(unit||'').toLowerCase().trim()] || 'U';
 
@@ -410,35 +421,38 @@ async function registerItemWithEtims(item) {
         ).padStart(8, '0');
 
        const regUnitCodeMap = {
-            // ── Measurement units — DigiTax accepts these directly ──
-            'pcs': 'U', 'pc': 'U', 'piece': 'U', 'pieces': 'U', 'unit': 'U', 'units': 'U', 'no': 'U', 'nos': 'U', 'number': 'U',
-            'kg': 'KGM', 'kgs': 'KGM', 'kilogram': 'KGM', 'kilograms': 'KGM',
-            'g':  'GRM', 'gm': 'GRM', 'gram': 'GRM', 'grams': 'GRM',
-            'l':  'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
-            'ml': 'MLT', 'millilitre': 'MLT', 'milliliter': 'MLT',
-            'm':  'MTR', 'mtr': 'MTR', 'metre': 'MTR', 'meter': 'MTR', 'metres': 'MTR', 'meters': 'MTR',
-            'm2': 'MTK', 'sqm': 'MTK', 'sq m': 'MTK', 'square metre': 'MTK', 'square meter': 'MTK',
-            'm3': 'MTQ', 'cbm': 'MTQ', 'cubic metre': 'MTQ',
-            'doz': 'DZN', 'dozen': 'DZN', 'dzn': 'DZN',
+            // ── Measurement units ──
+            'pcs': 'U',   'pc': 'U',    'piece': 'U',   'pieces': 'U',
+            'unit': 'U',  'units': 'U', 'no': 'NO',     'nos': 'NO',  'number': 'NO',
+            'kg':  'KG',  'kgs': 'KG',  'kilogram': 'KG', 'kilograms': 'KG',
+            'g':   'GRM', 'gm': 'GRM',  'gram': 'GRM',  'grams': 'GRM',
+            'l':   'LTR', 'ltr': 'LTR', 'litre': 'LTR', 'litres': 'LTR', 'liter': 'LTR', 'liters': 'LTR',
+            'ml':  'LTR', 'millilitre': 'LTR', 'milliliter': 'LTR',   // no mL code — use LTR
+            'm':   'MTR', 'mtr': 'MTR', 'metre': 'MTR', 'meter': 'MTR', 'metres': 'MTR', 'meters': 'MTR',
+            'm2':  'M2',  'sqm': 'M2',  'sq m': 'M2',   'square metre': 'M2', 'square meter': 'M2',
+            'm3':  'M3',  'cbm': 'M3',  'cubic metre': 'M3',
+            'doz': 'DZ',  'dozen': 'DZ', 'dzn': 'DZ',
             'set': 'SET', 'sets': 'SET',
-            'pair': 'PAR', 'pairs': 'PAR', 'pr': 'PAR',
-
-            // ── Container / packaging units — DigiTax does NOT accept these as quantity_unit_code.
-            // They describe packaging, not measurement. Always fall back to U so KRA gets a valid code.
-            // The actual item count per container is handled via sub-unit logic.
-            'box': 'U', 'boxes': 'U',
-            'ctn': 'U', 'carton': 'U', 'cartons': 'U',
-            'bag': 'U', 'bags': 'U',
-            'roll': 'U', 'rolls': 'U', 'rl': 'U',
-            'tin':  'U', 'tins': 'U',
-            'bundle': 'U', 'bundles': 'U', 'bnd': 'U',
-            'pack': 'U', 'packs': 'U', 'pkt': 'U', 'packet': 'U', 'packets': 'U',
-            'drum': 'U', 'drums': 'U',
-            'sack': 'U', 'sacks': 'U',
-            'coil': 'U', 'coils': 'U',
-            'sheet': 'U', 'sheets': 'U',
-            'length': 'U', 'lengths': 'U',
-        };
+            'pair': 'PR', 'pairs': 'PR', 'pr': 'PR',
+            'yd':  'YRD', 'yard': 'YRD', 'yards': 'YRD',
+            'lb':  'LBR', 'lbs': 'LBR', 'pound': 'LBR', 'pounds': 'LBR',
+            // ── Container/packaging units — DigiTax HAS valid codes for these ──
+            'box':    'BX',  'boxes':   'BX',
+            'bag':    'BG',  'bags':    'BG',
+            'roll':   'RO',  'rolls':   'RO',  'rl': 'RO',
+            'drum':   'DR',  'drums':   'DR',
+            'sheet':  'ST',  'sheets':  'ST',
+            'reel':   'RL',  'reels':   'RL',
+            'tube':   'TU',  'tubes':   'TU',
+            'bundle': 'BE',  'bundles': 'BE',  'bnd': 'BE',
+            'pack':   'PA',  'packs':   'PA',  'pkt': 'PA', 'packet': 'PA', 'packets': 'PA',
+            // ── No specific code — safest fallback is U ──
+            'ctn':    'U',   'carton':  'U',   'cartons': 'U',
+            'tin':    'U',   'tins':    'U',
+            'sack':   'U',   'sacks':   'U',
+            'coil':   'U',   'coils':   'U',
+            'length': 'U',   'lengths': 'U',
+            };
        
        
 
@@ -1746,10 +1760,8 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), require
         if (etimsItem) {
             digitaxItemId = etimsItem;
             await supabase.from('Inventory')
-                .update({ digitax_item_id: digitaxItemId, kra_registered: true })
+                .update({ digitax_item_id: digitaxItemId, kra_registered: !!digitaxItemId })
                 .eq('id', newItem.id);
-            // Note: stock sync is handled inside registerItemWithEtims Phase 2 (3s delay)
-            // Do NOT call syncStockWithEtims here — it would double the stock count
         }
         res.json({
             success:       true,
@@ -2667,8 +2679,8 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
                     });
                     if (newId) {
                         await supabase.from('Inventory')
-                            .update({ digitax_item_id: newId, kra_registered: true })
-                            .eq('id', newInvItem.id);
+                            .update({ digitax_item_id: newId, kra_registered: !!newId })
+                            .eq('id', poItem.inventory_id);
                         log.info('[eTIMS] ✅ New item created & registered with KRA', { item: poItem.item_name, digitaxItemId: newId });
                         kraResults.created++;
                     } else {
@@ -2743,10 +2755,10 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
                         unit:         invItem.unit || 'PCS',
                         stockQty:     newTotal
                     });
-                    if (newId) {
+                  if (newId) {
                         await supabase.from('Inventory')
-                            .update({ digitax_item_id: newId, kra_registered: true })
-                            .eq('id', poItem.inventory_id);
+                            .update({ digitax_item_id: newId, kra_registered: !!newId })
+                            .eq('id', newInvItem.id);
                         log.info('[eTIMS] ✅ Item registered on PO receive', { item: invItem.item_name, digitaxItemId: newId });
                         kraStatus = 'registered';
                     } else {
@@ -3809,7 +3821,7 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                     stock_quantity:    qty,
                     barcode:           finalBarcode,
                     digitax_item_id:   digitaxItemId,
-                    kra_registered:    true,
+                    kra_registered:  !!digitaxItemId,
                     // Advanced Fields
                     fundi_price:       fundiPrice      ? parseFloat(fundiPrice)      : null,
                     wholesale_price:   wholesalePrice  ? parseFloat(wholesalePrice)  : null,
