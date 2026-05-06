@@ -4479,6 +4479,7 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
         // ── Distribute payment FIFO across ALL customer rows ──────────────────
         let toDistribute = Math.round(amountToPay);
         let totalApplied = 0;
+        const clearedInvoices = []; // <-- Added to track per-sale distribution
 
         for (let i = 0; i < activeDebts.length; i++) {
             if (toDistribute <= 0) break;
@@ -4491,6 +4492,15 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
             if (rowOwing <= 0) continue;
 
             const applyAmt = Math.min(toDistribute, rowOwing);
+
+            // <-- Capture the specific sale ID and the exact amount applied to it
+            // Note: If you want the actual item name here, ensure 'item_name' 
+            // is included in your activeDebts .select() query above this loop.
+            clearedInvoices.push({
+                itemName: `Payment for Sale #${row.id}`,
+                price: applyAmt,
+                quantity: 1
+            });
 
             let rowNewPaid;
             if (applyAmt >= rowOwing) {
@@ -4556,6 +4566,7 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
             amountPaid:       amountToPay,
             remainingBalance: newRemaining,
             rowsUpdated:      activeDebts.length,
+            clearedInvoices:  clearedInvoices
         });
 
     } catch (err) {
