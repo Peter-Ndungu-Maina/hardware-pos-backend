@@ -3084,7 +3084,7 @@ app.get('/api/reports/daily-summary', requireAuth, async (req, res) => {
         allSales?.forEach(s => {
             const total = parseFloat(s.total_amount || 0);
             const paid  = parseFloat(s.amount_paid  || 0);
-            const cost  = parseFloat(s.cost_price   || 0) * parseFloat(s.quantity_sold || 0);
+            const cost  = parseFloat(s.cost_price   || 0); // total line cost — no qty multiply
             // Revenue: only collected cash — unpaid credit is excluded
             realizedSales += paid;
             // COGS: full cost of every item sold (goods left the shop regardless of payment)
@@ -3162,7 +3162,7 @@ app.get('/api/reports/sales', requireAuth, requireRole('admin', 'manager', 'cash
         const reports = data.map(sale => {
             const rev  = parseFloat(sale.total_amount || 0);
             const paid = parseFloat(sale.amount_paid  || 0);
-            const cogs = parseFloat(sale.cost_price   || 0) * parseFloat(sale.quantity_sold || 0);
+            const cogs = parseFloat(sale.cost_price   || 0); // total line cost — no qty multiply
             const ratio = rev > 0 ? paid / rev : 0;
 
             const row = {
@@ -3228,7 +3228,20 @@ app.get('/api/reports/debtors', requireAuth, async (req, res) => {
             return acc;
         }, {});
 
-        res.json(Object.values(consolidated));
+        // Enrich with credit_limit from customers table
+        const phones = Object.values(consolidated).map(c => c.phone).filter(p => p && p !== 'No Phone');
+        let creditLimits = {};
+        if (phones.length > 0) {
+            const { data: custRows } = await supabase
+                .from('customers').select('phone, credit_limit').in('phone', phones);
+            (custRows || []).forEach(c => { creditLimits[c.phone] = c.credit_limit; });
+        }
+        const result = Object.values(consolidated).map(c => ({
+            ...c,
+            credit_limit: creditLimits[c.phone] !== undefined ? creditLimits[c.phone] : null
+        }));
+
+        res.json(result);
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
@@ -3363,7 +3376,8 @@ app.get('/api/reports/profit-loss', requireAuth, requireRole('admin', 'manager')
         
         sales.forEach(s => {
             const amt = parseFloat(s.total_amount) || 0;
-            const cogs = (parseFloat(s.cost_price) || 0) * (parseFloat(s.quantity_sold) || 0);
+            // cost_price now stores the TOTAL line cost — sum directly, never multiply by quantity_sold
+            const cogs = parseFloat(s.cost_price) || 0;
             const status = (s.payment_status || '').toLowerCase().trim();
             const paid = parseFloat(s.amount_paid) || 0;
 
@@ -3630,9 +3644,7 @@ app.get('/api/reports/debt-logs', requireAuth, async (req, res) => {
     }
 });
 
-// ============================================================
-//  BULK PRODUCT IMPORT (CSV/EXCEL)
-// ============================================================
+
 // ============================================================
 //  BULK PRODUCT IMPORT (CSV/EXCEL) - BATCHED KRA SYNC
 // ============================================================
@@ -3652,26 +3664,30 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
 
     const allAuditRows = [];
 
-    // ── Process in BATCHES OF 5 to balance speed and DigiTax Rate Limits ──────
+    // ── Process in BATCHES OF 10 to balance speed and DigiTax Rate Limits ──────
     const BATCH_SIZE = 10;
     
     for (let i = 0; i < items.length; i += BATCH_SIZE) {
         const batch = items.slice(i, i + BATCH_SIZE);
         log.info(`[BULK IMPORT] Processing batch ${Math.floor(i/BATCH_SIZE) + 1} (${batch.length} items)...`);
 
-        // Process up to 5 items concurrently
+        // Process up to 10 items concurrently
         await Promise.all(batch.map(async (row) => {
-            // 1. ADD BARCODE TO DESTRUCTURING
-            const { itemName, category, unit, costPrice, sellingPrice, stockQty, deliveryNote, barcode } = row;
+            // 1. EXTRACT ALL FIELDS (Including Tiers & Sub-Units)
+            const { 
+                itemName, category, unit, costPrice, sellingPrice, stockQty, deliveryNote, barcode,
+                fundiPrice, wholesalePrice, wholesaleMinQty, 
+                bulkUnit, subUnit, subUnitQty, subUnitPrice 
+            } = row;
 
             if (!itemName || !sellingPrice || !stockQty || !deliveryNote) {
-                results.failed.push({ itemName: itemName || `Row`, reason: 'Missing required fields' });
+                results.failed.push({ itemName: itemName || `Row`, reason: 'Missing required fields (Name, Selling Price, Qty, or DN)' });
                 return;
             }
             
             const price = parseFloat(sellingPrice);
             const cost  = parseFloat(costPrice || 0);
-            const qty   = parseInt(stockQty);
+            const qty   = parseFloat(stockQty);
             const dn    = String(deliveryNote).trim().toUpperCase();
 
             if (isNaN(price) || price <= 0) { results.failed.push({ itemName, reason: 'Invalid selling price' }); return; }
@@ -3686,14 +3702,21 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                 : `EH-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(Math.floor(Math.random() * 99999)).padStart(5, '0')}`;
 
             try {
-                // 3. PASS BARCODE TO KRA
+                // 3. PASS EVERYTHING TO KRA (Including sub-unit info for proper stock tracking)
                 const digitaxItemId = await registerItemWithEtims({
-                    itemName: itemName.trim(),
-                    category: category || 'General',
+                    itemName:     itemName.trim(),
+                    category:     category || 'General',
+                    unit:         unit || 'PCS',
+                    stockQty:     qty,
+                    barcode:      finalBarcode,
                     sellingPrice: price,
-                    unit: unit || 'PCS',
-                    stockQty: qty,
-                    barcode: finalBarcode // <--- Passed to eTIMS
+                    // Pass sub-unit data to helper so it calculates Etims quantities correctly
+                    bulk_unit:    bulkUnit?.trim()  || null,
+                    sub_unit:     subUnit?.trim()   || null,
+                    sub_unit_qty: subUnitQty        ? parseFloat(subUnitQty)    : null,
+                    sub_unit_price: subUnitPrice    ? parseFloat(subUnitPrice)  : null,
+                    fundi_price:  fundiPrice        ? parseFloat(fundiPrice)    : null,
+                    wholesale_price: wholesalePrice ? parseFloat(wholesalePrice): null,
                 });
 
                 if (!digitaxItemId) {
@@ -3701,17 +3724,25 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                     return; 
                 }
 
-                // 4. SAVE BARCODE TO SUPABASE INVENTORY TABLE
+                // 4. SAVE TO SUPABASE INVENTORY TABLE (All fields)
                 const { data: newItem, error: invErr } = await supabase.from('Inventory').insert([{
-                    item_name:      itemName.trim(),
-                    category:       category || 'General',
-                    unit:           unit     || 'PCS',
-                    cost_price:     cost,
-                    price:          price,
-                    stock_quantity: qty,
-                    barcode:        finalBarcode, // <--- Saved here
-                    digitax_item_id: digitaxItemId,
-                    kra_registered:  true           
+                    item_name:         itemName.trim(),
+                    category:          category || 'General',
+                    unit:              unit     || 'PCS',
+                    cost_price:        cost,
+                    price:             price,
+                    stock_quantity:    qty,
+                    barcode:           finalBarcode,
+                    digitax_item_id:   digitaxItemId,
+                    kra_registered:    true,
+                    // Advanced Fields
+                    fundi_price:       fundiPrice      ? parseFloat(fundiPrice)      : null,
+                    wholesale_price:   wholesalePrice  ? parseFloat(wholesalePrice)  : null,
+                    wholesale_min_qty: wholesaleMinQty ? parseInt(wholesaleMinQty)   : null,
+                    bulk_unit:         bulkUnit?.trim() || null,
+                    sub_unit:          subUnit?.trim()  || null,
+                    sub_unit_qty:      subUnitQty      ? parseFloat(subUnitQty)      : null,
+                    sub_unit_price:    subUnitPrice    ? parseFloat(subUnitPrice)    : null,
                 }]).select().single();
                 
                 if (invErr) throw new Error(invErr.message);
@@ -3741,7 +3772,7 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                     added_qty:    qty,
                     new_stock:    qty,
                     batch_id:     newBatch?.id || null,
-                    details:      `BULK IMPORT: ${itemName} | Qty: ${qty} | DN: ${dn} | KRA ID: ${digitaxItemId} | Barcode: ${finalBarcode}`,
+                    details:      `BULK IMPORT: ${itemName} | Qty: ${qty} | DN: ${dn} | KRA ID: ${digitaxItemId}`,
                     timestamp:    new Date().toISOString()
                 });
 
@@ -3751,7 +3782,8 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
                 results.failed.push({ itemName, reason: err.message });
             }
         }));
-        // 5. THE COOL-DOWN DELAY
+        
+        // 6. THE COOL-DOWN DELAY
         // Wait 3 seconds between batches (only if there are more items to process)
         if (i + BATCH_SIZE < items.length) {
             log.info(`[BULK IMPORT] Batch complete. Sleeping 3s to respect DigiTax limits...`);
@@ -3769,13 +3801,11 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
 
     log.info(`[BULK IMPORT] Done — ${results.success.length} imported & registered, ${results.failed.length} failed | by ${userName}`);
 
-    // ── NEW: PRINT EXACT FAILURES TO THE TERMINAL ──────────────────────────────
     if (results.failed.length > 0) {
         results.failed.forEach(f => {
             log.warn(`[BULK IMPORT FAILURE] ❌ ${f.itemName}: ${f.reason}`);
         });
     }
-    // ──────────────────────────────────────────────────────────────────────────
 
     res.json({
         success:  true,
@@ -3850,6 +3880,37 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
         const receiptNumber = isCredit ? null : `REC-${datePart}-${seq}-${timePart}`;
         const invoiceNumber = isCredit ? `INV-${datePart}-${seq}-${timePart}` : null;
         const dnNumber      = isCredit ? `DN-${datePart}-${seq}-${timePart}`  : null;
+
+        // ── CREDIT LIMIT CHECK ────────────────────────────────────────────────
+        // If this is a credit sale, check whether the customer has a credit_limit set.
+        // If they do, and their current total_debt >= credit_limit, block the sale.
+        // credit_limit = NULL means no limit is configured (always allow).
+        if (isCredit && linkedPhone) {
+            const { data: custCheck } = await supabase
+                .from('customers')
+                .select('name, total_debt, credit_limit')
+                .eq('phone', linkedPhone)
+                .maybeSingle();
+
+            if (custCheck && custCheck.credit_limit !== null && custCheck.credit_limit !== undefined) {
+                const currentDebt  = parseFloat(custCheck.total_debt  || 0);
+                const creditLimit  = parseFloat(custCheck.credit_limit);
+                // Calculate new total if this sale goes through
+                const saleTotal = items.reduce((sum, it) => {
+                    // We don't have prices yet — use a pre-check based on current debt only
+                    return sum;
+                }, 0);
+                if (currentDebt >= creditLimit) {
+                    return res.status(400).json({
+                        success:      false,
+                        creditBlocked: true,
+                        message:      `❌ Credit limit reached. ${custCheck.name || linkedPhone} owes KES ${currentDebt.toLocaleString()} and has a limit of KES ${creditLimit.toLocaleString()}. Clear existing debt before allowing new credit.`,
+                        currentDebt,
+                        creditLimit
+                    });
+                }
+            }
+        }
 
         // Determine stored payment method label for DB
         const storedMethod = paymentMethod === 'Equity'             ? 'Equity Paybill'
@@ -3952,7 +4013,9 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 remaining = parseFloat((remaining - take).toFixed(6));
             }
 
-            const avgCost  = stockDeductionQty > 0 ? itemCost / stockDeductionQty : 0;
+            // itemCost = total FIFO cost for this line (e.g. 0.25 cartons × KES 3000 = KES 750)
+            // Store the TOTAL line cost — NOT per-unit — so the P&L can sum cost_price directly
+            // without multiplying by quantity_sold again (which would inflate COGS for sub-unit sales).
             const itemPaid = isCredit ? 0 : itemTotal;
             cartTotal += itemTotal;
 
@@ -3963,7 +4026,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 unit_price:     price,
                 total_amount:   itemTotal,
                 amount_paid:    itemPaid,
-                cost_price:     avgCost,
+                cost_price:     parseFloat(itemCost.toFixed(4)),  // TOTAL line cost — sum directly for COGS, never multiply by qty again
                 profit:         itemTotal - itemCost,
                 payment_status: isCredit ? 'Credit' : 'Paid',
                 is_credit_sale: isCredit,
@@ -4149,6 +4212,24 @@ app.post('/api/sell', requireAuth, requireSubscription, validateBody({
         // Use server-side values only
         const price    = item.price;       // from DB, not client
         const itemName = item.item_name;   // from DB, not client
+
+        // ── CREDIT LIMIT CHECK ────────────────────────────────────────────────
+        if (paymentMethod === 'Credit' && linkedPhone) {
+            const { data: custCheck } = await supabase
+                .from('customers').select('name, total_debt, credit_limit')
+                .eq('phone', linkedPhone).maybeSingle();
+            if (custCheck && custCheck.credit_limit !== null && custCheck.credit_limit !== undefined) {
+                const currentDebt = parseFloat(custCheck.total_debt  || 0);
+                const creditLimit = parseFloat(custCheck.credit_limit);
+                if (currentDebt >= creditLimit) {
+                    return res.status(400).json({
+                        success: false, creditBlocked: true,
+                        message: `❌ Credit limit reached. ${custCheck.name || linkedPhone} owes KES ${currentDebt.toLocaleString()} and has a limit of KES ${creditLimit.toLocaleString()}. Clear existing debt before allowing new credit.`,
+                        currentDebt, creditLimit
+                    });
+                }
+            }
+        }
 
         const { data: batches, error: batchErr } = await supabase.from('stock_batches').select('*')
             .eq('inventory_id', itemId).gt('remaining_qty', 0).order('created_at', { ascending: true });
@@ -4703,11 +4784,66 @@ app.patch('/api/employees/:id/reset-mfa', requireAuth, requireRole('admin'), req
 });
 app.get('/api/customers/:phone', requireAuth, async (req, res) => {
     try {
-        const { data, error } = await supabase.from('customers').select('name, total_debt').eq('phone', req.params.phone).single();
+        const { data, error } = await supabase.from('customers').select('name, total_debt, credit_limit').eq('phone', req.params.phone).single();
         if (error) return res.status(404).json({ message: 'Not found' });
         res.json(data);
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
+// ── PUT Set / Remove Credit Limit for a customer ─────────────────────────────
+// credit_limit: number  → set a limit (e.g. 5000)
+// credit_limit: null    → remove the limit (unlimited credit allowed)
+// Admin and manager only — cashiers cannot change credit limits.
+app.put('/api/customers/:phone/credit-limit', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    const { credit_limit } = req.body;
+    const phone = req.params.phone;
+
+    // Validate: must be a positive number or explicitly null
+    if (credit_limit !== null && credit_limit !== undefined) {
+        const v = parseFloat(credit_limit);
+        if (isNaN(v) || v < 0) {
+            return res.status(400).json({ success: false, message: 'credit_limit must be a positive number or null to remove.' });
+        }
+    }
+
+    try {
+        const limitValue = (credit_limit === null || credit_limit === undefined || credit_limit === '')
+            ? null
+            : parseFloat(credit_limit);
+
+        // Upsert: create customer record if it doesn't exist yet
+        const { data: existing } = await supabase.from('customers').select('phone').eq('phone', phone).maybeSingle();
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Customer not found. They must have at least one transaction first.' });
+        }
+
+        const { error } = await supabase.from('customers')
+            .update({ credit_limit: limitValue })
+            .eq('phone', phone);
+        if (error) throw error;
+
+        await supabase.from('audit_logs').insert([{
+            performed_by: req.user.name,
+            action:       'CREDIT_LIMIT_SET',
+            item_name:    phone,
+            details:      limitValue === null
+                ? `Credit limit removed for ${phone} — unlimited credit allowed`
+                : `Credit limit set to KES ${limitValue.toLocaleString()} for ${phone}`,
+            timestamp:    new Date().toISOString()
+        }]);
+
+        res.json({
+            success: true,
+            message: limitValue === null
+                ? 'Credit limit removed — customer can take unlimited credit.'
+                : `Credit limit set to KES ${limitValue.toLocaleString()}.`,
+            credit_limit: limitValue
+        });
+    } catch (err) {
+        log.error('[Credit Limit]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
@@ -5160,16 +5296,24 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
         }
         } // end: only if kraEtimsInvoiceNumber present
 
+        // ── Generate QR locally — works offline, instant, no external API call ──
+        // Use the live eTIMS URL if DigiTax returned one; otherwise build a
+        // human-readable fallback string so the printed receipt always has a QR.
+        const returnQrString = kraReturnQrUrl || (
+            `PIN:${process.env.BUSINESS_PIN||'PENDING'}|TYPE:CREDIT-NOTE|REF:${rec?.id||'N/A'}|ITEM:${retItem.item_name}|QTY:${retQty}|DATE:${new Date().toISOString().split('T')[0]}`
+        );
+        const kraReturnQrDataUrl = await generateQrDataUrl(returnQrString);
+
         res.json({
             success: true,
             message: 'Exchange processed. ' + retItem.item_name + ' replaced with ' + repItem.item_name + '.' +
                      (returnReason === 'damaged' ? ' KES ' + costWrittenOff + ' written off as expense.' : ''),
-            returnId:      rec && rec.id,
+            returnId:         rec && rec.id,
             expenseId,
-            kraReturnRef,   kraReturnQrUrl,
+            kraReturnRef,     kraReturnQrUrl,    kraReturnQrDataUrl,
             kraDebitRef,
-            kraReplRef,     kraReplQrUrl,
-            etimsSubmitted: !!(kraReturnRef || kraReplRef)
+            kraReplRef,       kraReplQrUrl,
+            etimsSubmitted:   !!(kraReturnRef || kraReplRef)
         });
     } catch (err) {
         log.error('[RETURNS] Exchange error:', err);
@@ -7248,11 +7392,11 @@ app.get('/api/accounting/balance-sheet', requireAuth, requireRole('admin','manag
 
         // Realized revenue & real COGS
         // Revenue: only what was collected (amount_paid) — unpaid credit excluded
-        // COGS: full cost of ALL goods sold — goods left the shop regardless of payment
+        // COGS: sum cost_price directly — it stores the total line cost per sale row
         let realizedSales = 0, totalCogs = 0;
         (salesData||[]).forEach(sale => {
             const paid = parseFloat(sale.amount_paid || 0);
-            const cost = parseFloat(sale.cost_price  || 0) * parseFloat(sale.quantity_sold || 0);
+            const cost = parseFloat(sale.cost_price  || 0); // total line cost — no qty multiply
             realizedSales += paid;
             totalCogs     += cost;
         });
@@ -7314,9 +7458,9 @@ app.get('/api/accounting/income-statement', requireAuth, requireRole('admin','ma
             .reduce((s,sale) => s + Math.max(0, (parseFloat(sale.total_amount)||0) - (parseFloat(sale.amount_paid)||0)), 0);
         const netRevenue  = grossSales - creditUnpaid;
 
-        // COGS from sales cost records
+        // COGS: sum cost_price directly — it stores the total line cost per sale row
         const cogs = (sales||[]).reduce((s,sale) =>
-            s + (parseFloat(sale.cost_price)||0) * (parseFloat(sale.quantity_sold)||0), 0);
+            s + (parseFloat(sale.cost_price)||0), 0);
 
         const stockValue   = (stockData||[]).reduce((s,i) => s + (parseFloat(i.stock_quantity)||0)*(parseFloat(i.cost_price)||0), 0);
         const purchases    = (poData||[]).reduce((s,po) => s + (parseFloat(po.total_amount)||0), 0);
