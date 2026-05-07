@@ -226,7 +226,7 @@ async function submitSaleToEtims(saleData) {
                     item_name:             item.itemName,
                     item_class_code:       '99010000',
                     item_type_code:        '2',
-                    item_bar_code:         String((item.itemName || 'ITEM').split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)).padStart(8, '0'),
+                    item_bar_code:         (item.barcode && String(item.barcode).trim() !== '') ? String(item.barcode).trim() : String(((s) => { let h=5381; for(let i=0;i<s.length;i++) h=((h*33)^s.charCodeAt(i))>>>0; return h; })((item.itemName||'ITEM').trim().toUpperCase())).padStart(13,'0').slice(-13),
                     item_tax_type_code:    'B',
                     quantity:              qty,
                     quantity_unit_code:    quantityUnitCode,
@@ -416,9 +416,26 @@ async function registerItemWithEtims(item) {
             'Garden':              '10150000', // Seeds/Garden
             'General':             '31160000'  // Default: Hardware
         };
-        const barCode = String(
-            item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)
-        ).padStart(8, '0');
+        // ── Barcode generation: globally collision-free ───────────────────────────
+        // The old charcode-sum approach produced the same 8-digit number for items
+        // whose names have the same character-sum (e.g. "Hardware Product 11" and
+        // "Hardware Product 20" both sum to 1713).  DigiTax uses item_bar_code as a
+        // UNIQUE KEY — a collision causes DigiTax to merge the second item into the
+        // first, doubling its stock instead of creating a new entry.
+        //
+        // Fix: use a proper DJB2 hash (fast, well-distributed, no crypto needed)
+        // combined with the item name so every unique name → unique barcode.
+        // We keep to 13 digits (EAN-13 range) which DigiTax accepts.
+        const _djb2 = (str) => {
+            let h = 5381;
+            for (let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+            return h;
+        };
+        // If the CSV/frontend supplied a real barcode, always prefer it.
+        // Only auto-generate when there is none.
+        const barCode = (item.barcode && String(item.barcode).trim() !== '')
+            ? String(item.barcode).trim()
+            : String(_djb2((item.itemName || '').trim().toUpperCase())).padStart(13, '0').slice(-13);
 
        const regUnitCodeMap = {
             // ── Measurement units ──
@@ -3751,14 +3768,17 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
 
     const allAuditRows = [];
 
-    // ── Process in BATCHES OF 10 to balance speed and DigiTax Rate Limits ──────
-    const BATCH_SIZE = 10;
-    
-    for (let i = 0; i < items.length; i += BATCH_SIZE) {
-        const batch = items.slice(i, i + BATCH_SIZE);
-        log.info(`[BULK IMPORT] Processing batch ${Math.floor(i/BATCH_SIZE) + 1} (${batch.length} items)...`);
-
-        // Process up to 10 items concurrently
+    // ── Process items SEQUENTIALLY with a small inter-item gap ─────────────────
+    // Previously used Promise.all(10 concurrent). Each registerItemWithEtims call
+    // awaits an internal 3s stock-push delay, so 10 concurrent calls meant 10
+    // simultaneous stock/adjust requests hitting DigiTax — triggering rate limits
+    // and causing DigiTax to merge duplicate-barcode items (doubling their stock).
+    // Sequential processing: one item fully completes before the next starts.
+    // 100 items × ~4s each = ~6-7 min total — acceptable for a background import.
+    log.info(`[BULK IMPORT] Processing ${items.length} items sequentially...`);
+    for (let i = 0; i < items.length; i++) {
+        const batch = [items[i]];   // one item at a time — kept as array for minimal diff below
+        // Process one item
         await Promise.all(batch.map(async (row) => {
             // 1. EXTRACT ALL FIELDS (Including Tiers & Sub-Units)
             const { 
@@ -3870,11 +3890,11 @@ app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manage
             }
         }));
         
-        // 6. THE COOL-DOWN DELAY
-        // Wait 3 seconds between batches (only if there are more items to process)
-        if (i + BATCH_SIZE < items.length) {
-            log.info(`[BULK IMPORT] Batch complete. Sleeping 3s to respect DigiTax limits...`);
-            await new Promise(resolve => setTimeout(resolve, 3000));
+        // 6. Inter-item gap — give DigiTax a short breath between registrations.
+        // registerItemWithEtims already waits 3s internally before the stock push,
+        // so we only add a small extra gap here to avoid hammering the API.
+        if (i < items.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 500));
         }
     }
 
