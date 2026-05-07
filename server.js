@@ -7877,6 +7877,118 @@ app.get('/api/digitax/reconcile', requireAuth, requireRole('admin'), async (req,
 });
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  INVENTORY RECONCILE — compare local DB items vs DigiTax registered items
+//  GET /api/digitax/inventory-reconcile
+//  Returns: matched, stock_mismatch, missing_in_digitax, unregistered, orphans
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/digitax/inventory-reconcile', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        // ── 1. Pull ALL inventory from local DB ───────────────────────────
+        const { data: dbItems, error: dbErr } = await supabase
+            .from('Inventory')
+            .select('id, item_name, category, unit, price, stock_quantity, digitax_item_id, kra_registered, barcode')
+            .order('item_name');
+        if (dbErr) throw dbErr;
+
+        // ── 2. Pull ALL items from DigiTax (paginated) ────────────────────
+        let digitaxItems = [];
+        let digitaxError = null;
+
+        if (!DIGITAX_API_KEY) {
+            digitaxError = 'DIGITAX_API_KEY not configured on server.';
+        } else {
+            try {
+                let afterCursor = null;
+                let pagesFetched = 0;
+                const MAX_PAGES = 100; // 100 × 50 = 5,000 items max
+                do {
+                    const params = new URLSearchParams({ page_size: '50', ...(afterCursor ? { after: afterCursor } : {}) });
+                    const dtRes  = await fetch(`${DIGITAX_BASE_URL}/items?${params}`, {
+                        headers: { 'x-api-key': DIGITAX_API_KEY, 'Content-Type': 'application/json' },
+                        signal: AbortSignal.timeout(15000)
+                    });
+                    const dtText = await dtRes.text();
+                    let page;
+                    try { page = JSON.parse(dtText); } catch { page = null; }
+                    if (!dtRes.ok || !page) { digitaxError = `DigiTax API error ${dtRes.status}: ${dtText.slice(0, 200)}`; break; }
+                    const records = Array.isArray(page.data) ? page.data : (Array.isArray(page) ? page : []);
+                    digitaxItems.push(...records);
+                    pagesFetched++;
+                    afterCursor = page.pagination?.next || null;
+                } while (afterCursor && pagesFetched < MAX_PAGES);
+                log.info('[InventoryReconcile] DigiTax pages fetched', { pages: pagesFetched, items: digitaxItems.length });
+            } catch (err) {
+                digitaxError = `DigiTax unreachable: ${err.message}`;
+            }
+        }
+
+        if (digitaxError) return res.status(502).json({ success: false, message: digitaxError });
+
+        // ── 3. Build DigiTax lookup maps (by id AND by normalised name) ───
+        const dtById = {}, dtByName = {};
+        for (const dt of digitaxItems) {
+            const dtId = dt.id || dt.item_id;
+            if (dtId)  dtById[dtId] = dt;
+            const norm = (dt.item_name || '').toLowerCase().trim();
+            if (norm)  dtByName[norm] = dt;
+        }
+
+        // ── 4. Reconcile DB → DigiTax ─────────────────────────────────────
+        const matched = [], missingInDigitax = [], unregistered = [], stockMismatch = [];
+
+        for (const item of (dbItems || [])) {
+            const norm = (item.item_name || '').toLowerCase().trim();
+
+            if (!item.digitax_item_id && !item.kra_registered) {
+                unregistered.push({ id: item.id, item_name: item.item_name, category: item.category, unit: item.unit, price: item.price, stock_qty: item.stock_quantity, barcode: item.barcode });
+                continue;
+            }
+
+            const dtMatch = (item.digitax_item_id && dtById[item.digitax_item_id]) || dtByName[norm] || null;
+
+            if (!dtMatch) {
+                missingInDigitax.push({ id: item.id, item_name: item.item_name, category: item.category, digitax_item_id: item.digitax_item_id, price: item.price, stock_qty: item.stock_quantity });
+            } else {
+                const dtQty = parseFloat(dtMatch.quantity ?? dtMatch.stock_quantity ?? 0);
+                const dbQty = parseFloat(item.stock_quantity || 0);
+                const diff  = Math.abs(dtQty - dbQty);
+                const mismatch = diff > 0.01;
+                matched.push({ id: item.id, item_name: item.item_name, digitax_item_id: item.digitax_item_id || (dtMatch.id || dtMatch.item_id), db_qty: dbQty, dt_qty: dtQty, qty_mismatch: mismatch, qty_diff: parseFloat(diff.toFixed(4)), dt_status: dtMatch.active === false ? 'inactive' : 'active' });
+                if (mismatch) stockMismatch.push({ item_name: item.item_name, db_qty: dbQty, dt_qty: dtQty, qty_diff: parseFloat(diff.toFixed(4)), digitax_id: item.digitax_item_id || (dtMatch.id || dtMatch.item_id) });
+            }
+        }
+
+        // ── 5. DigiTax items NOT in DB (orphans) ──────────────────────────
+        const dbIds   = new Set((dbItems || []).map(i => i.digitax_item_id).filter(Boolean));
+        const dbNames = new Set((dbItems || []).map(i => (i.item_name||'').toLowerCase().trim()));
+        const orphansInDigitax = digitaxItems
+            .filter(dt => { const id = dt.id||dt.item_id; const nm = (dt.item_name||'').toLowerCase().trim(); return !dbIds.has(id) && !dbNames.has(nm); })
+            .map(dt => ({ digitax_item_id: dt.id||dt.item_id, item_name: dt.item_name, dt_qty: dt.quantity ?? dt.stock_quantity ?? 0, dt_status: dt.active === false ? 'inactive' : 'active' }));
+
+        const summary = {
+            total_db:           (dbItems || []).length,
+            total_digitax:      digitaxItems.length,
+            matched:            matched.length,
+            stock_mismatch:     stockMismatch.length,
+            missing_in_digitax: missingInDigitax.length,
+            unregistered:       unregistered.length,
+            orphans_in_digitax: orphansInDigitax.length,
+            sync_health:        (missingInDigitax.length === 0 && unregistered.length === 0 && stockMismatch.length === 0)
+                                    ? 'healthy' : (missingInDigitax.length > 10 || unregistered.length > 10)
+                                    ? 'critical' : 'warning',
+        };
+
+        log.info('[InventoryReconcile] Complete', summary);
+        res.json({ success: true, generated_at: new Date().toISOString(), summary, matched, stock_mismatch: stockMismatch, missing_in_digitax: missingInDigitax, unregistered, orphans_in_digitax: orphansInDigitax });
+
+    } catch (err) {
+        log.error('[InventoryReconcile]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
+
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║                  ELITE HARDWARE POS — AUTOMATED SCRIPTS                     ║
 // ║  All scripts run on server startup and on a recurring schedule.             ║
