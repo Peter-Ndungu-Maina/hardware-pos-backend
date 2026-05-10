@@ -3752,175 +3752,324 @@ app.get('/api/reports/debt-logs', requireAuth, async (req, res) => {
 // ============================================================
 //  BULK PRODUCT IMPORT (CSV/EXCEL) - BATCHED KRA SYNC
 // ============================================================
+// ============================================================
+//  BULK IMPORT — JOB QUEUE
+//
+//  Stores state in Supabase table `import_jobs`:
+//    id TEXT PK, status TEXT, total INT, processed INT,
+//    imported INT, failed INT, results JSONB,
+//    created_by TEXT, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+//
+//  Flow:
+//    1. POST /api/inventory/bulk-import
+//       → validates, writes job row, fires background worker, returns jobId
+//    2. Worker runs sequentially in background (no HTTP timeout risk)
+//    3. GET  /api/inventory/bulk-import/status/:jobId
+//       → frontend polls this every 3s for live progress
+//
+//  This means a 2,000-item import (≈2.3 hours) works fine —
+//  the HTTP connection is never held open beyond the initial POST.
+// ============================================================
+
+const BULK_IMPORT_CHUNK_SIZE = 1;  // one item at a time (DigiTax rate-limit safe)
+const BULK_IMPORT_ITEM_GAP_MS = 500; // extra gap between items beyond DigiTax's own 3s
+const BULK_IMPORT_MAX_ITEMS = 5000;  // hard cap per job — prevents 10MB JSON attacks
+
+// In-memory guard: only one import job runs at a time per server process.
+// Prevents a manager triggering 3 simultaneous imports and hitting DigiTax 3× per item.
+let _importJobRunning = false;
+
+async function importJobSet(jobId, fields) {
+    const { error } = await supabase
+        .from('import_jobs')
+        .upsert({ id: jobId, ...fields, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+    if (error) log.error('[BULK IMPORT] importJobSet failed', { jobId, error: error.message });
+}
+
+async function importJobGet(jobId) {
+    const { data, error } = await supabase
+        .from('import_jobs')
+        .select('*')
+        .eq('id', jobId)
+        .maybeSingle();
+    if (error) log.error('[BULK IMPORT] importJobGet failed', { jobId, error: error.message });
+    return data || null;
+}
+
+async function runBulkImportJob(jobId, items, userName) {
+    _importJobRunning = true;
+    const results = { success: [], failed: [] };
+    const allAuditRows = [];
+
+    try {
+        // Pre-fetch ALL existing DNs once — avoids per-item DB round-trips
+        const { data: existingDNs } = await supabase
+            .from('stock_batches')
+            .select('delivery_number');
+        const usedDNs = new Set((existingDNs || []).map(r => r.delivery_number));
+
+        log.info(`[BULK IMPORT] Job ${jobId} started — ${items.length} items by ${userName}`);
+
+        for (let i = 0; i < items.length; i++) {
+            // Abort gracefully if job was cancelled via the cancel endpoint
+            const jobState = await importJobGet(jobId);
+            if (jobState?.status === 'cancelled') {
+                log.info(`[BULK IMPORT] Job ${jobId} cancelled at item ${i}`);
+                break;
+            }
+
+            const row = items[i];
+            const {
+                itemName, category, unit, costPrice, sellingPrice, stockQty, deliveryNote, barcode,
+                fundiPrice, wholesalePrice, wholesaleMinQty,
+                bulkUnit, subUnit, subUnitQty, subUnitPrice
+            } = row;
+
+            if (!itemName || !sellingPrice || !stockQty || !deliveryNote) {
+                results.failed.push({ itemName: itemName || `Row ${i + 1}`, reason: 'Missing required fields (Name, Selling Price, Qty, or DN)' });
+            } else {
+                const price = parseFloat(sellingPrice);
+                const cost  = parseFloat(costPrice || 0);
+                const qty   = parseFloat(stockQty);
+                const dn    = String(deliveryNote).trim().toUpperCase();
+
+                if (isNaN(price) || price <= 0) {
+                    results.failed.push({ itemName, reason: 'Invalid selling price' });
+                } else if (isNaN(qty) || qty <= 0) {
+                    results.failed.push({ itemName, reason: 'Invalid quantity' });
+                } else if (usedDNs.has(dn)) {
+                    results.failed.push({ itemName, reason: `DN ${dn} already exists` });
+                } else {
+                    usedDNs.add(dn);
+
+                    const finalBarcode = (barcode && String(barcode).trim() !== '')
+                        ? String(barcode).trim()
+                        : `EH-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(Math.floor(Math.random() * 99999)).padStart(5, '0')}`;
+
+                    try {
+                        const digitaxItemId = await registerItemWithEtims({
+                            itemName:       itemName.trim(),
+                            category:       category || 'General',
+                            unit:           unit || 'PCS',
+                            stockQty:       qty,
+                            barcode:        finalBarcode,
+                            sellingPrice:   price,
+                            bulk_unit:      bulkUnit?.trim()  || null,
+                            sub_unit:       subUnit?.trim()   || null,
+                            sub_unit_qty:   subUnitQty        ? parseFloat(subUnitQty)    : null,
+                            sub_unit_price: subUnitPrice      ? parseFloat(subUnitPrice)  : null,
+                            fundi_price:    fundiPrice        ? parseFloat(fundiPrice)    : null,
+                            wholesale_price: wholesalePrice   ? parseFloat(wholesalePrice): null,
+                        });
+
+                        if (!digitaxItemId) {
+                            results.failed.push({ itemName, reason: 'KRA Registration Rejected' });
+                        } else {
+                            const { data: newItem, error: invErr } = await supabase.from('Inventory').insert([{
+                                item_name:         itemName.trim(),
+                                category:          category || 'General',
+                                unit:              unit     || 'PCS',
+                                cost_price:        cost,
+                                price:             price,
+                                stock_quantity:    qty,
+                                barcode:           finalBarcode,
+                                digitax_item_id:   digitaxItemId,
+                                kra_registered:  !!digitaxItemId,
+                                fundi_price:       fundiPrice      ? parseFloat(fundiPrice)      : null,
+                                wholesale_price:   wholesalePrice  ? parseFloat(wholesalePrice)  : null,
+                                wholesale_min_qty: wholesaleMinQty ? parseInt(wholesaleMinQty)   : null,
+                                bulk_unit:         bulkUnit?.trim() || null,
+                                sub_unit:          subUnit?.trim()  || null,
+                                sub_unit_qty:      subUnitQty      ? parseFloat(subUnitQty)      : null,
+                                sub_unit_price:    subUnitPrice    ? parseFloat(subUnitPrice)    : null,
+                            }]).select().single();
+
+                            if (invErr) throw new Error(invErr.message);
+
+                            const { data: newBatch, error: batchErr } = await supabase.from('stock_batches').insert([{
+                                inventory_id:    newItem.id,
+                                batch_qty:       qty,
+                                remaining_qty:   qty,
+                                unit_cost:       cost,
+                                delivery_number: dn,
+                                stock_at_entry:  0,
+                                performed_by:    userName
+                            }]).select('id').single();
+
+                            if (batchErr) {
+                                await supabase.from('Inventory').delete().eq('id', newItem.id);
+                                throw new Error(batchErr.message);
+                            }
+
+                            allAuditRows.push({
+                                performed_by: userName,
+                                action:       'INITIAL_STOCK',
+                                dn_number:    dn,
+                                item_name:    itemName.trim(),
+                                old_stock:    0,
+                                added_qty:    qty,
+                                new_stock:    qty,
+                                batch_id:     newBatch?.id || null,
+                                details:      `BULK IMPORT: ${itemName} | Qty: ${qty} | DN: ${dn} | KRA ID: ${digitaxItemId}`,
+                                timestamp:    new Date().toISOString()
+                            });
+
+                            results.success.push({ itemName, dn });
+                        }
+                    } catch (err) {
+                        results.failed.push({ itemName, reason: err.message });
+                    }
+                }
+            }
+
+            // Persist live progress after every item so the poll endpoint has fresh data
+            await importJobSet(jobId, {
+                status:    'running',
+                processed: i + 1,
+                imported:  results.success.length,
+                failed:    results.failed.length,
+                // Keep results array trimmed to last 200 entries in the live field to
+                // avoid the JSONB column growing unbounded on 2000-item imports
+                results:   {
+                    success: results.success.slice(-200),
+                    failed:  results.failed.slice(-200)
+                }
+            });
+
+            // Inter-item gap — DigiTax already waits 3s internally for the stock push
+            if (i < items.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, BULK_IMPORT_ITEM_GAP_MS));
+            }
+        }
+
+        // Batch-insert all audit rows at the end
+        if (allAuditRows.length > 0) {
+            // Split into chunks of 500 to stay within Supabase insert limits
+            for (let c = 0; c < allAuditRows.length; c += 500) {
+                const { error: auditErr } = await supabase.from('audit_logs').insert(allAuditRows.slice(c, c + 500));
+                if (auditErr) log.warn('[BULK IMPORT] Audit log batch insert failed:', auditErr.message);
+            }
+        }
+
+        const finalStatus = (await importJobGet(jobId))?.status === 'cancelled' ? 'cancelled' : 'done';
+        await importJobSet(jobId, {
+            status:    finalStatus,
+            processed: items.length,
+            imported:  results.success.length,
+            failed:    results.failed.length,
+            results:   { success: results.success, failed: results.failed }
+        });
+
+        log.info(`[BULK IMPORT] Job ${jobId} ${finalStatus} — ${results.success.length} imported, ${results.failed.length} failed`);
+        results.failed.forEach(f => log.warn(`[BULK IMPORT FAILURE] ❌ ${f.itemName}: ${f.reason}`));
+
+    } catch (err) {
+        log.error(`[BULK IMPORT] Job ${jobId} crashed:`, err.message);
+        await importJobSet(jobId, { status: 'error', error_message: err.message });
+    } finally {
+        _importJobRunning = false;
+    }
+}
+
+// ── POST /api/inventory/bulk-import ──────────────────────────────────────────
+// Validates the payload, writes a job row, fires the background worker, and
+// immediately returns the jobId. The client polls the status endpoint.
 app.post('/api/inventory/bulk-import', requireAuth, requireRole('admin', 'manager'), requireSubscription, bulkJsonParser, async (req, res) => {
     const { items } = req.body;
     const userName  = req.user.name;
     if (!Array.isArray(items) || !items.length)
         return res.status(400).json({ success: false, message: 'No items provided.' });
 
-    const results = { success: [], failed: [] };
-
-    // ── Pre-fetch ALL existing DNs in one query ───────────────────────────────
-    const { data: existingDNs } = await supabase
-        .from('stock_batches')
-        .select('delivery_number');
-    const usedDNs = new Set((existingDNs || []).map(r => r.delivery_number));
-
-    const allAuditRows = [];
-
-    // ── Process items SEQUENTIALLY with a small inter-item gap ─────────────────
-    // Previously used Promise.all(10 concurrent). Each registerItemWithEtims call
-    // awaits an internal 3s stock-push delay, so 10 concurrent calls meant 10
-    // simultaneous stock/adjust requests hitting DigiTax — triggering rate limits
-    // and causing DigiTax to merge duplicate-barcode items (doubling their stock).
-    // Sequential processing: one item fully completes before the next starts.
-    // 100 items × ~4s each = ~6-7 min total — acceptable for a background import.
-    log.info(`[BULK IMPORT] Processing ${items.length} items sequentially...`);
-    for (let i = 0; i < items.length; i++) {
-        const batch = [items[i]];   // one item at a time — kept as array for minimal diff below
-        // Process one item
-        await Promise.all(batch.map(async (row) => {
-            // 1. EXTRACT ALL FIELDS (Including Tiers & Sub-Units)
-            const { 
-                itemName, category, unit, costPrice, sellingPrice, stockQty, deliveryNote, barcode,
-                fundiPrice, wholesalePrice, wholesaleMinQty, 
-                bulkUnit, subUnit, subUnitQty, subUnitPrice 
-            } = row;
-
-            if (!itemName || !sellingPrice || !stockQty || !deliveryNote) {
-                results.failed.push({ itemName: itemName || `Row`, reason: 'Missing required fields (Name, Selling Price, Qty, or DN)' });
-                return;
-            }
-            
-            const price = parseFloat(sellingPrice);
-            const cost  = parseFloat(costPrice || 0);
-            const qty   = parseFloat(stockQty);
-            const dn    = String(deliveryNote).trim().toUpperCase();
-
-            if (isNaN(price) || price <= 0) { results.failed.push({ itemName, reason: 'Invalid selling price' }); return; }
-            if (isNaN(qty)   || qty   <= 0) { results.failed.push({ itemName, reason: 'Invalid quantity' });      return; }
-
-            if (usedDNs.has(dn)) { results.failed.push({ itemName, reason: `DN ${dn} already exists` }); return; }
-            usedDNs.add(dn);
-
-            // 2. SANITIZE BARCODE OR AUTO-GENERATE
-            const finalBarcode = (barcode && String(barcode).trim() !== '') 
-                ? String(barcode).trim() 
-                : `EH-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(Math.floor(Math.random() * 99999)).padStart(5, '0')}`;
-
-            try {
-                // 3. PASS EVERYTHING TO KRA (Including sub-unit info for proper stock tracking)
-                const digitaxItemId = await registerItemWithEtims({
-                    itemName:     itemName.trim(),
-                    category:     category || 'General',
-                    unit:         unit || 'PCS',
-                    stockQty:     qty,
-                    barcode:      finalBarcode,
-                    sellingPrice: price,
-                    // Pass sub-unit data to helper so it calculates Etims quantities correctly
-                    bulk_unit:    bulkUnit?.trim()  || null,
-                    sub_unit:     subUnit?.trim()   || null,
-                    sub_unit_qty: subUnitQty        ? parseFloat(subUnitQty)    : null,
-                    sub_unit_price: subUnitPrice    ? parseFloat(subUnitPrice)  : null,
-                    fundi_price:  fundiPrice        ? parseFloat(fundiPrice)    : null,
-                    wholesale_price: wholesalePrice ? parseFloat(wholesalePrice): null,
-                });
-
-                if (!digitaxItemId) {
-                    results.failed.push({ itemName, reason: 'KRA Registration Rejected' });
-                    return; 
-                }
-
-                // 4. SAVE TO SUPABASE INVENTORY TABLE (All fields)
-                const { data: newItem, error: invErr } = await supabase.from('Inventory').insert([{
-                    item_name:         itemName.trim(),
-                    category:          category || 'General',
-                    unit:              unit     || 'PCS',
-                    cost_price:        cost,
-                    price:             price,
-                    stock_quantity:    qty,
-                    barcode:           finalBarcode,
-                    digitax_item_id:   digitaxItemId,
-                    kra_registered:  !!digitaxItemId,
-                    // Advanced Fields
-                    fundi_price:       fundiPrice      ? parseFloat(fundiPrice)      : null,
-                    wholesale_price:   wholesalePrice  ? parseFloat(wholesalePrice)  : null,
-                    wholesale_min_qty: wholesaleMinQty ? parseInt(wholesaleMinQty)   : null,
-                    bulk_unit:         bulkUnit?.trim() || null,
-                    sub_unit:          subUnit?.trim()  || null,
-                    sub_unit_qty:      subUnitQty      ? parseFloat(subUnitQty)      : null,
-                    sub_unit_price:    subUnitPrice    ? parseFloat(subUnitPrice)    : null,
-                }]).select().single();
-                
-                if (invErr) throw new Error(invErr.message);
-
-                // 5. Insert stock batch
-                const { data: newBatch, error: batchErr } = await supabase.from('stock_batches').insert([{
-                    inventory_id:    newItem.id,
-                    batch_qty:       qty,
-                    remaining_qty:   qty,
-                    unit_cost:       cost,
-                    delivery_number: dn,
-                    stock_at_entry:  0,
-                    performed_by:    userName
-                }]).select('id').single();
-                
-                if (batchErr) {
-                    await supabase.from('Inventory').delete().eq('id', newItem.id);
-                    throw new Error(batchErr.message);
-                }
-
-                allAuditRows.push({
-                    performed_by: userName,
-                    action:       'INITIAL_STOCK',
-                    dn_number:    dn,
-                    item_name:    itemName.trim(),
-                    old_stock:    0,
-                    added_qty:    qty,
-                    new_stock:    qty,
-                    batch_id:     newBatch?.id || null,
-                    details:      `BULK IMPORT: ${itemName} | Qty: ${qty} | DN: ${dn} | KRA ID: ${digitaxItemId}`,
-                    timestamp:    new Date().toISOString()
-                });
-
-                results.success.push({ itemName, dn });
-
-            } catch (err) {
-                results.failed.push({ itemName, reason: err.message });
-            }
-        }));
-        
-        // 6. Inter-item gap — give DigiTax a short breath between registrations.
-        // registerItemWithEtims already waits 3s internally before the stock push,
-        // so we only add a small extra gap here to avoid hammering the API.
-        if (i < items.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-    }
-
-    // ── Single batch INSERT for all audit logs ────────────────────────────────
-    if (allAuditRows.length > 0) {
-        const { error: auditErr } = await supabase.from('audit_logs').insert(allAuditRows);
-        if (auditErr) {
-            log.warn('[BULK IMPORT] Audit log batch insert failed:', auditErr.message);
-        }
-    }
-
-    log.info(`[BULK IMPORT] Done — ${results.success.length} imported & registered, ${results.failed.length} failed | by ${userName}`);
-
-    if (results.failed.length > 0) {
-        results.failed.forEach(f => {
-            log.warn(`[BULK IMPORT FAILURE] ❌ ${f.itemName}: ${f.reason}`);
+    if (items.length > BULK_IMPORT_MAX_ITEMS)
+        return res.status(400).json({
+            success: false,
+            message: `Too many items in one request (${items.length.toLocaleString()}). Maximum per job is ${BULK_IMPORT_MAX_ITEMS.toLocaleString()}. Split your CSV into smaller files and import them one at a time.`
         });
-    }
 
+    if (_importJobRunning)
+        return res.status(429).json({
+            success: false,
+            message: 'Another import is already running. Please wait for it to finish before starting a new one.'
+        });
+
+    // Generate a stable job ID the client can poll
+    const jobId = `import-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+
+    // Write the initial job row synchronously so the poll endpoint can find it immediately
+    await importJobSet(jobId, {
+        status:     'running',
+        total:      items.length,
+        processed:  0,
+        imported:   0,
+        failed:     0,
+        results:    { success: [], failed: [] },
+        created_by: userName,
+        created_at: new Date().toISOString()
+    });
+
+    // Fire the worker in the background — do NOT await it
+    runBulkImportJob(jobId, items, userName).catch(err =>
+        log.error(`[BULK IMPORT] Unhandled worker crash for job ${jobId}:`, err.message)
+    );
+
+    // Respond immediately with the jobId — estimated time helps the frontend
+    const estimatedMinutes = Math.ceil((items.length * 3.5) / 60);
     res.json({
-        success:  true,
-        imported: results.success.length,
-        failed:   results.failed.length,
-        results
+        success:           true,
+        jobId,
+        total:             items.length,
+        message:           `Import started for ${items.length.toLocaleString()} items. Estimated time: ~${estimatedMinutes} minute(s). Poll /api/inventory/bulk-import/status/${jobId} for live progress.`,
+        statusUrl:         `/api/inventory/bulk-import/status/${jobId}`
     });
 });
+
+// ── GET /api/inventory/bulk-import/status/:jobId ──────────────────────────────
+// Frontend polls this every 3 seconds. Returns live progress + final results.
+app.get('/api/inventory/bulk-import/status/:jobId', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    const job = await importJobGet(req.params.jobId);
+    if (!job) return res.status(404).json({ success: false, message: 'Job not found. It may have expired.' });
+
+    const pct = job.total > 0 ? Math.round((job.processed / job.total) * 100) : 0;
+    res.json({
+        success:   true,
+        jobId:     job.id,
+        status:    job.status,           // 'running' | 'done' | 'cancelled' | 'error'
+        total:     job.total,
+        processed: job.processed,
+        imported:  job.imported,
+        failed:    job.failed,
+        percent:   pct,
+        results:   job.results || { success: [], failed: [] },
+        error:     job.error_message || null,
+        createdBy: job.created_by,
+        createdAt: job.created_at,
+        updatedAt: job.updated_at
+    });
+});
+
+// ── POST /api/inventory/bulk-import/cancel/:jobId ─────────────────────────────
+// Sets status to 'cancelled' — the worker checks this flag between items and exits.
+app.post('/api/inventory/bulk-import/cancel/:jobId', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    const job = await importJobGet(req.params.jobId);
+    if (!job) return res.status(404).json({ success: false, message: 'Job not found.' });
+    if (job.status !== 'running')
+        return res.status(400).json({ success: false, message: `Job is already ${job.status} — cannot cancel.` });
+
+    await importJobSet(req.params.jobId, { status: 'cancelled' });
+    log.info(`[BULK IMPORT] Job ${req.params.jobId} cancelled by ${req.user.name}`);
+    res.json({ success: true, message: 'Cancellation requested. The import will stop after the current item completes.' });
+});
+
+// Nightly cleanup: remove import_jobs rows older than 7 days
+setInterval(async () => {
+    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const { error } = await supabase.from('import_jobs').delete().lt('created_at', cutoff);
+    if (error) log.warn('[BULK IMPORT] Job cleanup failed:', error.message);
+}, 24 * 60 * 60 * 1000);
+
+
+
 // ============================================================
 //  8a. SELL ROUTE — MULTI-ITEM CART
 //  POST /api/sell/cart  →  ONE receipt/invoice/DN for ALL items
@@ -4036,7 +4185,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             if (!qty || qty <= 0) continue;
 
             const { data: invItem, error: fetchErr } = await supabase
-                .from('Inventory').select('stock_quantity, item_name, price, fundi_price, wholesale_price, wholesale_min_qty, sub_unit, sub_unit_qty, sub_unit_price, bulk_unit, cost_price').eq('id', cartItem.itemId).single();
+                .from('Inventory').select('stock_quantity, item_name, price, fundi_price, wholesale_price, wholesale_min_qty, sub_unit, sub_unit_qty, sub_unit_price, bulk_unit, cost_price, barcode').eq('id', cartItem.itemId).single();
             if (fetchErr || !invItem) throw new Error(`Item ${cartItem.itemId} not found.`);
 
             // ── Price tier resolution ─────────────────────────────────────────
@@ -4094,6 +4243,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 bulkUnit:   invItem.bulk_unit || invItem.unit || 'Carton',
                 subUnit:    invItem.sub_unit  || null,
                 subUnitQty: invItem.sub_unit_qty || null,
+                barcode:    invItem.barcode      || null,  // null triggers consistent hash fallback for items without barcodes
             });
 
             // FIFO batch drain
