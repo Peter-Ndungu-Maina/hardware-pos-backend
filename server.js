@@ -6805,22 +6805,19 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
 
         if (publicCert) {
             if (!rawSignature) {
-                // ── No signature header received ─────────────────────────────────────
-                // Jenga UAT/sandbox does NOT send a signature header on callbacks —
-                // signature verification only applies in production.
-                // Log the received header names for reference, then ALLOW the callback
-                // to be processed so sandbox testing works correctly.
-                // In production, Jenga WILL send a signature header — at that point
-                // rawSignature will be populated and the verify() block below will run.
+                // 🛑 THE FIX: Hard-block missing signatures in production!
+                if (process.env.NODE_ENV === 'production') {
+                    log.error(`[JENGA IPN] ❌ CRITICAL: Missing signature in PRODUCTION. Spoofed callback REJECTED from IP ${req.ip}`);
+                    return; // EXIT HERE! Do not process the fake payment.
+                }
+
+                // If we reach here, we are NOT in production, so it's safe to allow testing
                 log.warn('[JENGA IPN] No signature header found (CRIT-01). Header names received: '
                     + Object.keys(req.headers).join(', '));
-                log.warn('[JENGA IPN] Likely sandbox/UAT — processing WITHOUT signature verification. '
-                    + 'In production Jenga will include a signature header and this block will verify it.');
-                // ── IMPORTANT: fall through to process the payment — do NOT return here.
-                // The old code fell through but still ran verifier.verify('') which always
-                // returns false and silently rejected real sandbox payments.
+                log.warn('[JENGA IPN] Sandbox/UAT detected — processing WITHOUT signature verification.');
             } else {
                 // ── Signature header present — verify it ─────────────────────────────
+     
                 try {
                     // Reconstruct the signed string Jenga uses for IPN callbacks.
                     // For IPN (paybill): reference + amount + currency + mobileNumber
