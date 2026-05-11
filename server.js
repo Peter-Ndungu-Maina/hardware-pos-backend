@@ -6324,16 +6324,24 @@ async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerN
     //    updated the instant the STK callback is processed — before any DB write.
     //    The payments table check is a fallback for cases where the cache has expired.
     if (activeDebts.length === 0) {
-        if (bankRef) {
-            // ── Guard 1: in-memory STK pending cache (fastest, no DB hit) ──────────
-            // The STK callback sets status='confirmed' and mpesa_code=bankRef on the
-            // pending row the moment payment is received. Check this first.
-            const pendingRow = await mpesaGet(bankRef);
-            if (pendingRow?.status === 'confirmed' || pendingRow?.mpesa_code === bankRef) {
-                log.info(`[JENGA ${channel}] ℹ️ bankRef=${bankRef} is a confirmed STK payment (found in pending cache) — ignoring duplicate IPN.`);
-                return;
-            }
-
+    if (bankRef) {
+        // NEW: Check if this was an STK push initiated from the POS interface
+        const pendingRow = await mpesaGet(bankRef) || await mpesaGet(primaryRef);
+        
+        if (pendingRow && pendingRow.status === 'pending') {
+            // This is a legit sale in progress! 
+            // Mark the STK as confirmed so the frontend 'waiting' modal sees it.
+            await mpesaSet(bankRef, { 
+                ...pendingRow, 
+                status: 'confirmed', 
+                mpesa_code: bankRef, 
+                amount, 
+                phone 
+            });
+            log.info(`[JENGA] ✅ STK Session Confirmed for in-progress sale: ${bankRef}`);
+            return; // EXIT HERE. Do not mark as unmatched.
+        }
+   
             // ── Guard 2: also check via transactionId cross-ref in cache ─────────
             // Jenga's STK callback stores an _indexFor row keyed by jengaTxId.
             // If bankRef resolves to a payRef that is confirmed, same conclusion.
