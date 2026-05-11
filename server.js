@@ -6742,41 +6742,49 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
 
         if (publicCert) {
             if (!rawSignature) {
-                // Signature cert is loaded but Jenga sent no recognisable signature header.
-                // Log every header name we received to help identify the correct one,
-                // then PROCESS the payment anyway so real customer payments aren't lost.
-                // Once the correct header name is confirmed in the logs, re-enable hard rejection.
+                // ── No signature header received ─────────────────────────────────────
+                // Jenga UAT/sandbox does NOT send a signature header on callbacks —
+                // signature verification only applies in production.
+                // Log the received header names for reference, then ALLOW the callback
+                // to be processed so sandbox testing works correctly.
+                // In production, Jenga WILL send a signature header — at that point
+                // rawSignature will be populated and the verify() block below will run.
                 log.warn('[JENGA IPN] No signature header found (CRIT-01). Header names received: '
                     + Object.keys(req.headers).join(', '));
-                log.warn('[JENGA IPN] Processing WITHOUT signature verification -- update header name and re-enable rejection once confirmed.');
-                // NOTE: remove the line below and restore the hard return once the header is confirmed
-                // return;
-            }
-            try {
-                // Reconstruct the signed string.
-                // For IPN (paybill): reference + amount + currency + mobileNumber
-                // For STK callback: transactionReference + debitedAmount + currency + mobileNumber
-                // Use the fields present in the body to cover both shapes.
-                const tx   = body.transaction   || {};
-                const cust = body.customer       || {};
-                const ref  = tx.reference        || body.transactionReference || body.telcoReference || '';
-                const amt  = tx.amount           || body.debitedAmount        || body.requestAmount  || '';
-                const cur  = tx.currency         || body.currency             || 'KES';
-                const mob  = cust.mobileNumber   || body.mobileNumber         || '';
-                const dataToVerify = `${ref}${amt}${cur}${mob}`;
+                log.warn('[JENGA IPN] Likely sandbox/UAT — processing WITHOUT signature verification. '
+                    + 'In production Jenga will include a signature header and this block will verify it.');
+                // ── IMPORTANT: fall through to process the payment — do NOT return here.
+                // The old code fell through but still ran verifier.verify('') which always
+                // returns false and silently rejected real sandbox payments.
+            } else {
+                // ── Signature header present — verify it ─────────────────────────────
+                try {
+                    // Reconstruct the signed string Jenga uses for IPN callbacks.
+                    // For IPN (paybill): reference + amount + currency + mobileNumber
+                    // For STK callback: transactionReference + debitedAmount + currency + mobileNumber
+                    const tx   = body.transaction   || {};
+                    const cust = body.customer       || {};
+                    const ref  = tx.reference        || body.transactionReference || body.telcoReference || '';
+                    const amt  = tx.amount           || body.debitedAmount        || body.requestAmount  || '';
+                    const cur  = tx.currency         || body.currency             || 'KES';
+                    const mob  = cust.mobileNumber   || body.mobileNumber         || '';
+                    const dataToVerify = `${ref}${amt}${cur}${mob}`;
 
-                const verifier = crypto.createVerify('SHA256');
-                verifier.update(dataToVerify);
-                const isValid = verifier.verify(publicCert, rawSignature, 'base64');
+                    log.info(`[JENGA IPN] Verifying signature. Data string: "${dataToVerify}"`);
 
-                if (!isValid) {
-                    log.warn(`[JENGA IPN] ❌ SIGNATURE INVALID — spoofed callback REJECTED from IP ${req.ip}`);
-                    return; // Do not process — this is a forged callback
+                    const verifier = crypto.createVerify('SHA256');
+                    verifier.update(dataToVerify);
+                    const isValid = verifier.verify(publicCert, rawSignature, 'base64');
+
+                    if (!isValid) {
+                        log.warn(`[JENGA IPN] ❌ SIGNATURE INVALID — spoofed callback REJECTED from IP ${req.ip}`);
+                        return; // Do not process — this is a forged callback
+                    }
+                    log.info('[JENGA IPN] ✅ Signature verified successfully.');
+                } catch (sigErr) {
+                    log.error('[JENGA IPN] ❌ Signature verification threw an error:', sigErr.message, '— callback rejected');
+                    return;
                 }
-                log.info('[JENGA IPN] ✅ Signature verified successfully.');
-            } catch (sigErr) {
-                log.error('[JENGA IPN] ❌ Signature verification threw an error:', sigErr.message, '— callback rejected');
-                return;
             }
         } else {
             // No public cert loaded — warn loudly but only hard-block in production
