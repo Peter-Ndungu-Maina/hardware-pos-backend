@@ -6800,24 +6800,36 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
         if (body.callbackType === 'IPN') {
             const tx   = body.transaction || {};
             const cust = body.customer    || {};
-            
+
             if ((tx.status || '').toUpperCase() !== 'SUCCESS') return;
 
-            const phone        = String(cust.mobileNumber || '').replace(/^254/, '0').replace(/^\+254/, '0');
-            const amount       = Math.round(parseFloat(tx.amount || 0));
-            const bankRef      = tx.reference || null;        // e.g. SH90HU7FO2
-            const accountRef   = tx.billNumber || null;       // What customer typed (e.g. INV-1234)
-            const customerName = cust.name || 'Jenga Paybill Customer';
-            
-            // Fix: Correctly label the channel based on paymentMode
-            const mode = (tx.paymentMode || '').toUpperCase();
+            const phone         = String(cust.mobileNumber || '').replace(/^254/, '0').replace(/^\+254/, '0');
+            const amount        = Math.round(parseFloat(tx.amount || 0));
+            const bankRef       = tx.reference  || null;   // M-Pesa code e.g. SH90HU7FO2
+            const rawAccountRef = tx.billNumber || null;   // What customer typed as account ref
+            const customerName  = cust.name || 'Jenga Paybill Customer';
+
+            const mode    = (tx.paymentMode || '').toUpperCase();
             const channel = mode === 'EQUITEL' ? 'Equitel Paybill' : 'M-Pesa Paybill';
 
             if (!amount || amount <= 0 || !bankRef) return;
 
-            log.info(`[JENGA IPN] Independent payment via ${channel}. Routing straight to debt matcher.`);
-            
-            // NO pending_mpesa lookup here! Send straight to FIFO debt matcher.
+            // ── Account ref normalisation ─────────────────────────────────────────
+            // When a customer pays manually and types the Equity account number as
+            // the account reference, billNumber = JENGA_EQUITY_ACCOUNT.
+            // Discard it — fall through to phone-based debt matching instead.
+            const isAccountNumber = rawAccountRef &&
+                JENGA_EQUITY_ACCOUNT &&
+                rawAccountRef.trim().replace(/\s/g, '') === String(JENGA_EQUITY_ACCOUNT).trim().replace(/\s/g, '');
+
+            const accountRef = isAccountNumber ? null : rawAccountRef;
+
+            if (isAccountNumber) {
+                log.info(`[JENGA IPN] billNumber="${rawAccountRef}" matches JENGA_EQUITY_ACCOUNT — using phone matching only.`);
+            }
+
+            log.info(`[JENGA IPN] ${channel} KES ${amount} from ${customerName}. accountRef="${accountRef || '(phone match)'}"`);
+
             await applyJengaPayment({ phone, amount, bankRef, accountRef, customerName, channel });
             return;
         }
