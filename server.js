@@ -6313,10 +6313,65 @@ async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerN
         (parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) > 0
     );
 
-    // ── 3. No debt — store as unmatched for cashier to resolve as goods purchase ──
-    // This is identical to how Safaricom C2B handles walk-in cash customers:
-    // the cashier sees it in the dashboard and calls /api/c2b/resolve-goods.
+    // ── 3. No debt found — but before marking unmatched, check if this is a
+    //    duplicate IPN for an STK push already handled by the STK callback.
+    //
+    //    ROOT CAUSE: Jenga fires TWO callbacks for every STK push:
+    //      a) STK callback  (body.telco present)        → handled first, sale marked Paid
+    //      b) IPN callback  (body.callbackType = 'IPN') → arrives ms later, finds no debt
+    //
+    //    The in-memory pending cache is the most reliable guard because it is
+    //    updated the instant the STK callback is processed — before any DB write.
+    //    The payments table check is a fallback for cases where the cache has expired.
     if (activeDebts.length === 0) {
+        if (bankRef) {
+            // ── Guard 1: in-memory STK pending cache (fastest, no DB hit) ──────────
+            // The STK callback sets status='confirmed' and mpesa_code=bankRef on the
+            // pending row the moment payment is received. Check this first.
+            const pendingRow = await mpesaGet(bankRef);
+            if (pendingRow?.status === 'confirmed' || pendingRow?.mpesa_code === bankRef) {
+                log.info(`[JENGA ${channel}] ℹ️ bankRef=${bankRef} is a confirmed STK payment (found in pending cache) — ignoring duplicate IPN.`);
+                return;
+            }
+
+            // ── Guard 2: also check via transactionId cross-ref in cache ─────────
+            // Jenga's STK callback stores an _indexFor row keyed by jengaTxId.
+            // If bankRef resolves to a payRef that is confirmed, same conclusion.
+            const indexRow = await mpesaGet(bankRef);
+            if (indexRow?._indexFor) {
+                const primaryRow = await mpesaGet(indexRow._indexFor);
+                if (primaryRow?.status === 'confirmed') {
+                    log.info(`[JENGA ${channel}] ℹ️ bankRef=${bankRef} resolves to confirmed payRef — ignoring duplicate IPN.`);
+                    return;
+                }
+            }
+
+            // ── Guard 3: payments table fallback (covers cache-expired cases) ────
+            const { data: alreadyPaid } = await supabase
+                .from('payments')
+                .select('id')
+                .ilike('mpesa_code', `${bankRef}%`)
+                .maybeSingle();
+            if (alreadyPaid) {
+                log.info(`[JENGA ${channel}] ℹ️ bankRef=${bankRef} already in payments table — ignoring duplicate IPN.`);
+                return;
+            }
+
+            // ── Guard 4: c2b_payments dedup (prevents double-unmatched entries) ──
+            const { data: existingC2B } = await supabase
+                .from('c2b_payments')
+                .select('id')
+                .eq('mpesa_code', bankRef)
+                .maybeSingle();
+            if (existingC2B) {
+                log.info(`[JENGA ${channel}] ℹ️ bankRef=${bankRef} already in c2b_payments — ignoring duplicate.`);
+                return;
+            }
+        }
+
+        // ── Genuinely unmatched ───────────────────────────────────────────────
+        // All guards passed — this is a real walk-in customer paying via paybill
+        // without an open sale. Cashier resolves via Remote M-Pesa Payments panel.
         await supabase.from('c2b_payments').insert([{
             phone,
             amount,
@@ -6328,7 +6383,7 @@ async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerN
             amount_excess:  amount,
             created_at:    now.toISOString()
         }]);
-        log.info(`[JENGA ${channel}] ⚠️ No debt for inv="${accountRef}" phone="${phone}" — stored as unmatched (cashier resolves as goods purchase)`);
+        log.info(`[JENGA ${channel}] ⚠️ Genuinely unmatched: KES ${amount} from ${phone} (bankRef=${bankRef}) — stored for cashier to resolve.`);
         return;
     }
 
