@@ -212,12 +212,11 @@ async function submitSaleToEtims(saleData) {
                 const hasSub = !!(item.subUnit && item.subUnitQty);
 
                 // ── THE FIX: Translate Bulk sales into Sub-unit sales for KRA ──
-                // If the cashier sold by 'Carton' but the item is tracked in 'Pieces',
-                // multiply the quantity by 1000 and divide the unit price by 1000.
                 if (item.sellUnit !== 'sub' && hasSub) {
                     const subQty = parseFloat(item.subUnitQty);
                     qty = parseFloat((qty * subQty).toFixed(4));
-                    price = price / subQty; 
+                    // 🛑 NEW: Round price to exactly 2 decimal places so KRA math aligns perfectly
+                    price = parseFloat((price / subQty).toFixed(2)); 
                 }
 
                 // KRA must always see the sub-unit if the item has one configured
