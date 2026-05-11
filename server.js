@@ -796,7 +796,13 @@ const apiLimiter = rateLimit({
 app.use('/api/', apiLimiter);
 app.use(log.middleware);          // structured JSON request logging
 app.use(sanitizeQuery);           // strip PostgREST injection chars from all query params
-app.use(express.json({ limit: '100kb' })); // Tight global limit — prevents DoS via large payloads
+// Skip JSON parsing for /api/jenga/ipn -- Jenga sends text/plain, not application/json.
+// express.json() would consume the stream and discard it, leaving nothing for the
+// route's own express.raw() parser. The route handles its own parsing instead.
+app.use((req, res, next) => {
+    if (req.path === '/api/jenga/ipn') return next();
+    express.json({ limit: '100kb' })(req, res, next);
+});
 // Bulk import is the only route that legitimately receives large bodies; apply 10mb only there.
 const bulkJsonParser = express.json({ limit: '10mb' });
 
@@ -6647,14 +6653,9 @@ app.get('/api/jenga/status/:ref', requireAuth, async (req, res) => {
 if (!SUB_EXEMPT_PATHS.has('/api/jenga/ipn')) SUB_EXEMPT_PATHS.add('/api/jenga/ipn');
 
 // ── JENGA WEBHOOK (Handles BOTH Independent Paybill IPNs & STK Callbacks) ──
-// WHY the raw-body parser is here:
-// Jenga sends IPN callbacks with Content-Type: text/plain (or no Content-Type).
-// Express's global express.json() only parses requests whose Content-Type is
-// exactly "application/json", so it silently skips Jenga callbacks and leaves
-// req.body as whatever string was in the body (hence the log showing "Menu").
-//
-// Fix: express.raw({ type: '*/*' }) captures raw bytes regardless of Content-Type,
-// then we manually JSON.parse() the buffer. Every other route is unaffected.
+// express.raw() captures the raw bytes regardless of Content-Type so we can
+// manually JSON.parse() them. The global express.json() is bypassed for this
+// route (see the middleware skip above) so the stream arrives intact.
 const _jengaRawParser = express.raw({ type: '*/*', limit: '64kb' });
 
 app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
@@ -6664,7 +6665,7 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
     try {
         // Parse raw buffer regardless of what Content-Type Jenga sends
         let body = {};
-        const rawBuf = req.body; // express.raw() delivers a Buffer here
+        const rawBuf = req.body;
         const rawStr = Buffer.isBuffer(rawBuf)
             ? rawBuf.toString('utf8').trim()
             : (typeof rawBuf === 'string' ? rawBuf.trim() : '');
@@ -6676,7 +6677,7 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
         try {
             body = JSON.parse(rawStr);
         } catch (parseErr) {
-            log.warn('[JENGA WEBHOOK] Body is not valid JSON -- raw content:', rawStr.substring(0, 200));
+            log.warn('[JENGA WEBHOOK] Body is not valid JSON -- raw:', rawStr.substring(0, 200));
             return;
         }
 
