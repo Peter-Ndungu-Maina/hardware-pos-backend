@@ -6647,12 +6647,39 @@ app.get('/api/jenga/status/:ref', requireAuth, async (req, res) => {
 if (!SUB_EXEMPT_PATHS.has('/api/jenga/ipn')) SUB_EXEMPT_PATHS.add('/api/jenga/ipn');
 
 // ── JENGA WEBHOOK (Handles BOTH Independent Paybill IPNs & STK Callbacks) ──
-app.post('/api/jenga/ipn', async (req, res) => {
+// WHY the raw-body parser is here:
+// Jenga sends IPN callbacks with Content-Type: text/plain (or no Content-Type).
+// Express's global express.json() only parses requests whose Content-Type is
+// exactly "application/json", so it silently skips Jenga callbacks and leaves
+// req.body as whatever string was in the body (hence the log showing "Menu").
+//
+// Fix: express.raw({ type: '*/*' }) captures raw bytes regardless of Content-Type,
+// then we manually JSON.parse() the buffer. Every other route is unaffected.
+const _jengaRawParser = express.raw({ type: '*/*', limit: '64kb' });
+
+app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
     // Always ACK immediately so Jenga doesn't retry
     res.status(200).json({ status: 'Success', message: 'Received' });
 
     try {
-        const body = req.body;
+        // Parse raw buffer regardless of what Content-Type Jenga sends
+        let body = {};
+        const rawBuf = req.body; // express.raw() delivers a Buffer here
+        const rawStr = Buffer.isBuffer(rawBuf)
+            ? rawBuf.toString('utf8').trim()
+            : (typeof rawBuf === 'string' ? rawBuf.trim() : '');
+
+        if (!rawStr) {
+            log.warn('[JENGA WEBHOOK] Empty body received -- ignoring');
+            return;
+        }
+        try {
+            body = JSON.parse(rawStr);
+        } catch (parseErr) {
+            log.warn('[JENGA WEBHOOK] Body is not valid JSON -- raw content:', rawStr.substring(0, 200));
+            return;
+        }
+
         log.info('[JENGA WEBHOOK] Received payload:', JSON.stringify(body).substring(0, 500));
 
         // ── FIX CRIT-01: Signature verification ────────────────────────────────
