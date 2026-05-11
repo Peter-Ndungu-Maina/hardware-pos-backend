@@ -6558,15 +6558,57 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
 
        // code -1 = queued successfully. code 106201 / status false = rejected.
         if (!response.ok || data.status === false || data.code === 106201) {
-            
-            // ── THE SELF-HEALING FIX ──
+
+            // ── AUTO-RETRY on expired token ───────────────────────────────────────
+            // Jenga returns 401 when the cached Bearer token has expired server-side.
+            // FIX: clear the cache, fetch a fresh token, and retry ONCE transparently.
+            // NEVER return 401 to the frontend — apiFetch treats any 401 as a user
+            // session logout and redirects to the login page.
             if (response.status === 401 || data.code === 401) {
-                _jengaTokenExp = 0; // Instantly kill the dead token in memory
-                log.warn('[JENGA STK] Token expired on Jenga side. Cache cleared.');
-                return res.status(401).json({ 
-                    success: false, 
-                    message: 'Bank session refreshed. Please click "Send Prompt" one more time.' 
-                });
+                _jengaToken    = null;
+                _jengaTokenExp = 0;
+                log.warn('[JENGA STK] Token expired on Jenga side — clearing cache and retrying once with fresh token...');
+
+                try {
+                    const freshToken   = await getJengaToken();
+                    const retryResp    = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
+                        method:  'POST',
+                        headers: {
+                            'Authorization': `Bearer ${freshToken}`,
+                            'Signature':     signature,
+                            'Content-Type':  'application/json'
+                        },
+                        body:   JSON.stringify(payload),
+                        signal: AbortSignal.timeout(15000)
+                    });
+                    const retryText = await retryResp.text();
+                    let retryData;
+                    try { retryData = JSON.parse(retryText); } catch(e) { throw new Error('Non-JSON on retry: ' + retryText.substring(0,200)); }
+
+                    if (!retryResp.ok || retryData.status === false || retryData.code === 106201) {
+                        log.warn(`[JENGA STK] ❌ Retry also failed HTTP=${retryResp.status}: ${JSON.stringify(retryData)}`);
+                        return res.status(400).json({ success: false, message: retryData.message || 'STK push rejected by Jenga after token refresh', code: retryData.code });
+                    }
+
+                    // Retry succeeded — persist and continue as normal
+                    log.info(`[JENGA STK] ✅ Retry succeeded with fresh token ref=${payRef}`);
+                    const channelLabelR = telco === 'Equitel' ? 'EQUITEL_STK' : 'SAFARICOM_STK_VIA_EQUITY';
+                    await mpesaSet(payRef, {
+                        status:     'pending',
+                        phone:      msisdn,
+                        amount:     paymentAmount,
+                        context:    { accountRef, channel: channelLabelR, transactionId: retryData.transactionId },
+                        created_at: new Date().toISOString()
+                    });
+                    if (retryData.transactionId && retryData.transactionId !== payRef) {
+                        await mpesaSet(retryData.transactionId, { _indexFor: payRef, created_at: new Date().toISOString() });
+                    }
+                    return res.json({ success: true, payRef, transactionId: retryData.transactionId, message: 'STK push sent. Waiting for customer...' });
+
+                } catch (retryErr) {
+                    log.error('[JENGA STK] Retry after token refresh failed:', retryErr.message);
+                    return res.status(502).json({ success: false, message: 'Bank connection failed after token refresh. Please try again.' });
+                }
             }
 
             log.warn(`[JENGA STK] ❌ Rejected (${telco}) HTTP=${response.status} full response: ${JSON.stringify(data)}`);
