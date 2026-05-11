@@ -6777,69 +6777,81 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
         // { status, code, transactionReference, telcoReference, mobileNumber,
         //   debitedAmount, requestAmount, telco: "Safaricom"|"Equitel", ... }
         if (body.telco || body.transactionReference) {
-          // Jenga Code 3 = Settled to Equity Bank. 
-// Jenga Code 4 = Customer paid successfully, but Jenga's internal transfer to Equity is delayed.
-            const isPaid = (body.status === true && String(body.code) === '3') || String(body.code) === '4';
-            const jengaTxId   = body.transactionReference || null;
+            // Official Jenga STK callback codes (from Jenga API docs):
+            //   0 = PENDING
+            //   1 = FAILED
+            //   2 = AWAITING_THIRD_PARTY_SETTLEMENT (successful, manual settlement pending)
+            //   3 = COMPLETED/CREDITED (fully settled to merchant)
+            //   4 = AWAITING-SETTLEMENT (customer paid, merchant crediting delayed)
+            //   5 = CANCELLED (by user)
+            //   6 = CANCELLED
+            //   7 = REJECTED
+            //
+            // Codes 3 and 4: money is confirmed received -- apply the payment now.
+            // Code 2: third-party settlement pending -- still safe to credit customer
+            //         since Jenga guarantees the funds; treat as paid.
+            // Codes 0,1,5,6,7: not paid -- classify for the frontend polling response.
+            //
+            // body.status is unreliable across Jenga versions (boolean, string, int) --
+            // use body.code as the single source of truth.
+            const codeStr = String(body.code);
+            const isPaid = codeStr === '3' || codeStr === '4' || codeStr === '2';
+
+            const jengaTxId     = body.transactionReference || null;
             const callbackTelco = body.telco || 'Unknown';
 
-            // ── Resolve cross-reference: jengaTxId → our payRef ──────────────────
+            // Resolve cross-reference: jengaTxId -> our payRef
             // We saved an index row under jengaTxId with _indexFor pointing to payRef.
             let primaryRef = jengaTxId;
             if (jengaTxId) {
                 const indexRow = await mpesaGet(jengaTxId);
                 if (indexRow?._indexFor) {
                     primaryRef = indexRow._indexFor;
-                    log.info(`[JENGA IPN] Resolved jengaTxId=${jengaTxId} → payRef=${primaryRef} (${callbackTelco})`);
+                    log.info(`[JENGA IPN] Resolved jengaTxId=${jengaTxId} -> payRef=${primaryRef} (${callbackTelco})`);
                 }
             }
 
             if (!isPaid) {
-                log.info(`[JENGA STK CB] ${callbackTelco} failed: code=${body.code} msg="${body.message}"`);
+                // Map official codes directly -- no message-text guessing needed
+                let newStatus;
+                switch (codeStr) {
+                    case '5':
+                    case '6':  newStatus = 'cancelled';  break;
+                    case '7':  newStatus = 'failed';      break;  // REJECTED
+                    case '1':  {
+                        // Code 1 = FAILED -- check message text to sub-classify
+                        const msg = (
+                            (body.message      || '') + ' ' +
+                            (body.description  || '') + ' ' +
+                            (body.reason       || '')
+                        ).toLowerCase();
+                        if (msg.includes('insufficient') || msg.includes('balance') ||
+                            msg.includes('funds')        || msg.includes('limit')   ||
+                            msg.includes('exceed')       || msg.includes('not enough')) {
+                            newStatus = 'insufficient_funds';
+                        } else if (msg.includes('timeout') || msg.includes('timed out') ||
+                                   msg.includes('expired') || msg.includes('no response')) {
+                            newStatus = 'timeout';
+                        } else {
+                            newStatus = 'failed';
+                        }
+                        break;
+                    }
+                    default: newStatus = 'failed';
+                }
+
+                const resultDesc = body.message || body.description || `Payment not completed (code ${codeStr})`;
+                log.info(`[JENGA STK CB] ${callbackTelco} not paid: code=${codeStr} status=${newStatus} msg="${resultDesc}"`);
+
                 if (primaryRef) {
                     const pending = await mpesaGet(primaryRef);
                     if (pending) {
-                        let newStatus = 'failed';
-                        const codeStr = String(body.code);
-                        // Combine all text fields Jenga may use to describe the failure
-                        const msg = (
-                            (body.message       || '') + ' ' +
-                            (body.description   || '') + ' ' +
-                            (body.reason        || '') + ' ' +
-                            (body.errorMessage  || '') + ' ' +
-                            (body.resultDesc    || '')
-                        ).toLowerCase();
-
-                        // IMPORTANT: Check message keywords FIRST before numeric codes.
-                        // Jenga reuses code 6 for both timeout AND insufficient funds —
-                        // the message text is the only reliable signal.
-                        // Confirmed from live logs: code=6, msg="The balance is insufficient for the transaction."
-                        const isInsufficientFunds =
-                            msg.includes('insufficient') || msg.includes('balance') ||
-                            msg.includes('funds')        || msg.includes('low bal') ||
-                            msg.includes('limit')        || msg.includes('exceed')  ||
-                            msg.includes('not enough')   || msg.includes('no funds') ||
-                            ['1','2','7','8','10','11','12','17'].includes(codeStr);
-
-                        const isTimeout =
-                            !isInsufficientFunds && (
-                                codeStr === '6' ||
-                                msg.includes('timeout') || msg.includes('timed out') ||
-                                msg.includes('expired')  || msg.includes('no response')
-                            );
-
-                        if (isInsufficientFunds) {
-                            newStatus = 'insufficient_funds';
-                        } else if (codeStr === '5' || msg.includes('cancel') || msg.includes('abort') || msg.includes('decline') || msg.includes('reject')) {
-                            newStatus = 'cancelled';
-                        } else if (isTimeout) {
-                            newStatus = 'timeout';
-                        }
-                        await mpesaSet(primaryRef, { ...pending, status: newStatus, result_desc: body.message || body.description || 'Payment failed' });
+                        await mpesaSet(primaryRef, { ...pending, status: newStatus, result_desc: resultDesc });
                     }
                 }
                 return;
             }
+
 
             const phone        = String(body.mobileNumber || '').replace(/^(?:\+?254)/, '0');
             const amount       = Math.round(parseFloat(body.debitedAmount || body.requestAmount || 0));
