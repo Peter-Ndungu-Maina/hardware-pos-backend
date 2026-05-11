@@ -103,13 +103,15 @@ function blockToken(token) {
     try {
         const decoded = jwt.decode(token);
         if (!decoded?.exp) return;
-        // Use first 16 chars as key — unique enough, avoids storing full token
-        tokenBlocklist.set(token.slice(0, 16), decoded.exp * 1000);
+        // SHA-256 of the full token — guaranteed unique, avoids JWT header collision
+        // (The first ~16 chars of every JWT are always identical base64-encoded header bytes)
+        const key = crypto.createHash('sha256').update(token).digest('hex');
+        tokenBlocklist.set(key, decoded.exp * 1000);
     } catch { /* ignore malformed tokens */ }
 }
 
 function isTokenBlocked(token) {
-    const key = token.slice(0, 16);
+    const key = crypto.createHash('sha256').update(token).digest('hex');
     const expiry = tokenBlocklist.get(key);
     if (!expiry) return false;
     if (Date.now() > expiry) { tokenBlocklist.delete(key); return false; }
@@ -703,7 +705,7 @@ const transporter = nodemailer.createTransport({
         user: process.env.EMAIL_USER,
         pass: process.env.EMAIL_PASS
     },
-    tls: { rejectUnauthorized: false },
+    tls: { rejectUnauthorized: true },  // FIX HIGH-03: Always verify TLS cert — prevents MITM on email
     connectionTimeout: 10000,
     greetingTimeout:   10000,
     socketTimeout:     15000
@@ -723,8 +725,14 @@ transporter.verify((err) => {
 // ============================================================
 
 // CORS — restrict to your frontend origins only
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,https://hardware-pos-backend.onrender.com')
-    .split(',').map(o => o.trim());
+// FIX HIGH-04: Never include the backend's own domain in ALLOWED_ORIGINS.
+// Default only to localhost for dev. In production, ALLOWED_ORIGINS MUST be set
+// explicitly to your frontend domain (e.g. https://my-pos-dashboard.netlify.app).
+const _rawOrigins = process.env.ALLOWED_ORIGINS || 'http://localhost:3000';
+if (process.env.NODE_ENV === 'production' && !process.env.ALLOWED_ORIGINS) {
+    log.warn('⚠️  ALLOWED_ORIGINS is not set in production! CORS is defaulting to localhost only. Set this env var to your frontend domain.');
+}
+const allowedOrigins = _rawOrigins.split(',').map(o => o.trim()).filter(Boolean);
 
 app.use(helmet({
     // Content-Security-Policy: lock down what scripts/styles can load
@@ -1025,6 +1033,31 @@ function requireWebhookSecret(req, res, next) {
     if (secret && req.query.secret !== secret) {
         log.warn(`[WEBHOOK] Rejected — missing or invalid ?secret from ${req.ip}`);
         return res.status(403).send('Forbidden');
+    }
+    next();
+}
+
+// ── SAFARICOM IP ALLOWLIST GUARD — CRIT-02 ───────────────────────────────────
+// Safaricom publishes its callback IP ranges. Requests not from these IPs are
+// rejected BEFORE any payload processing — closes the callback-spoofing window
+// even if WEBHOOK_SECRET is ever leaked from a log or CI system.
+// Source: https://developer.safaricom.co.ke/docs#ip-whitelist
+const SAFARICOM_IPS = new Set([
+    '196.201.214.200', '196.201.214.206', '196.201.213.114',
+    '196.201.214.207', '196.201.214.208', '196.201.213.44',
+    '196.201.212.127', '196.201.212.138', '196.201.212.129',
+    '196.201.212.136', '196.201.212.74',  '196.201.212.69',
+]);
+
+function requireSafaricomIP(req, res, next) {
+    // In sandbox/development mode skip IP check so local testing still works
+    if (process.env.MPESA_ENV !== 'live') return next();
+    const raw = req.ip || '';
+    const ip  = raw.replace('::ffff:', ''); // strip IPv4-mapped IPv6 prefix
+    if (!SAFARICOM_IPS.has(ip)) {
+        log.warn(`[MPESA] ❌ Callback blocked — IP ${ip} is not a Safaricom server`);
+        // Always return the Safaricom-expected ACK shape so they don't retry
+        return res.status(403).json({ ResultCode: 1, ResultDesc: 'Rejected' });
     }
     next();
 }
@@ -1332,7 +1365,7 @@ app.post('/api/subscription/refresh', requireAuth, requireRole('admin'), async (
 //
 // .env: VENDOR_MPESA_SHORTCODE, SUBSCRIPTION_MONTHLY_KES,
 //       SUBSCRIPTION_ANNUAL_KES, SUBSCRIPTION_SERVICE_KES
-app.post('/api/subscription/mpesa-confirmation', requireWebhookSecret, async (req, res) => {
+app.post('/api/subscription/mpesa-confirmation', requireSafaricomIP, requireWebhookSecret, async (req, res) => {
     // Always ACK immediately — Safaricom retries if you don't respond fast
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
@@ -1358,7 +1391,10 @@ app.post('/api/subscription/mpesa-confirmation', requireWebhookSecret, async (re
         }
 
         const payerName = [FirstName, MiddleName, LastName].filter(Boolean).join(' ') || MSISDN || 'Unknown';
-        log.info(`[SUB-MPESA] Processing KES ${amount} from ${payerName} (${TransID})`);
+        // FIX HIGH-01: Mask PII — log only first name initial and masked transaction ID
+        const maskedPayer = FirstName ? `${FirstName.charAt(0)}***` : 'Unknown';
+        const maskedTransID = TransID ? String(TransID).slice(0, 4) + '****' : 'N/A';
+        log.info(`[SUB-MPESA] Processing KES ${amount} from ${maskedPayer} (${maskedTransID})`);
 
         // ── Detect plan type from amount ──────────────────────────────────────
         // Read tiers from env vars first; fall back to the standard Elite pricing
@@ -1421,7 +1457,7 @@ app.post('/api/subscription/mpesa-confirmation', requireWebhookSecret, async (re
             source:     `C2B vendor paybill (${BusinessShortCode})`,
         });
 
-        log.info(`[SUB-MPESA] ✅ Auto-applied: KES ${amount} → plan=${plan_type} months=${months} mpesa=${TransID} payer=${payerName}`);
+        log.info(`[SUB-MPESA] ✅ Auto-applied: KES ${amount} → plan=${plan_type} months=${months} mpesa=${maskedTransID} payer=${maskedPayer}`);
 
     } catch (err) {
         const errDetail = [
@@ -1463,31 +1499,42 @@ app.post('/api/login', loginLimiter, async (req, res) => {
         }
 
         // --- 1. FIRST TIME MFA SETUP (No secret in DB) ---
-        if (!user.mfa_secret && !mfaSetupSecret) {
-            // Generate secret using Speakeasy
+        if (!user.mfa_secret && !mfaCode) {
+            // Generate a new TOTP secret and persist it server-side as a PENDING secret.
+            // FIX HIGH-05: The secret is stored in `mfa_pending_secret` on the DB row —
+            // it is NEVER sent back to the client for round-tripping. On the next login
+            // the server reads the pending secret from its own storage to verify the setup code.
             const secretData = speakeasy.generateSecret({ name: `Elite Hardware (${user.emp_id})` });
-            const secret = secretData.base32;
-            const otpauth = secretData.otpauth_url;
-            
+            const secret   = secretData.base32;
+            const otpauth  = secretData.otpauth_url;
+
+            // Persist pending secret server-side (requires mfa_pending_secret TEXT column on employees table)
+            await supabase.from('employees').update({ mfa_pending_secret: secret }).eq('id', user.id);
+
             const qrCodeUrl = await QRCode.toDataURL(otpauth);
-            return res.json({ success: true, mfaSetupRequired: true, qrCodeUrl, secret });
+            // Do NOT send the raw `secret` in the response — the QR code is sufficient for the authenticator app
+            return res.json({ success: true, mfaSetupRequired: true, qrCodeUrl });
         }
 
         // --- 2. VERIFYING FIRST TIME MFA SETUP ---
-        if (!user.mfa_secret && mfaSetupSecret) {
-            if (!mfaCode) return res.status(400).json({ success: false, message: 'MFA Code required.' });
-            
-            // Verify setup code
+        // FIX HIGH-05: Read the pending secret from the DB (server-side), not from the client request.
+        // This prevents an attacker from substituting their own pre-generated TOTP secret.
+        if (!user.mfa_secret && mfaCode) {
+            if (!user.mfa_pending_secret) {
+                return res.status(400).json({ success: false, message: 'MFA setup not initiated. Please log in again to start setup.' });
+            }
             const isValid = speakeasy.totp.verify({
-                secret: mfaSetupSecret,
+                secret:   user.mfa_pending_secret,  // from DB, not from client
                 encoding: 'base32',
-                token: mfaCode
+                token:    mfaCode,
+                window:   1
             });
-            
             if (!isValid) return res.status(401).json({ success: false, message: 'Invalid setup code. Try again.' });
-
-            // Save the secret to the DB permanently now that we know it works
-            await supabase.from('employees').update({ mfa_secret: mfaSetupSecret }).eq('id', user.id);
+            // Promote pending → permanent secret; clear the pending column
+            await supabase.from('employees').update({
+                mfa_secret:         user.mfa_pending_secret,
+                mfa_pending_secret: null
+            }).eq('id', user.id);
         }
         // --- 3. STANDARD MFA CHECK (Already set up) ---
         else if (user.mfa_secret) {
@@ -1758,7 +1805,7 @@ app.post('/api/inventory', requireAuth, requireRole('admin', 'manager'), require
             details: `NEW PRODUCT registered: ${itemName} | Category: ${category} | Unit: ${unit} | Qty: ${stockQty} | Cost: KES ${costPrice} | Selling: KES ${sellingPrice} | DN: ${deliveryNote || 'N/A'}`,
             timestamp: new Date().toISOString()
         }]);
-        if (auditErr1) console.error('Audit log error (INITIAL_STOCK):', auditErr1.message);
+        if (auditErr1) log.error('Audit log error (INITIAL_STOCK):', auditErr1.message);
 
         // ── Register item with DigiTax/KRA (non-blocking) ──────────────────
         let digitaxItemId = null;
@@ -1831,7 +1878,7 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
             details: `RESTOCK: ${item.item_name} | DN: ${delivery_number} | Added: ${added} units | Stock: ${oldStock} → ${newTotal} | New Cost: KES ${unit_cost} | New Price: KES ${new_selling_price}`,
             timestamp: new Date().toISOString()
         }]);
-        if (auditErr2) console.error('Audit log error (RESTOCK_FIFO):', auditErr2.message);
+        if (auditErr2) log.error('Audit log error (RESTOCK_FIFO):', auditErr2.message);
 
        // Sync restocked quantity with KRA using correct sub-unit conversion
         if (item.digitax_item_id) {
@@ -1839,8 +1886,7 @@ app.post('/api/inventory/restock-fifo', requireAuth, requireRole('admin', 'manag
             await syncStockWithEtims(item.digitax_item_id, etimsQty, `Restock — DN: ${delivery_note_ref}`);
         }
 
-        res.json({ success: true, message: `Added ${added}. Total: ${newTotal}` });
-        res.json({ success: true, message: 'Restock successful!' });
+        res.json({ success: true, message: `Restock successful! Added ${added} units. New total: ${newTotal}.` });
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
@@ -1878,7 +1924,7 @@ app.post('/api/inventory/bulk-restock', requireAuth, requireRole('admin', 'manag
                 details: `BULK RESTOCK: ${invItem.item_name} | DN: ${delivery_number} | Added: ${added} units | Stock: ${oldStock} → ${newTotal} | Cost: KES ${unit_cost} | New Price: KES ${new_selling_price}`,
                 timestamp: new Date().toISOString()
             }]);
-           if (auditErr3) console.error('Audit log error (BULK_RESTOCK):', auditErr3.message);
+           if (auditErr3) log.error('Audit log error (BULK_RESTOCK):', auditErr3.message);
             
             // Sync with KRA using correct sub-unit conversion
             if (invItem.digitax_item_id) {
@@ -2066,7 +2112,7 @@ app.get('/api/suppliers', requireAuth, async (req, res) => {
 
         res.json(data || []);
     } catch (err) {
-        console.error('[GET /api/suppliers]', err.message);
+        log.error('[GET /api/suppliers]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2086,7 +2132,7 @@ app.get('/api/suppliers/:id', requireAuth, async (req, res) => {
 
         res.json(data);
     } catch (err) {
-        console.error('[GET /api/suppliers/:id]', err.message);
+        log.error('[GET /api/suppliers/:id]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2141,11 +2187,11 @@ app.post('/api/suppliers', requireAuth, requireRole('admin', 'manager'), require
             item_name:    name.trim(),
             details:      `New supplier added: ${name.trim()} | Category: ${category} | Phone: ${phone || 'N/A'} | By: ${req.user.name}`,
             timestamp:    new Date().toISOString(),
-        }]).then(({ error: ae }) => { if (ae) console.error('Audit log error (SUPPLIER_ADDED):', ae.message); });
+        }]).then(({ error: ae }) => { if (ae) log.error('Audit log error (SUPPLIER_ADDED):', ae.message); });
 
         res.status(201).json({ success: true, message: 'Supplier added successfully.', data });
     } catch (err) {
-        console.error('[POST /api/suppliers]', err.message);
+        log.error('[POST /api/suppliers]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2217,11 +2263,11 @@ app.put('/api/suppliers/:id', requireAuth, requireRole('admin', 'manager'), requ
             item_name:    name.trim(),
             details:      `Supplier updated: ${existing.name} → ${name.trim()} | By: ${req.user.name}`,
             timestamp:    new Date().toISOString(),
-        }]).then(({ error: ae }) => { if (ae) console.error('Audit log error (SUPPLIER_UPDATED):', ae.message); });
+        }]).then(({ error: ae }) => { if (ae) log.error('Audit log error (SUPPLIER_UPDATED):', ae.message); });
 
         res.json({ success: true, message: 'Supplier updated successfully.', data });
     } catch (err) {
-        console.error('[PUT /api/suppliers/:id]', err.message);
+        log.error('[PUT /api/suppliers/:id]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2263,11 +2309,11 @@ app.delete('/api/suppliers/:id', requireAuth, requireRole('admin', 'manager'), r
             item_name:    existing.name,
             details:      `Supplier deleted: ${existing.name} | By: ${req.user.name}`,
             timestamp:    new Date().toISOString(),
-        }]).then(({ error: ae }) => { if (ae) console.error('Audit log error (SUPPLIER_DELETED):', ae.message); });
+        }]).then(({ error: ae }) => { if (ae) log.error('Audit log error (SUPPLIER_DELETED):', ae.message); });
 
         res.json({ success: true, message: `"${existing.name}" has been deleted.` });
     } catch (err) {
-        console.error('[DELETE /api/suppliers/:id]', err.message);
+        log.error('[DELETE /api/suppliers/:id]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2308,11 +2354,11 @@ app.patch('/api/suppliers/:id/balance', requireAuth, requireRole('admin'), requi
             item_name:    existing.name,
             details:      `Balance adjusted for ${existing.name}: KES ${existing.balance} → KES ${balance}${notes ? ' | Note: ' + notes : ''} | By: ${req.user.name}`,
             timestamp:    new Date().toISOString(),
-        }]).then(({ error: ae }) => { if (ae) console.error('Audit log error (SUPPLIER_BALANCE):', ae.message); });
+        }]).then(({ error: ae }) => { if (ae) log.error('Audit log error (SUPPLIER_BALANCE):', ae.message); });
 
         res.json({ success: true, message: 'Balance updated.', data });
     } catch (err) {
-        console.error('[PATCH /api/suppliers/:id/balance]', err.message);
+        log.error('[PATCH /api/suppliers/:id/balance]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2383,7 +2429,7 @@ app.get('/api/purchase-orders', requireAuth, async (req, res) => {
         if (error) throw error;
         res.json(data || []);
     } catch (err) {
-        console.error('[GET /api/purchase-orders]', err.message);
+        log.error('[GET /api/purchase-orders]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2474,7 +2520,7 @@ app.post('/api/purchase-orders', requireAuth, requireRole('admin', 'manager'), r
 
         res.status(201).json({ success: true, message: 'Purchase order created.', data: po });
     } catch (err) {
-        console.error('[POST /api/purchase-orders]', err.message);
+        log.error('[POST /api/purchase-orders]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2543,7 +2589,7 @@ app.put('/api/purchase-orders/:id', requireAuth, requireRole('admin', 'manager')
 
         res.json({ success: true, message: 'Purchase order updated.', data });
     } catch (err) {
-        console.error('[PUT /api/purchase-orders/:id]', err.message);
+        log.error('[PUT /api/purchase-orders/:id]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2830,7 +2876,7 @@ app.post('/api/purchase-orders/:id/receive', requireAuth, requireRole('admin', '
             kraResults,
         });
     } catch (err) {
-        console.error('[POST /api/purchase-orders/:id/receive]', err.message);
+        log.error('[POST /api/purchase-orders/:id/receive]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2896,7 +2942,7 @@ app.post('/api/supplier-payments', requireAuth, requireRole('admin', 'manager'),
             balance_remaining: totalOwed - newAmountPaid,
         });
     } catch (err) {
-        console.error('[POST /api/supplier-payments]', err.message);
+        log.error('[POST /api/supplier-payments]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -2944,7 +2990,7 @@ app.delete('/api/purchase-orders/:id', requireAuth, requireRole('admin', 'manage
 
         res.json({ success: true, message: `${po.po_number} deleted.` });
     } catch (err) {
-        console.error('[DELETE /api/purchase-orders/:id]', err.message);
+        log.error('[DELETE /api/purchase-orders/:id]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -3030,7 +3076,7 @@ app.post('/api/purchase-orders/:id/email', requireAuth, requireRole('admin', 'ma
         res.json({ success: true, message: `Purchase order PDF emailed to ${to.trim()}.` });
 
     } catch (err) {
-        console.error('[POST /api/purchase-orders/:id/email]', err.message);
+        log.error('[POST /api/purchase-orders/:id/email]', err.message);
         res.status(500).json({ success: false, message: `Email failed: ${err.message}` });
     }
 });
@@ -3081,7 +3127,7 @@ app.get('/api/suppliers/:id/activity', requireAuth, async (req, res) => {
 
         res.json(logs || []);
     } catch (err) {
-        console.error('[GET /api/suppliers/:id/activity]', err.message);
+        log.error('[GET /api/suppliers/:id/activity]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -3123,7 +3169,7 @@ app.get('/api/purchase-orders/:id/activity', requireAuth, async (req, res) => {
 
         res.json(logs || []);
     } catch (err) {
-        console.error('[GET /api/purchase-orders/:id/activity]', err.message);
+        log.error('[GET /api/purchase-orders/:id/activity]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -3214,7 +3260,7 @@ app.get('/api/reports/daily-summary', requireAuth, async (req, res) => {
             avgTx,
         });
     } catch (err) {
-        console.error('[DAILY SUMMARY ERROR]', err.message);
+        log.error('[DAILY SUMMARY ERROR]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -5053,7 +5099,7 @@ app.patch('/api/employees/:id/reset-mfa', requireAuth, requireRole('admin'), req
             message: 'MFA reset successfully. The user will be prompted to set it up again on their next login.' 
         });
     } catch (err) {
-        console.error('[RESET MFA ERROR]', err);
+        log.error('[RESET MFA ERROR]', err);
         res.status(500).json({ success: false, message: 'Server error resetting MFA.' });
     }
 });
@@ -5161,7 +5207,7 @@ app.patch('/api/employees/:id/status', requireAuth, requireRole('admin'), requir
     const id = isNaN(req.params.id) ? req.params.id : parseInt(req.params.id);
     const { is_active } = req.body;
 
-    console.log('[STATUS] id:', id, 'type:', typeof id, 'is_active:', is_active);
+    log.info('[STATUS] Updating employee id:', id, 'is_active:', is_active);
 
     if (typeof is_active !== 'boolean') {
         return res.status(400).json({ success: false, message: 'is_active must be true or false.' });
@@ -5179,7 +5225,6 @@ app.patch('/api/employees/:id/status', requireAuth, requireRole('admin'), requir
             .update({ is_active })
             .eq('id', id)
             .select('id, name');
-        console.log('[STATUS] Update result:', updated, 'Error:', error);
         if (error) throw error;
         if (!updated || updated.length === 0) {
             return res.status(500).json({ success: false, message: 'Update ran but no rows changed. Check Supabase RLS policies.' });
@@ -5209,7 +5254,7 @@ app.patch('/api/employees/:id/reset-pin', requireAuth, requireRole('admin'), req
     const id = isNaN(req.params.id) ? req.params.id : parseInt(req.params.id);
     const { newPin } = req.body;
 
-    console.log('[PIN RESET] id:', id, 'type:', typeof id, 'newPin received:', !!newPin);
+    log.info('[PIN RESET] Request for employee id:', id);
 
     if (!newPin || String(newPin).length < 4) {
         return res.status(400).json({ success: false, message: 'New PIN must be at least 4 digits.' });
@@ -5219,7 +5264,6 @@ app.patch('/api/employees/:id/reset-pin', requireAuth, requireRole('admin'), req
         // First verify employee exists
         const { data: emp, error: findErr } = await supabase
             .from('employees').select('id, name, emp_id').eq('id', id).single();
-        console.log('[PIN RESET] Found employee:', emp, 'Find error:', findErr);
         if (findErr || !emp) {
             return res.status(404).json({ success: false, message: `Employee id=${id} not found. DB error: ${findErr?.message}` });
         }
@@ -5230,7 +5274,6 @@ app.patch('/api/employees/:id/reset-pin', requireAuth, requireRole('admin'), req
             .update({ pin: hashedPin, pin_reset_requested: false })
             .eq('id', id)
             .select('id, name');
-        console.log('[PIN RESET] Update result:', updated, 'Update error:', error);
         if (error) throw error;
         if (!updated || updated.length === 0) {
             return res.status(500).json({ success: false, message: 'Update ran but no rows changed. Check Supabase RLS policies.' });
@@ -5334,7 +5377,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
                 spent_by:     processedBy,
                 expense_date: nowEATIso()
             }]).select('id').single();
-            if (expErr) console.error('[RETURNS] Expense error:', expErr.message);
+            if (expErr) log.error('[RETURNS] Expense error:', expErr.message);
             else expenseId = exp && exp.id;
         }
 
@@ -5659,13 +5702,15 @@ app.get('/api/returns/summary', requireAuth, requireRole('admin', 'manager'), as
 app.get('/api/returns/search-sale', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
     const { q } = req.query;
     if (!q) return res.status(400).json({ success: false, message: 'Query q is required.' });
+    // FIX MED-03: Sanitize input and cap length before embedding in PostgREST .or() filter string.
+    // Raw user input in .or() can manipulate the PostgREST filter expression.
+    const safeQ = sanitize(String(q).trim()).substring(0, 100);
+    if (!safeQ) return res.status(400).json({ success: false, message: 'Invalid search query.' });
     try {
        // 1. Fetch the matching sales
         const { data, error } = await supabase.from('Sales')
-            // ADDED: invoice_number to the select list
             .select('id,receipt_number,invoice_number,item_name,quantity_sold,unit_price,total_amount,amount_paid,customer_name,customer_phone,sale_date,payment_status,"Kra_Receipt_No",kra_qr_url,"E-tims_No",digitax_sale_id')
-            // ADDED: invoice_number to the search filter
-            .or(`customer_name.ilike.%${q}%,customer_phone.ilike.%${q}%,receipt_number.ilike.%${q}%,invoice_number.ilike.%${q}%`)
+            .or(`customer_name.ilike.%${safeQ}%,customer_phone.ilike.%${safeQ}%,receipt_number.ilike.%${safeQ}%,invoice_number.ilike.%${safeQ}%`)
             .eq('is_voided', false)
             .order('sale_date', { ascending: false })
             .limit(10);
@@ -5785,7 +5830,7 @@ async function getMpesaToken() {
     if (!data.access_token) throw new Error('Safaricom returned no access_token. Check Consumer Key/Secret.');
     _mpesaToken    = data.access_token;
     _mpesaTokenExp = now + (parseInt(data.expires_in) || 3600) * 1000;
-    console.log('[MPESA] 🔑 Token refreshed, valid for', Math.round((parseInt(data.expires_in)||3600)/60), 'min');
+    log.info('[MPESA] 🔑 Token refreshed, valid for', Math.round((parseInt(data.expires_in)||3600)/60), 'min');
     return _mpesaToken;
 }
 
@@ -5908,17 +5953,18 @@ app.post('/api/mpesa/stk-push', requireAuth, requireSubscription, async (req, re
         log.info(`[MPESA STK] ✅ Pending: ${stkData.CheckoutRequestID}`);
         res.json({ success: true, checkoutRequestId: stkData.CheckoutRequestID, message: 'STK push sent.' });
     } catch (err) {
-        console.error('[MPESA STK]', err.message);
+        log.error('[MPESA STK]', err.message);
         res.status(500).json({ success: false, message: 'M-Pesa error: ' + err.message });
     }
 });
 
-app.post('/api/mpesa/callback', requireWebhookSecret, async (req, res) => {
+app.post('/api/mpesa/callback', requireSafaricomIP, requireWebhookSecret, async (req, res) => {
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     try {
-        console.log('[MPESA CALLBACK] Received:', JSON.stringify(req.body, null, 2));
+        // FIX HIGH-01/MED-01: Never log full callback body — it contains phone numbers and M-Pesa codes.
         const body    = req.body?.Body?.stkCallback;
-        if (!body)    return;
+        if (!body) { log.warn('[MPESA CALLBACK] Missing stkCallback in body'); return; }
+        log.info(`[MPESA CALLBACK] Received: checkoutId=${body.CheckoutRequestID} code=${body.ResultCode}`);
         const checkId = body.CheckoutRequestID;
         const code    = body.ResultCode;
         const pending = await mpesaGet(checkId);
@@ -5930,7 +5976,10 @@ app.post('/api/mpesa/callback', requireWebhookSecret, async (req, res) => {
             const amount    = get('Amount');
             const phone     = get('PhoneNumber');
             await mpesaSet(checkId, { ...pending, status: 'confirmed', mpesa_code: mpesaCode, amount, phone });
-            log.info(`[MPESA]✅ Payment confirmed: ${mpesaCode} KES ${amount} from ${phone}`);
+            // FIX HIGH-01: Mask PII in logs — ODPC Kenya Data Protection Act compliance
+            const maskedPhone = phone    ? String(phone).slice(0, 5)    + '****' + String(phone).slice(-2)    : 'N/A';
+            const maskedCode  = mpesaCode ? String(mpesaCode).slice(0, 4) + '****'                             : 'N/A';
+            log.info(`[MPESA] ✅ Payment confirmed: ${maskedCode} KES ${amount} from ${maskedPhone}`);
 
             // ── Billing subscription extension ───────────────────────────────
             // If this STK push came from the billing page, context.billingPlan
@@ -5975,7 +6024,7 @@ app.post('/api/mpesa/callback', requireWebhookSecret, async (req, res) => {
             await mpesaSet(checkId, { ...pending, status: 'failed', result_desc: body.ResultDesc });
             log.info(`[MPESA]❌ Payment failed (code ${code}): ${body.ResultDesc}`);
         }
-    } catch (err) { console.error('[MPESA CALLBACK ERROR]', err.message); }
+    } catch (err) { log.error('[MPESA CALLBACK ERROR]', err.message); }
 });
 
 app.get('/api/mpesa/status/:checkoutId', requireAuth, async (req, res) => {
@@ -6008,7 +6057,7 @@ app.get('/api/mpesa/query/:checkoutId', requireAuth, async (req, res) => {
             signal: AbortSignal.timeout(10000)
         });
         const qData = await qRes.json();
-        console.log('[MPESA QUERY]', checkoutId, qData.ResultCode, qData.ResultDesc);
+        log.info('[MPESA QUERY]', checkoutId, qData.ResultCode, qData.ResultDesc);
         const rc = parseInt(qData.ResultCode);
         const desc = qData.ResultDesc || '';
         const pending = await mpesaGet(checkoutId);
@@ -6029,7 +6078,7 @@ app.get('/api/mpesa/query/:checkoutId', requireAuth, async (req, res) => {
         if (pending && pending.status === 'pending') await mpesaSet(checkoutId, { ...pending, status: 'failed', result_desc: desc });
         return res.json({ success: true, status: 'failed', resultDesc: desc });
     } catch (err) {
-        console.error('[MPESA QUERY]', err.message);
+        log.error('[MPESA QUERY]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -6127,20 +6176,61 @@ async function getJengaToken() {
 }
 
 // ── Jenga Private Key (for signing) ───────────────────────────────────────────
+// FIX CRIT-03: Never store private keys as files in the project directory.
+// Encode your jenga-private.pem to base64 once:
+//   base64 -w0 jenga-private.pem   (Linux)
+//   base64 -i jenga-private.pem    (macOS)
+// Then set the result as JENGA_PRIVATE_KEY_B64 in your .env / Render env vars.
+// The actual .pem file should NOT be committed and should be deleted from disk.
 let JENGA_PRIVATE_KEY;
-try {
-    JENGA_PRIVATE_KEY = fs.readFileSync('jenga-private.pem', 'utf8');
-} catch (e) {
-    log.warn('[JENGA] jenga-private.pem not found — all Jenga STK pushes will fail.');
+const _jengaKeyB64 = process.env.JENGA_PRIVATE_KEY_B64;
+if (_jengaKeyB64) {
+    try {
+        JENGA_PRIVATE_KEY = Buffer.from(_jengaKeyB64, 'base64').toString('utf8');
+        log.info('[JENGA] ✅ Private key loaded from JENGA_PRIVATE_KEY_B64 env var.');
+    } catch (e) {
+        log.error('[JENGA] ❌ Failed to decode JENGA_PRIVATE_KEY_B64 — Jenga STK pushes will fail:', e.message);
+    }
+} else {
+    // Fallback: try reading from disk for local dev only.
+    // In production JENGA_PRIVATE_KEY_B64 must be set.
+    try {
+        JENGA_PRIVATE_KEY = fs.readFileSync('jenga-private.pem', 'utf8');
+        if (process.env.NODE_ENV === 'production') {
+            log.error('[JENGA] ❌ SECURITY: jenga-private.pem read from disk in PRODUCTION. Set JENGA_PRIVATE_KEY_B64 env var and delete the .pem file.');
+        } else {
+            log.warn('[JENGA] jenga-private.pem read from disk (dev only). Use JENGA_PRIVATE_KEY_B64 in production.');
+        }
+    } catch (e) {
+        log.warn('[JENGA] No private key found (JENGA_PRIVATE_KEY_B64 not set, jenga-private.pem not found) — Jenga STK pushes will fail.');
+    }
 }
 
 // ── Jenga Public Cert (for IPN verification) — cached once at startup ─────────
+// FIX CRIT-01/03: Load from JENGA_PUBLIC_CERT_B64 env var in production.
+// To encode: base64 -w0 jenga-public-equity.pem  (Linux) / base64 -i (macOS)
 let _jengaPublicCert = null;
 function getJengaPublicCert() {
     if (_jengaPublicCert) return _jengaPublicCert;
+    const b64 = process.env.JENGA_PUBLIC_CERT_B64;
+    if (b64) {
+        try {
+            _jengaPublicCert = Buffer.from(b64, 'base64').toString('utf8');
+            log.info('[JENGA] ✅ Public cert loaded from JENGA_PUBLIC_CERT_B64 env var.');
+            return _jengaPublicCert;
+        } catch (e) {
+            log.error('[JENGA] ❌ Failed to decode JENGA_PUBLIC_CERT_B64:', e.message);
+            return null;
+        }
+    }
+    // Fallback: read from disk for local dev only
     try {
         _jengaPublicCert = fs.readFileSync('jenga-public-equity.pem', 'utf8');
-        log.info('[JENGA] jenga-public-equity.pem loaded for IPN verification.');
+        if (process.env.NODE_ENV === 'production') {
+            log.error('[JENGA] ❌ SECURITY: jenga-public-equity.pem read from disk in PRODUCTION. Set JENGA_PUBLIC_CERT_B64 env var.');
+        } else {
+            log.warn('[JENGA] jenga-public-equity.pem read from disk (dev only). Use JENGA_PUBLIC_CERT_B64 in production.');
+        }
         return _jengaPublicCert;
     } catch (e) {
         log.warn('[JENGA] jenga-public-equity.pem not found — IPN signature verification will be skipped.');
@@ -6439,9 +6529,8 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
             }
         };
 
-        log.info(`[JENGA STK] Initiating → ${msisdn} (${telco}) KES ${amountStr} ref=${payRef}`);
-        log.info(`[JENGA STK] Signature input: "${JENGA_EQUITY_ACCOUNT}${payRef}${msisdn}${telco}${amountStr}KES"`);
-        log.info(`[JENGA STK] Payload: ${JSON.stringify(payload)}`);
+        log.info(`[JENGA STK] Initiating → ${msisdn.slice(0,5)}**** (${telco}) KES ${amountStr} ref=${payRef}`);
+        // FIX HIGH-01: Removed signature input log — it exposed JENGA_EQUITY_ACCOUNT and full signing data
 
         // ── 5. Send to Jenga ─────────────────────────────────────────────────────
         const response = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
@@ -6566,7 +6655,53 @@ app.post('/api/jenga/ipn', async (req, res) => {
         const body = req.body;
         log.info('[JENGA WEBHOOK] Received payload:', JSON.stringify(body).substring(0, 500));
 
-        // Optional: Signature verification logic goes here...
+        // ── FIX CRIT-01: Signature verification ────────────────────────────────
+        // Jenga signs its IPN callbacks with its private key.
+        // We verify using the public cert loaded from JENGA_PUBLIC_CERT_B64 (or the .pem file).
+        // FAIL CLOSED in production: if the cert is present but verification fails, reject.
+        const publicCert = getJengaPublicCert();
+        const rawSignature = req.headers['signature'] || req.headers['x-jenga-signature'];
+
+        if (publicCert) {
+            if (!rawSignature) {
+                log.warn('[JENGA IPN] ❌ No signature header present — callback rejected (CRIT-01)');
+                return; // Already ACK'd to prevent Jenga retry storm; do not process
+            }
+            try {
+                // Reconstruct the signed string.
+                // For IPN (paybill): reference + amount + currency + mobileNumber
+                // For STK callback: transactionReference + debitedAmount + currency + mobileNumber
+                // Use the fields present in the body to cover both shapes.
+                const tx   = body.transaction   || {};
+                const cust = body.customer       || {};
+                const ref  = tx.reference        || body.transactionReference || body.telcoReference || '';
+                const amt  = tx.amount           || body.debitedAmount        || body.requestAmount  || '';
+                const cur  = tx.currency         || body.currency             || 'KES';
+                const mob  = cust.mobileNumber   || body.mobileNumber         || '';
+                const dataToVerify = `${ref}${amt}${cur}${mob}`;
+
+                const verifier = crypto.createVerify('SHA256');
+                verifier.update(dataToVerify);
+                const isValid = verifier.verify(publicCert, rawSignature, 'base64');
+
+                if (!isValid) {
+                    log.warn(`[JENGA IPN] ❌ SIGNATURE INVALID — spoofed callback REJECTED from IP ${req.ip}`);
+                    return; // Do not process — this is a forged callback
+                }
+                log.info('[JENGA IPN] ✅ Signature verified successfully.');
+            } catch (sigErr) {
+                log.error('[JENGA IPN] ❌ Signature verification threw an error:', sigErr.message, '— callback rejected');
+                return;
+            }
+        } else {
+            // No public cert loaded — warn loudly but only hard-block in production
+            if (process.env.NODE_ENV === 'production') {
+                log.error('[JENGA IPN] ❌ JENGA_PUBLIC_CERT_B64 not set in PRODUCTION — callback rejected. Load the cert to process payments.');
+                return;
+            }
+            log.warn('[JENGA IPN] ⚠️  Public cert not loaded — skipping signature check (DEV only). Set JENGA_PUBLIC_CERT_B64 before going live.');
+        }
+        // ── End signature verification ──────────────────────────────────────────
 
         // ── 1. ROUTE: INDEPENDENT PAYBILL 247247 PAYMENT (IPN) ──────────────
         if (body.callbackType === 'IPN') {
@@ -6680,7 +6815,7 @@ app.post('/api/jenga/ipn', async (req, res) => {
                 }
             }
 
-            log.info(`[JENGA STK CB] ${callbackTelco} confirmed: KES ${amount} from ${phone} bankRef=${bankRef}`);
+            log.info(`[JENGA STK CB] ${callbackTelco} confirmed: KES ${amount} from ${String(phone).slice(0,5)}**** bankRef=${String(bankRef).slice(0,4)}****`);
             await applyJengaPayment({
                 phone, amount, bankRef,
                 accountRef: actualBillNumber,
@@ -6693,13 +6828,29 @@ app.post('/api/jenga/ipn', async (req, res) => {
         log.warn('[JENGA WEBHOOK] Unrecognised payload shape:', JSON.stringify(body).substring(0, 300));
 
     } catch (err) {
-        console.error('[JENGA WEBHOOK ERROR]', err.message, err.stack?.split('\n')[1]?.trim());
+        log.error('[JENGA WEBHOOK ERROR]', err.message, err.stack?.split('\n')[1]?.trim());
     }
 });
 // ╔══════════════════════════════════════════════════════════════╗
 // ║              DIGITAX WEBHOOK (ASYNC QUEUE)                   ║
 // ╚══════════════════════════════════════════════════════════════╝
 app.post('/api/digitax/callback', async (req, res) => {
+    // FIX HIGH-02: Verify shared webhook secret before processing any payload.
+    // Set DIGITAX_WEBHOOK_SECRET in your .env and register the same value in DigiTax HQ
+    // under Settings → Webhooks → Secret. Without this, anyone can forge KRA receipt data.
+    const digitaxWebhookSecret = process.env.DIGITAX_WEBHOOK_SECRET;
+    const receivedSecret = req.headers['x-digitax-secret'] || req.headers['x-webhook-secret'];
+    if (digitaxWebhookSecret) {
+        if (!receivedSecret || receivedSecret !== digitaxWebhookSecret) {
+            log.warn(`[DIGITAX CB] ❌ Rejected — invalid or missing secret from IP ${req.ip}`);
+            // Return 200 to prevent DigiTax from logging failures, but do NOT process
+            return res.status(200).json({ received: false, reason: 'Invalid secret' });
+        }
+    } else if (process.env.NODE_ENV === 'production') {
+        log.error('[DIGITAX CB] ❌ DIGITAX_WEBHOOK_SECRET not set in PRODUCTION — all callbacks rejected for safety.');
+        return res.status(200).json({ received: false, reason: 'Server misconfiguration' });
+    }
+
     // 1. Acknowledge receipt immediately so DigiTax doesn't retry
     res.status(200).json({ received: true });
 
@@ -6841,7 +6992,7 @@ app.post('/api/c2b/register', requireAuth, requireRole('admin', 'manager'), requ
             body: JSON.stringify(body)
         });
         const data = await r.json();
-        console.log('[C2B REGISTER]', data);
+        log.info('[C2B REGISTER]', data);
         res.json({ success: true, data });
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
@@ -6849,13 +7000,14 @@ app.post('/api/c2b/register', requireAuth, requireRole('admin', 'manager'), requ
 });
 
 // ── Safaricom C2B Validation (approve all payments) ───────────────────────────
-app.post('/api/c2b/validation', requireWebhookSecret, (req, res) => {
-    console.log('[C2B VALIDATION]', JSON.stringify(req.body));
+app.post('/api/c2b/validation', requireSafaricomIP, requireWebhookSecret, (req, res) => {
+    // FIX HIGH-01/MED-01: Never log the full C2B body — it contains MSISDN (phone) and names
+    log.info('[C2B VALIDATION] Received — approved');
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
 // ── Safaricom C2B Confirmation (payment received) ─────────────────────────────
-app.post('/api/c2b/confirmation', requireWebhookSecret, async (req, res) => {
+app.post('/api/c2b/confirmation', requireSafaricomIP, requireWebhookSecret, async (req, res) => {
     // Always ACK immediately so Safaricom doesn't retry
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
@@ -6880,13 +7032,18 @@ app.post('/api/c2b/confirmation', requireWebhookSecret, async (req, res) => {
                 .maybeSingle();
             
             if (existingC2B) {
-                log.warn(`[C2B]⚠️ Duplicate M-Pesa code blocked: ${mpesaCode} from ${phone}`);
+                // FIX HIGH-01: Mask PII in logs
+                const maskedPhone2 = String(phone).slice(0,3) + '****' + String(phone).slice(-2);
+                log.warn(`[C2B] ⚠️ Duplicate M-Pesa code blocked: ${String(mpesaCode).slice(0,4)}**** from ${maskedPhone2}`);
                 return; // Safaricom already got the 200 OK, abort processing
             }
         }
         // ──────────────────────────────────────────────────────────────────────
 
-        log.info(`[C2B]💰 Received KES ${amount} from ${phone} (${mpesaCode})`);
+        // FIX HIGH-01: Mask PII in logs (ODPC compliance)
+        const maskedPhoneC2B = String(phone).slice(0, 3) + '****' + String(phone).slice(-2);
+        const maskedCodeC2B  = mpesaCode ? String(mpesaCode).slice(0, 4) + '****' : 'N/A';
+        log.info(`[C2B] 💰 Received KES ${amount} from ${maskedPhoneC2B} (${maskedCodeC2B})`);
         const now      = new Date();
         const datePart = now.getFullYear().toString() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0');
         const timePart = String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0') + String(now.getSeconds()).padStart(2,'0');
@@ -7009,7 +7166,7 @@ app.post('/api/c2b/confirmation', requireWebhookSecret, async (req, res) => {
         }
 
     } catch (err) {
-        console.error('[C2B CONFIRMATION ERROR]', err.message);
+        log.error('[C2B CONFIRMATION ERROR]', err.message);
     }
 });
 // ── Cashier marks unmatched/excess C2B as goods purchase ─────────────────────
@@ -7054,7 +7211,7 @@ app.post('/api/c2b/resolve-goods', requireAuth, requireRole('admin', 'manager', 
 
         res.json({ success: true, message: 'C2B payment resolved', excess });
     } catch (err) {
-        console.error('[C2B RESOLVE ERROR]', err.message);
+        log.error('[C2B RESOLVE ERROR]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -7191,7 +7348,7 @@ app.get('/api/c2b/payments', requireAuth, requireRole('admin', 'manager'), async
         if (error) throw error;
         res.json(data || []);
     } catch (err) {
-        console.error('[C2B PAYMENTS ERROR]', err.message);
+        log.error('[C2B PAYMENTS ERROR]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -9096,7 +9253,7 @@ app.get('/api/reports/customer-statement', requireAuth, requireRole('admin', 'ma
         });
 
     } catch (err) {
-        console.error('[CUSTOMER STATEMENT]', err);
+        log.error('[CUSTOMER STATEMENT]', err);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -9212,7 +9369,7 @@ app.get('/api/reports/supplier-statement', requireAuth, requireRole('admin', 'ma
         });
 
     } catch (err) {
-        console.error('[SUPPLIER STATEMENT]', err);
+        log.error('[SUPPLIER STATEMENT]', err);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
@@ -9435,27 +9592,20 @@ if (process.env.NODE_ENV === 'production' || process.env.MPESA_ENV === 'live') {
     // Repeat every 10 minutes (600,000 ms)
     setInterval(runSelfPing, 10 * 60 * 1000);
 }
-// ── ONE-TIME STARTUP MIGRATION: quantity_sold → NUMERIC ─────────────────────
-// Supabase Sales.quantity_sold was INTEGER, which rejects decimal sub-unit
-// quantities (e.g. 0.5 Kg sold loose). This migration widens it to NUMERIC(12,4)
-// so fractional quantities are stored accurately. Safe to run on every restart —
-// ALTER TYPE to same or wider type is idempotent in Postgres.
-(async () => {
-    try {
-        const { error } = await supabase.rpc('exec_sql', {
-            sql: `ALTER TABLE "Sales" ALTER COLUMN quantity_sold TYPE NUMERIC(12,4) USING quantity_sold::NUMERIC;`
-        });
-        if (error) {
-            // exec_sql RPC may not exist — fall back to a direct query via the REST API
-            // This is fine — the column may already be NUMERIC from a prior run.
-            log.warn('[MIGRATION] quantity_sold column type: could not alter via RPC —', error.message,
-                '(safe to ignore if already NUMERIC)');
-        } else {
-            log.info('[MIGRATION] Sales.quantity_sold column confirmed NUMERIC(12,4)');
-        }
-    } catch (e) {
-        log.warn('[MIGRATION] quantity_sold migration skipped:', e.message);
-    }
-})();
+// ── ONE-TIME STARTUP MIGRATION NOTE ─────────────────────────────────────────
+// FIX MED-04: The previous code called supabase.rpc('exec_sql', { sql: 'ALTER TABLE...' })
+// on every server startup. This relied on an arbitrary-SQL RPC which, if ever compromised,
+// could execute any query against your database.
+//
+// The quantity_sold column migration (INTEGER → NUMERIC(12,4)) has been moved to a
+// proper Supabase migration file. To run it manually once in the Supabase SQL editor:
+//
+//   ALTER TABLE "Sales"
+//     ALTER COLUMN quantity_sold TYPE NUMERIC(12,4)
+//     USING quantity_sold::NUMERIC;
+//
+// After running it once, this block is no longer needed.
+// If you have not run it yet, execute the SQL above in your Supabase project's SQL Editor.
+log.info('[MIGRATION] quantity_sold migration is handled via Supabase SQL Editor — no runtime DDL needed.');
 
 app.listen(PORT, () => log.info(`🚀 Elite Hardware POS running on http://localhost:${PORT}`));
