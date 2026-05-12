@@ -6274,13 +6274,7 @@ async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerN
     const timePart = String(now.getHours()).padStart(2, '0')
                    + String(now.getMinutes()).padStart(2, '0')
                    + String(now.getSeconds()).padStart(2, '0');
-    // payMethod is what gets written to the payments and debt_payments tables.
-    // Equitel STK → 'Equitel'  (customer paid via Equitel prompt)
-    // Safaricom STK via Equity → 'M-Pesa STK'  (customer paid via M-Pesa STK prompt routed through Equity)
-    // Equity Paybill IPN → 'Equity Paybill'  (customer paid manually to the Equity paybill)
-    const payMethod = channel === 'Equitel STK'            ? 'Equitel'
-                    : channel === 'Safaricom STK via Equity' ? 'M-Pesa STK'
-                    : 'Equity Paybill';
+    const payMethod = channel === 'Equitel STK' ? 'Equitel' : 'Equity Paybill';
     const suffix    = channel === 'Equitel STK' ? 'EQT' : 'EQ';
     const processor = 'JENGA-AUTO';
 
@@ -6397,21 +6391,47 @@ async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerN
         }
 
         // ── Genuinely unmatched ───────────────────────────────────────────────
-        // All guards passed — this is a real walk-in customer paying via paybill
-        // without an open sale. Cashier resolves via Remote M-Pesa Payments panel.
-        await supabase.from('c2b_payments').insert([{
-            phone,
-            amount,
-            mpesa_code:     bankRef,
-            account_ref:    accountRef,
-            customer_name:  customerName,
-            status:         'unmatched',
-            amount_applied: 0,
-            amount_excess:  amount,
-            payment_source: channel,   // e.g. 'Safaricom STK via Equity', 'Equitel STK', 'Equitel Paybill', 'M-Pesa Paybill'
-            created_at:     now.toISOString()
-        }]);
-        log.info(`[JENGA ${channel}] ⚠️ Genuinely unmatched: KES ${amount} from ${phone} (bankRef=${bankRef}) — stored for cashier to resolve.`);
+        // All guards passed — no matching sale or debt found.
+        //
+        // Routing:
+        //   Safaricom/Equitel STK via Equity → jenga_stk_payments table
+        //     These are POS-initiated pushes. They belong in their own table,
+        //     completely separate from Remote Payments (c2b_payments).
+        //     The cashier resolves them via the Equity STK panel.
+        //
+        //   Equitel/M-Pesa Paybill IPN → c2b_payments table (existing behaviour)
+        //     These are walk-in customers paying manually to the paybill number.
+        //     The cashier resolves them via the Remote Payments panel.
+        const isSTK = channel === 'Safaricom STK via Equity' || channel === 'Equitel STK';
+        if (isSTK) {
+            await supabase.from('jenga_stk_payments').insert([{
+                phone,
+                amount,
+                bank_ref:      bankRef,
+                account_ref:   accountRef,
+                customer_name: customerName,
+                channel,
+                status:        'unmatched',
+                amount_applied: 0,
+                amount_excess:  amount,
+                created_at:    now.toISOString()
+            }]);
+            log.info(`[JENGA ${channel}] ⚠️ Unmatched STK: KES ${amount} from ${phone} — stored in jenga_stk_payments for cashier.`);
+        } else {
+            // Paybill IPN — goes to c2b_payments as before
+            await supabase.from('c2b_payments').insert([{
+                phone,
+                amount,
+                mpesa_code:     bankRef,
+                account_ref:    accountRef,
+                customer_name:  customerName,
+                status:         'unmatched',
+                amount_applied: 0,
+                amount_excess:  amount,
+                created_at:     now.toISOString()
+            }]);
+            log.info(`[JENGA ${channel}] ⚠️ Unmatched paybill IPN: KES ${amount} from ${phone} — stored in c2b_payments.`);
+        }
         return;
     }
 
@@ -6501,21 +6521,40 @@ async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerN
     // 'excess' = money left over after all debts cleared → cashier links it as goods purchase
     // 'debt_cleared' = all debt settled exactly or fully
     const finalStatus = remaining > 0 ? 'excess' : 'debt_cleared';
+    const isSTKChannel = channel === 'Safaricom STK via Equity' || channel === 'Equitel STK';
 
-    await supabase.from('c2b_payments').insert([{
-        phone,
-        amount,
-        mpesa_code:     bankRef,
-        account_ref:    accountRef,
-        customer_name:  activeDebts[0]?.customer_name || customerName,
-        status:         finalStatus,
-        amount_applied: totalApplied,
-        amount_excess:  remaining,
-        receipt_number: payRef,
-        receipt_data:   receiptDataJson,
-        payment_source: channel,   // 'Safaricom STK via Equity' | 'Equitel STK' | 'Equitel Paybill' | 'M-Pesa Paybill'
-        created_at:     now.toISOString()
-    }]);
+    if (isSTKChannel) {
+        // Jenga STK push — write to jenga_stk_payments, never to c2b_payments
+        await supabase.from('jenga_stk_payments').insert([{
+            phone,
+            amount,
+            bank_ref:       bankRef,
+            account_ref:    accountRef,
+            customer_name:  activeDebts[0]?.customer_name || customerName,
+            channel,
+            status:         finalStatus,
+            amount_applied: totalApplied,
+            amount_excess:  remaining,
+            receipt_number: payRef,
+            receipt_data:   receiptDataJson,
+            created_at:     now.toISOString()
+        }]);
+    } else {
+        // Paybill IPN (Equity Paybill / M-Pesa Paybill) — write to c2b_payments as before
+        await supabase.from('c2b_payments').insert([{
+            phone,
+            amount,
+            mpesa_code:     bankRef,
+            account_ref:    accountRef,
+            customer_name:  activeDebts[0]?.customer_name || customerName,
+            status:         finalStatus,
+            amount_applied: totalApplied,
+            amount_excess:  remaining,
+            receipt_number: payRef,
+            receipt_data:   receiptDataJson,
+            created_at:     now.toISOString()
+        }]);
+    }
 
     if (remaining > 0) {
         log.info(`[JENGA ${channel}] ℹ️ KES ${remaining} excess after debts — cashier can link as goods purchase`);
@@ -8160,8 +8199,14 @@ app.get('/api/accounting/reconcile', requireAuth, requireRole('admin','manager')
     const toISO     = toDate   ? `${toDate}T23:59:59.999+03:00`   : null;
 
     try {
-        // Pull from c2b_payments table (your existing M-Pesa C2B log)
-        let q = supabase.from('c2b_payments').select('*').order('created_at', { ascending: false });
+        // Pull from c2b_payments table — Safaricom C2B paybill only.
+        // Jenga STK payments are completely separate and never appear here.
+        // Exclude any historical Jenga STK rows that may have been written before this fix
+        // by filtering out rows where customer_name ends in 'Customer' AND channel is STK-shaped.
+        let q = supabase.from('c2b_payments')
+            .select('*')
+            .not('customer_name', 'in', '("Safaricom Customer","Equitel Customer")')
+            .order('created_at', { ascending: false });
         if (fromISO) q = q.gte('created_at', fromISO).lte('created_at', toISO);
         if (filter && filter !== 'all') q = q.eq('status', filter);
 
@@ -8191,17 +8236,16 @@ app.get('/api/accounting/reconcile', requireAuth, requireRole('admin','manager')
         // Combine and shape for frontend
         const transactions = [
             ...(c2bTxns||[]).map(t => ({
-                id:             t.id,
-                customer_name:  t.customer_name,
-                phone:          t.phone,
-                mpesa_code:     t.mpesa_code,
-                account_ref:    t.account_ref,
-                amount:         t.amount,
-                amount_excess:  t.amount_excess || 0,
-                status:         t.status,
-                created_at:     t.created_at,
-                payment_source: t.payment_source || null,  // e.g. 'Safaricom STK via Equity', 'M-Pesa Paybill'
-                source:         t.payment_source?.includes('STK') ? 'JENGA_STK' : 'C2B'
+                id:           t.id,
+                customer_name: t.customer_name,
+                phone:        t.phone,
+                mpesa_code:   t.mpesa_code,
+                account_ref:  t.account_ref,
+                amount:       t.amount,
+                amount_excess: t.amount_excess || 0,
+                status:       t.status,
+                created_at:   t.created_at,
+                source:       'C2B'
             })),
             ...(stkPayments||[]).map(p => ({
                 id:           p.id,
@@ -8228,6 +8272,32 @@ app.get('/api/accounting/reconcile', requireAuth, requireRole('admin','manager')
     } catch (err) {
         log.error('[Reconcile]', err.message);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
+// ── GET Jenga STK Payments (Equity Mobile — completely separate from Remote/C2B) ─
+// Returns entries from jenga_stk_payments table only.
+// These are POS-initiated Safaricom/Equitel STK pushes routed through Equity Bank.
+// They are NEVER mixed with c2b_payments (Remote M-Pesa Payments panel).
+app.get('/api/jenga/stk-payments', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    const { date, from, to, filter } = req.query;
+    const fromDate = from || date || null;
+    const toDate   = to   || date || null;
+    const fromISO  = fromDate ? `${fromDate}T00:00:00.000+03:00` : null;
+    const toISO    = toDate   ? `${toDate}T23:59:59.999+03:00`   : null;
+    try {
+        let q = supabase.from('jenga_stk_payments')
+            .select('*')
+            .order('created_at', { ascending: false });
+        if (fromISO) q = q.gte('created_at', fromISO).lte('created_at', toISO);
+        if (filter && filter !== 'all') q = q.eq('status', filter);
+        const { data, error } = await q;
+        if (error) throw error;
+        const unmatchedCount = (data||[]).filter(t => ['unmatched','excess'].includes(t.status)).length;
+        res.json({ success: true, transactions: data || [], unmatched_count: unmatchedCount });
+    } catch (err) {
+        log.error('[JENGA STK PAYMENTS]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
