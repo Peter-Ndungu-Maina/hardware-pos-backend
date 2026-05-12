@@ -140,8 +140,10 @@ const DIGITAX_CALLBACK_URL = process.env.DIGITAX_CALLBACK_URL || 'https://uninfi
 async function submitSaleToEtims(saleData) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — QR will use fallback placeholder'); return null; }
     try {
-        const now         = nowEAT();
-       const saleDate = new Date().toISOString().split('T')[0];
+        const now      = nowEAT();
+        // FIX CRIT-02: was new Date().toISOString() (UTC) — after 9 PM EAT this files under
+        // tomorrow's date with KRA. nowEATIso() gives the correct EAT wall-clock date.
+        const saleDate = nowEATIso().split('T')[0];
         const payMap   = { 'Cash':'01', 'M-Pesa':'06', 'Credit':'02' };
 
         // Numeric invoice number generation
@@ -245,9 +247,10 @@ async function submitSaleToEtims(saleData) {
             const unitPrice   = parseFloat(saleData.unitPrice) || 0;
             const quantity    = parseFloat(saleData.quantity)  || 1;
             const totalAmount = parseFloat((unitPrice * quantity).toFixed(2));
-           const barCode = (item.barcode && String(item.barcode).trim() !== '') 
-    ? String(item.barcode).trim() 
-    : String(item.itemName.split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)).padStart(8, '0');
+           // FIX CRIT-01: was referencing undefined `item`; correct scope is `saleData`
+           const barCode = (saleData.barcode && String(saleData.barcode).trim() !== '')
+    ? String(saleData.barcode).trim()
+    : String((saleData.itemName || 'ITEM').split('').reduce((a, c) => Math.abs(a + c.charCodeAt(0)), 0)).padStart(8, '0');
             
             payloadItems = [{
                 item_name:             saleData.itemName,
@@ -741,7 +744,9 @@ app.use(helmet({
             
             // SECURITY UPDATE: Removed 'unsafe-eval' and 'cdn.tailwindcss.com'
             // This strictly blocks arbitrary string execution (eval, new Function)
-            scriptSrc:      ["'self'", "'unsafe-inline'", "cdnjs.cloudflare.com", "unpkg.com"],
+            // FIX: removed 'unsafe-inline' — it defeats XSS protection entirely.
+            // Move any remaining inline <script> blocks to external files under /src/.
+            scriptSrc:      ["'self'", "cdnjs.cloudflare.com", "unpkg.com"],
             
             // Allows inline event handlers (onclick=, onkeydown=) which your HTML relies on
             scriptSrcAttr:  ["'unsafe-hashes'", "'unsafe-inline'"],
@@ -1037,7 +1042,14 @@ function requireRole(...roles) {
 // arbitrary IPs since Safaricom does not sign its webhook bodies.
 function requireWebhookSecret(req, res, next) {
     const secret = process.env.WEBHOOK_SECRET;
-    if (secret && req.query.secret !== secret) {
+    // FIX: old guard was "if (secret && …)" — when WEBHOOK_SECRET is unset the condition
+    // is never entered and every request passes unconditionally (fail-open).
+    // Correct behaviour: fail CLOSED when the env var is missing.
+    if (!secret) {
+        log.error('[WEBHOOK] WEBHOOK_SECRET is not set — rejecting callback to prevent spoofed payments. Set WEBHOOK_SECRET in .env');
+        return res.status(403).send('Forbidden');
+    }
+    if (req.query.secret !== secret) {
         log.warn(`[WEBHOOK] Rejected — missing or invalid ?secret from ${req.ip}`);
         return res.status(403).send('Forbidden');
     }
@@ -6325,7 +6337,9 @@ async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerN
     if (activeDebts.length === 0) {
     if (bankRef) {
         // NEW: Check if this was an STK push initiated from the POS interface
-        const pendingRow = await mpesaGet(bankRef) || await mpesaGet(primaryRef);
+        // FIX CRIT-03: primaryRef is not in scope here (only computed later in the STK branch).
+        // Guard 1 should only look up by bankRef — which IS available at this point.
+        const pendingRow = await mpesaGet(bankRef);
         
         if (pendingRow && pendingRow.status === 'pending') {
             // This is a legit sale in progress! 
@@ -6804,16 +6818,22 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
 
         if (publicCert) {
             if (!rawSignature) {
-                // 🛑 THE FIX: Hard-block missing signatures in production!
+                // FIX: Jenga only signs C2B Paybill IPNs (callbackType === 'IPN').
+                // STK Push callbacks intentionally omit the signature — they are verified
+                // instead by matching transactionReference against our internal pending cache.
+                // Hard-blocking ALL unsigned callbacks was rejecting legitimate STK payments.
                 if (process.env.NODE_ENV === 'production') {
-                    log.error(`[JENGA IPN] ❌ CRITICAL: Missing signature in PRODUCTION. Spoofed callback REJECTED from IP ${req.ip}`);
-                    return; // EXIT HERE! Do not process the fake payment.
+                    if (body.callbackType === 'IPN') {
+                        log.error(`[JENGA IPN] ❌ CRITICAL: Missing signature on C2B IPN in PRODUCTION. Spoofed callback REJECTED from IP ${req.ip}`);
+                        return; // Block unsigned C2B paybill callbacks
+                    }
+                    // STK callbacks are unsigned by design — allow but log clearly
+                    log.warn(`[JENGA IPN] No signature on STK callback (expected) — proceeding via transactionReference matching. IP: ${req.ip}`);
+                } else {
+                    log.warn('[JENGA IPN] No signature header found (CRIT-01). Header names received: '
+                        + Object.keys(req.headers).join(', '));
+                    log.warn('[JENGA IPN] Sandbox/UAT detected — processing WITHOUT signature verification.');
                 }
-
-                // If we reach here, we are NOT in production, so it's safe to allow testing
-                log.warn('[JENGA IPN] No signature header found (CRIT-01). Header names received: '
-                    + Object.keys(req.headers).join(', '));
-                log.warn('[JENGA IPN] Sandbox/UAT detected — processing WITHOUT signature verification.');
             } else {
                 // ── Signature header present — verify it ─────────────────────────────
      
@@ -6846,12 +6866,22 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
                 }
             }
         } else {
-            // No public cert loaded — warn loudly but only hard-block in production
-            if (process.env.NODE_ENV === 'production') {
-                log.error('[JENGA IPN] ❌ JENGA_PUBLIC_CERT_B64 not set in PRODUCTION — callback rejected. Load the cert to process payments.');
+            // ── No public cert loaded ──────────────────────────────────────────────
+            // Jenga only signs C2B Paybill IPNs (callbackType === 'IPN').
+            // STK Push callbacks are intentionally unsigned — they are verified
+            // by matching transactionReference against our internal pending cache.
+            //
+            // Decision matrix:
+            //   cert missing + callbackType=IPN  → BLOCK (unsigned paybill = spoofable)
+            //   cert missing + STK body          → ALLOW (no signature expected from Jenga)
+            //   cert missing + unknown body      → ALLOW with warning (fail open for unknown shapes)
+            if (body.callbackType === 'IPN') {
+                // C2B Paybill IPN with no cert — cannot verify, must block
+                log.error('[JENGA IPN] ❌ JENGA_PUBLIC_CERT_B64 not set — unsigned C2B IPN rejected in production. Set the cert to process paybill payments.');
                 return;
             }
-            log.warn('[JENGA IPN] ⚠️  Public cert not loaded — skipping signature check (DEV only). Set JENGA_PUBLIC_CERT_B64 before going live.');
+            // STK callback (body.telco or body.transactionReference present) — cert not needed
+            log.warn('[JENGA IPN] ⚠️  No public cert loaded. STK callback allowed — will be verified via transactionReference matching.');
         }
         // ── End signature verification ──────────────────────────────────────────
 
@@ -6976,7 +7006,13 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
 
             const phone        = String(body.mobileNumber || '').replace(/^(?:\+?254)/, '0');
             const amount       = Math.round(parseFloat(body.debitedAmount || body.requestAmount || 0));
-            const bankRef = body.telcoReference || body.transactionReference || null;
+            // FIX CRIT-04: telcoReference is the customer-visible bank/telco ref (shown on their statement).
+            // transactionReference is Jenga's internal ID — valid for dedup but NOT for customer reconciliation.
+            // We track which was used via _bankRefSource so cashiers know what to search for.
+            const telcoRef  = body.telcoReference || null;
+            const bankRef   = telcoRef || body.transactionReference || null;
+            const _bankRefSource = telcoRef ? 'telcoReference' : (body.transactionReference ? 'transactionReference_fallback' : null);
+            if (!telcoRef) log.warn(`[JENGA STK CB] telcoReference absent — using transactionReference as bankRef. Source: ${_bankRefSource}`);
             const channel      = callbackTelco === 'Equitel' ? 'Equitel STK' : 'Safaricom STK via Equity';
 
             if (!amount || amount <= 0 || !bankRef) return;
@@ -9630,6 +9666,10 @@ app.get('/api/sales-orders/:id', requireAuth, async (req, res) => {
 });
 
 // ── POST Create Sales Order (Quote) ───────────────────────────────────────────
+// FIX SEC-01: Frontend previously supplied unit_price directly — a malicious cashier
+// could set any item to KES 1. The backend now fetches authoritative prices from the
+// Inventory table and applies the same tier logic as /api/sell/cart.
+// Frontend must send: inventory_id, qty_ordered, sell_unit, price_tier. unit_price is ignored.
 app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res) => {
     const { customerName, customerPhone, validUntil, notes, items } = req.body;
     if (!customerName) return res.status(400).json({ success: false, message: 'Customer name required.' });
@@ -9639,9 +9679,62 @@ app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res)
         const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, '');
         const timePart = Date.now().toString().slice(-4);
         const so_number = `SO-${datePart}-${timePart}`;
-        const total_amount = items.reduce((s, i) => s + (parseFloat(i.qty_ordered) * parseFloat(i.unit_price)), 0);
 
-        // 1. Insert Order
+        // ── 1. Resolve server-side price for every line item ──────────────────
+        const resolvedLines = [];
+        for (const i of items) {
+            if (!i.inventory_id) return res.status(400).json({ success: false, message: 'Each item must include inventory_id.' });
+            const qty = parseFloat(i.qty_ordered);
+            if (!qty || qty <= 0) return res.status(400).json({ success: false, message: 'qty_ordered must be > 0.' });
+
+            const { data: inv, error: invErr } = await supabase
+                .from('Inventory')
+                .select('item_name, price, fundi_price, wholesale_price, wholesale_min_qty, sub_unit, sub_unit_qty, sub_unit_price, bulk_unit, unit')
+                .eq('id', i.inventory_id)
+                .single();
+            if (invErr || !inv) return res.status(400).json({ success: false, message: `Item ${i.inventory_id} not found in inventory.` });
+
+            const sellUnit = (i.sell_unit || 'bulk').toLowerCase();
+            const tier     = (i.price_tier || 'retail').toLowerCase();
+
+            // ── Identical tier logic to /api/sell/cart ────────────────────────
+            const cartonRetail = parseFloat(inv.price) || 0;
+            const fundiPct     = (cartonRetail > 0 && inv.fundi_price)
+                ? (1 - parseFloat(inv.fundi_price)     / cartonRetail) : null;
+            const wholesalePct = (cartonRetail > 0 && inv.wholesale_price)
+                ? (1 - parseFloat(inv.wholesale_price) / cartonRetail) : null;
+            const wsQty        = parseInt(inv.wholesale_min_qty) || 0;
+            const wsAutoApplies = sellUnit !== 'sub'
+                && tier === 'retail' && wsQty >= 2 && qty >= wsQty && inv.wholesale_price;
+
+            let price = cartonRetail;
+            if (sellUnit === 'sub' && inv.sub_unit_price) {
+                const looseRetail = parseFloat(inv.sub_unit_price);
+                if      (tier === 'fundi'     && fundiPct     !== null) price = parseFloat((looseRetail * (1 - fundiPct)).toFixed(2));
+                else if (tier === 'wholesale' && wholesalePct !== null) price = parseFloat((looseRetail * (1 - wholesalePct)).toFixed(2));
+                else                                                    price = looseRetail;
+            } else if (tier === 'fundi'     && inv.fundi_price)     { price = parseFloat(inv.fundi_price); }
+            else if (tier === 'wholesale'   && inv.wholesale_price)  { price = parseFloat(inv.wholesale_price); }
+            else if (wsAutoApplies)                                   { price = parseFloat(inv.wholesale_price); }
+
+            const displayUnit = (sellUnit === 'sub' && inv.sub_unit)
+                ? inv.sub_unit : (inv.bulk_unit || inv.unit || 'PCS');
+
+            resolvedLines.push({
+                inventory_id: i.inventory_id,
+                item_name:    inv.item_name,                          // from DB — never from client
+                qty_ordered:  parseFloat(qty.toFixed(4)),
+                unit_price:   price,                                  // from DB tier logic — never from client
+                line_total:   parseFloat((price * qty).toFixed(2)),
+                sell_unit:    sellUnit,
+                price_tier:   tier,
+                display_unit: displayUnit,
+            });
+        }
+
+        const total_amount = parseFloat(resolvedLines.reduce((s, l) => s + l.line_total, 0).toFixed(2));
+
+        // ── 2. Insert Order ───────────────────────────────────────────────────
         const { data: so, error: soErr } = await supabase
             .from('sales_orders')
             .insert([{
@@ -9649,33 +9742,18 @@ app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res)
                 status: 'Quote', order_date: new Date().toISOString().split('T')[0],
                 valid_until: validUntil || null, total_amount, notes, created_by: req.user.name
             }]).select().single();
-        
         if (soErr) throw soErr;
 
-        // 2. Prepare Items
-        const lineItems = items.map(i => ({
-            so_id:        so.id,
-            inventory_id: i.inventory_id,
-            item_name:    i.item_name,
-            qty_ordered:  parseFloat(parseFloat(i.qty_ordered).toFixed(4)),
-            unit_price:   parseFloat(i.unit_price),
-            line_total:   parseFloat(i.qty_ordered) * parseFloat(i.unit_price),
-            sell_unit:    i.sell_unit || 'bulk',
-            price_tier:   i.price_tier || 'retail',
-            display_unit: i.display_unit || null,
-        }));
-
-        // 3. Insert Items WITH ERROR CHECK
-        const { error: itemsErr } = await supabase.from('sales_order_items').insert(lineItems);
-        
-        // If items fail to save, rollback the quote creation!
+        // ── 3. Insert Items ───────────────────────────────────────────────────
+        const { error: itemsErr } = await supabase.from('sales_order_items')
+            .insert(resolvedLines.map(l => ({ ...l, so_id: so.id })));
         if (itemsErr) {
             log.error('[POST Sales Order Items Error]', itemsErr);
             await supabase.from('sales_orders').delete().eq('id', so.id);
             return res.status(500).json({ success: false, message: `Items failed to save: ${itemsErr.message}` });
         }
 
-        // 4. Audit Log
+        // ── 4. Audit Log ──────────────────────────────────────────────────────
         await supabase.from('audit_logs').insert([{
             performed_by: req.user.name, action: 'SO_CREATED', item_name: so_number,
             details: `Quote ${so_number} created for ${customerName}. Total: KES ${total_amount}`,
@@ -9690,7 +9768,8 @@ app.post('/api/sales-orders', requireAuth, requireSubscription, async (req, res)
 });
 
 // ── PUT Update Status (Confirm / Cancel) ──────────────────────────────────────
-app.put('/api/sales-orders/:id/status', requireAuth, requireSubscription, async (req, res) => {
+// FIX SEC-02: Added requireRole — cashiers must not be able to cancel or fulfil quotes unilaterally.
+app.put('/api/sales-orders/:id/status', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
     const { status } = req.body;
     const ALLOWED_STATUSES = ['Quote', 'Confirmed', 'Fulfilled', 'Cancelled'];
     if (!status || !ALLOWED_STATUSES.includes(status)) {
