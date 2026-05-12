@@ -135,7 +135,14 @@ setInterval(() => {
 // ============================================================
 const DIGITAX_BASE_URL = process.env.DIGITAX_BASE_URL || 'https://api.digitax.tech/ke/v2';
 const DIGITAX_API_KEY  = process.env.DIGITAX_API_KEY  || '';
-const DIGITAX_CALLBACK_URL = process.env.DIGITAX_CALLBACK_URL || 'https://uninfiltrated-persistent-jewel.ngrok-free.dev/api/digitax/callback';
+// Build the DigiTax callback URL with the secret token appended as a query param.
+// DigiTax has no header-based auth — the token in the URL IS the authentication.
+// If DIGITAX_WEBHOOK_SECRET is set, it is appended here once so all three call sites
+// (item sync, sale sync, credit note sync) automatically use the secured URL.
+const _digitaxBase = process.env.DIGITAX_CALLBACK_URL || 'https://uninfiltrated-persistent-jewel.ngrok-free.dev/api/digitax/callback';
+const DIGITAX_CALLBACK_URL = process.env.DIGITAX_WEBHOOK_SECRET
+    ? `${_digitaxBase}${_digitaxBase.includes('?') ? '&' : '?'}token=${process.env.DIGITAX_WEBHOOK_SECRET}`
+    : _digitaxBase;
 
 async function submitSaleToEtims(saleData) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — QR will use fallback placeholder'); return null; }
@@ -7047,19 +7054,32 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
 // ║              DIGITAX WEBHOOK (ASYNC QUEUE)                   ║
 // ╚══════════════════════════════════════════════════════════════╝
 app.post('/api/digitax/callback', async (req, res) => {
-    // FIX HIGH-02: Verify shared webhook secret before processing any payload.
-    // Set DIGITAX_WEBHOOK_SECRET in your .env and register the same value in DigiTax HQ
-    // under Settings → Webhooks → Secret. Without this, anyone can forge KRA receipt data.
+    // ── Authentication ────────────────────────────────────────────────────────
+    // DigiTax sends NO authentication headers — their webhook spec has no signing
+    // mechanism (confirmed from their official docs). The correct defence is a
+    // secret token embedded in the callback URL itself, which only DigiTax stores.
+    //
+    // HOW TO SET UP (one-time):
+    //   1. Make sure DIGITAX_WEBHOOK_SECRET is set in your Render env vars.
+    //   2. Update the callback_url you pass to DigiTax on every /items and /sales
+    //      API call to include ?token=YOUR_SECRET, e.g.:
+    //        https://your-backend.onrender.com/api/digitax/callback?token=abc123
+    //      DigiTax stores the full URL and replays it exactly — so the token
+    //      travels back to you in every callback automatically.
+    //   3. Also update DIGITAX_CALLBACK_URL in your .env to include the token:
+    //        DIGITAX_CALLBACK_URL=https://your-backend.onrender.com/api/digitax/callback?token=YOUR_SECRET
+    //
+    // Why this works: an attacker who knows the base URL but not the token cannot
+    // forge callbacks. The token never appears in logs (only in the registered URL).
     const digitaxWebhookSecret = process.env.DIGITAX_WEBHOOK_SECRET;
-    const receivedSecret = req.headers['x-digitax-secret'] || req.headers['x-webhook-secret'];
     if (digitaxWebhookSecret) {
-        if (!receivedSecret || receivedSecret !== digitaxWebhookSecret) {
-            log.warn(`[DIGITAX CB] ❌ Rejected — invalid or missing secret from IP ${req.ip}`);
-            // Return 200 to prevent DigiTax from logging failures, but do NOT process
-            return res.status(200).json({ received: false, reason: 'Invalid secret' });
+        const receivedToken = req.query.token;
+        if (!receivedToken || receivedToken !== digitaxWebhookSecret) {
+            log.warn(`[DIGITAX CB] ❌ Rejected — missing or invalid ?token from IP ${req.ip}`);
+            return res.status(200).json({ received: false, reason: 'Invalid token' });
         }
     } else if (process.env.NODE_ENV === 'production') {
-        log.error('[DIGITAX CB] ❌ DIGITAX_WEBHOOK_SECRET not set in PRODUCTION — all callbacks rejected for safety.');
+        log.error('[DIGITAX CB] ❌ DIGITAX_WEBHOOK_SECRET not set — all callbacks rejected. Set this env var on Render.');
         return res.status(200).json({ received: false, reason: 'Server misconfiguration' });
     }
 
