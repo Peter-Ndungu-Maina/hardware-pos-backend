@@ -6641,10 +6641,13 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
         signer.end();
         const signature = signer.sign(JENGA_PRIVATE_KEY, 'base64');
 
-        // ── 4. Payload ────────────────────────────────────────────────────────────
+       // ── 4. Payload ────────────────────────────────────────────────────────────
+        // Prevent silent hangs if the env var is missing
+        const callbackBase = process.env.JENGA_CALLBACK_URL || 'https://example.com';
+
         const payload = {
             merchant: {
-                accountNumber: JENGA_EQUITY_ACCOUNT,  // Your Equity Bank account number
+                accountNumber: JENGA_EQUITY_ACCOUNT,
                 countryCode:   'KE',
                 name:          JENGA_MERCHANT_NAME
             },
@@ -6652,16 +6655,15 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
                 ref:          payRef,
                 amount:       amountStr,   // string, 2 d.p.
                 currency:     'KES',
-                telco:        telco,       // "Safaricom" or "Equitel" — detected above
+                telco:        telco,       // "Safaricom" or "Equitel"
                 mobileNumber: msisdn,      // 254XXXXXXXXX
                 date:         txDate,
-                callBackUrl:  `${process.env.JENGA_CALLBACK_URL}/api/jenga/ipn`,
-                pushType:     'STK'
+                callBackUrl:  `${callbackBase}/api/jenga/ipn`,
+                pushType:     'USSD'       // Changed from 'STK' to 'USSD' for API stability
             }
         };
 
         log.info(`[JENGA STK] Initiating → ${msisdn.slice(0,5)}**** (${telco}) KES ${amountStr} ref=${payRef}`);
-        // FIX HIGH-01: Removed signature input log — it exposed JENGA_EQUITY_ACCOUNT and full signing data
 
        // ── 5. Send to Jenga ─────────────────────────────────────────────────────
         const response = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
@@ -6669,10 +6671,11 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
             headers: {
                 'Authorization': `Bearer ${token}`,
                 'Signature':     signature,
-                'Content-Type':  'application/json'
+                'Content-Type':  'application/json',
+                'Accept':        'application/json' // Explicitly demand JSON
             },
             body:   JSON.stringify(payload),
-            signal: AbortSignal.timeout(45000) // Increased to 45s for slow Jenga responses
+            signal: AbortSignal.timeout(45000)
         });
 
         const text = await response.text();
