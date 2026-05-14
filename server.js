@@ -6663,7 +6663,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
         log.info(`[JENGA STK] Initiating → ${msisdn.slice(0,5)}**** (${telco}) KES ${amountStr} ref=${payRef}`);
         // FIX HIGH-01: Removed signature input log — it exposed JENGA_EQUITY_ACCOUNT and full signing data
 
-        // ── 5. Send to Jenga ─────────────────────────────────────────────────────
+       // ── 5. Send to Jenga ─────────────────────────────────────────────────────
         const response = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
             method:  'POST',
             headers: {
@@ -6672,7 +6672,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
                 'Content-Type':  'application/json'
             },
             body:   JSON.stringify(payload),
-            signal: AbortSignal.timeout(15000)
+            signal: AbortSignal.timeout(45000) // Increased to 45s for slow Jenga responses
         });
 
         const text = await response.text();
@@ -6702,7 +6702,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
                             'Content-Type':  'application/json'
                         },
                         body:   JSON.stringify(payload),
-                        signal: AbortSignal.timeout(15000)
+                        signal: AbortSignal.timeout(45000) // Increased to 45s
                     });
                     const retryText = await retryResp.text();
                     let retryData;
