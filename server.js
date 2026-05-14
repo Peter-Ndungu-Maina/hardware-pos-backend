@@ -6622,8 +6622,15 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
     // ── 2. Jenga requires amount as a string with 2 decimal places ─────────────
     const amountStr = paymentAmount.toFixed(2);
 
-    // ── 3. Payment reference: 6–12 alphanumeric chars only (Jenga hard limit) ──
-    const payRef = `EQ${Date.now().toString().slice(-10)}`; // e.g. EQ1714900123
+    // ── 3. Payment reference: strict Jenga limits ────────────────────────────
+    // Equitel  → 6–12 alphanumeric chars  (docs: "Allowed length 6 to 12")
+    // Safaricom → max 6 alphanumeric chars (docs: "For now we support up to 6")
+    // Strategy: use last N digits of epoch ms, prefix with one letter.
+    //   Equitel:   E + last 11 digits = 12 chars  ✅
+    //   Safaricom: S + last 5 digits  =  6 chars  ✅
+    const payRef = telco === 'Equitel'
+        ? `E${Date.now().toString().slice(-11)}`   // 12 chars e.g. E71490012345
+        : `S${Date.now().toString().slice(-5)}`;   //  6 chars e.g. S12345
 
     // ── 4. Transaction date (YYYY-MM-DD) ────────────────────────────────────────
     const txDate    = new Date().toISOString().split('T')[0];
@@ -6659,7 +6666,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
                 mobileNumber: msisdn,      // 254XXXXXXXXX
                 date:         txDate,
                 callBackUrl:  `${callbackBase}/api/jenga/ipn`,
-                pushType:     'USSD'       // Changed from 'STK' to 'USSD' for API stability
+                pushType:     'STK'        // STK = customer gets interactive prompt (Equitel STK / Safaricom USSD push)
             }
         };
 
@@ -6773,7 +6780,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
         });
 
     } catch (err) {
-        log.error('[JENGA STK ERROR]', err.message);
+        log.error('[JENGA STK ERROR]', err.message || err);
         return res.status(500).json({ success: false, message: 'Jenga STK error: ' + err.message });
     }
 });
