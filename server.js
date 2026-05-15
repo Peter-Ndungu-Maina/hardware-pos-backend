@@ -6595,116 +6595,50 @@ app.post('/api/jenga/stk-push', requireAuth, requireSubscription, (req, res, nex
 // Funds always settle to JENGA_EQUITY_ACCOUNT regardless of the customer's network.
 // The old /api/jenga/stk-push route now aliases here.
 // ═══════════════════════════════════════════════════════════════════════════════
-app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (req, res) => {
-    if (!JENGA_PRIVATE_KEY)
-        return res.status(503).json({ success: false, message: 'jenga-private.pem not loaded.' });
-    if (!JENGA_EQUITY_ACCOUNT)
-        return res.status(503).json({ success: false, message: 'JENGA_EQUITY_ACCOUNT not set in .env' });
-
-    const { phone, amount, accountRef, customerName = 'Walk-in Customer' } = req.body;
-
-    // ── 1. Normalise to 254XXXXXXXXX (Jenga always wants international format) ──
-    let msisdn = String(phone || '').replace(/\s/g, '');
-    if (msisdn.startsWith('+'))  msisdn = msisdn.slice(1);
-    if (msisdn.startsWith('0'))  msisdn = '254' + msisdn.slice(1);
-
-    if (!/^2547\d{8}$|^2541[0-9]\d{7}$/.test(msisdn))
-        return res.status(400).json({ success: false, message: 'Invalid phone. Use 07XXXXXXXX (Safaricom) or 01XXXXXXXX (Equitel).' });
-
-    // ── 2. Detect network → set correct telco string ─────────────────────────
-    // Jenga is strict: "Safaricom" or "Equitel" (exact casing, no typos)
-    const telco = msisdn.startsWith('2541') ? 'Equitel' : 'Safaricom';
-
-    const paymentAmount = Math.ceil(parseFloat(amount));
-    if (!paymentAmount || paymentAmount < 1)
-        return res.status(400).json({ success: false, message: 'Invalid amount' });
-
-    // ── 2. Jenga requires amount as a string with 2 decimal places ─────────────
-    const amountStr = paymentAmount.toFixed(2);
-
-    // ── 3. Payment reference: strict Jenga limits ────────────────────────────
-    // Equitel  → 6–12 alphanumeric chars  (docs: "Allowed length 6 to 12")
-    // Safaricom → max 6 alphanumeric chars (docs: "For now we support up to 6")
-    // Strategy: use last N digits of epoch ms, prefix with one letter.
-    //   Equitel:   E + last 11 digits = 12 chars  ✅
-    //   Safaricom: S + last 5 digits  =  6 chars  ✅
-    const payRef = telco === 'Equitel'
-        ? `E${Date.now().toString().slice(-11)}`   // 12 chars e.g. E71490012345
-        : `S${Date.now().toString().slice(-5)}`;   //  6 chars e.g. S12345
-
-    // ── 4. Transaction date (YYYY-MM-DD) ────────────────────────────────────────
-    const txDate    = new Date().toISOString().split('T')[0];
-
+// ═══════════════════════════════════════════════════════════════════════════════
+// BACKGROUND WORKER: Jenga STK Push
+// Runs asynchronously so the frontend isn't blocked waiting for Jenga UAT.
+// ═══════════════════════════════════════════════════════════════════════════════
+async function processJengaStkInBackground(payRef, payload, msisdn, telco, paymentAmount, amountStr, accountRef, channelLabel, txDate) {
     try {
-        const token = await getJengaToken();
+        let token = await getJengaToken();
 
-        // ── 3. Signature formula (identical for Safaricom AND Equitel) ───────────
-        // accountNumber + payment.ref + payment.mobileNumber + payment.telco
-        //               + payment.amount + payment.currency
-        // amount MUST be the string "500.00" (2 decimal places) — NOT a number.
+        // ── 3. Signature formula ──
         const dataToSign = `${JENGA_EQUITY_ACCOUNT}${payRef}${msisdn}${telco}${amountStr}KES`;
         const signer     = crypto.createSign('SHA256');
         signer.update(dataToSign);
         signer.end();
         const signature = signer.sign(JENGA_PRIVATE_KEY, 'base64');
 
-       // ── 4. Payload ────────────────────────────────────────────────────────────
-        // Prevent silent hangs if the env var is missing
-        const callbackBase = process.env.JENGA_CALLBACK_URL || 'https://example.com';
+        log.info(`[JENGA STK BG] Initiating → ${msisdn.slice(0,5)}**** (${telco}) KES ${amountStr} ref=${payRef}`);
 
-        const payload = {
-            merchant: {
-                accountNumber: JENGA_EQUITY_ACCOUNT,
-                countryCode:   'KE',
-                name:          JENGA_MERCHANT_NAME
-            },
-            payment: {
-                ref:          payRef,
-                amount:       amountStr,   // string, 2 d.p.
-                currency:     'KES',
-                telco:        telco,       // "Safaricom" or "Equitel"
-                mobileNumber: msisdn,      // 254XXXXXXXXX
-                date:         txDate,
-                callBackUrl:  `${callbackBase}/api/jenga/ipn`,
-                pushType:     'STK'        // STK = customer gets interactive prompt (Equitel STK / Safaricom USSD push)
-            }
-        };
-
-        log.info(`[JENGA STK] Initiating → ${msisdn.slice(0,5)}**** (${telco}) KES ${amountStr} ref=${payRef}`);
-
-       // ── 5. Send to Jenga ─────────────────────────────────────────────────────
-        const response = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
+        // ── 5. Send to Jenga ──
+        let response = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
             method:  'POST',
             headers: {
                 'Authorization': `Bearer ${token}`,
                 'Signature':     signature,
                 'Content-Type':  'application/json',
-                'Accept':        'application/json' // Explicitly demand JSON
+                'Accept':        'application/json'
             },
             body:   JSON.stringify(payload),
-            signal: AbortSignal.timeout(20000)
+            signal: AbortSignal.timeout(60000) // Increased to 60s for slow UAT
         });
 
-        const text = await response.text();
+        let text = await response.text();
         let data;
         try { data = JSON.parse(text); } catch (e) { throw new Error('Non-JSON from Jenga: ' + text.substring(0, 300)); }
 
-       // code -1 = queued successfully. code 106201 / status false = rejected.
         if (!response.ok || data.status === false || data.code === 106201) {
-
-            // ── AUTO-RETRY on expired token ───────────────────────────────────────
-            // Jenga returns 401 when the cached Bearer token has expired server-side.
-            // FIX: clear the cache, fetch a fresh token, and retry ONCE transparently.
-            // NEVER return 401 to the frontend — apiFetch treats any 401 as a user
-            // session logout and redirects to the login page.
+            // ── AUTO-RETRY on expired token ──
             if (response.status === 401 || data.code === 401) {
                 _jengaToken    = null;
                 _jengaTokenExp = 0;
-                log.warn('[JENGA STK] Token expired on Jenga side — clearing cache and retrying once with fresh token...');
+                log.warn('[JENGA STK BG] Token expired on Jenga side — clearing cache and retrying once...');
 
                 try {
-                    const freshToken   = await getJengaToken();
-                    const retryResp    = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
+                    const freshToken = await getJengaToken();
+                    response = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
                         method:  'POST',
                         headers: {
                             'Authorization': `Bearer ${freshToken}`,
@@ -6712,44 +6646,26 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
                             'Content-Type':  'application/json'
                         },
                         body:   JSON.stringify(payload),
-                        signal: AbortSignal.timeout(20000)
+                        signal: AbortSignal.timeout(60000)
                     });
-                    const retryText = await retryResp.text();
-                    let retryData;
-                    try { retryData = JSON.parse(retryText); } catch(e) { throw new Error('Non-JSON on retry: ' + retryText.substring(0,200)); }
-
-                    if (!retryResp.ok || retryData.status === false || retryData.code === 106201) {
-                        log.warn(`[JENGA STK] ❌ Retry also failed HTTP=${retryResp.status}: ${JSON.stringify(retryData)}`);
-                        return res.status(400).json({ success: false, message: retryData.message || 'STK push rejected by Jenga after token refresh', code: retryData.code });
-                    }
-
-                    // Retry succeeded — persist and continue as normal
-                    log.info(`[JENGA STK] ✅ Retry succeeded with fresh token ref=${payRef}`);
-                    const channelLabelR = telco === 'Equitel' ? 'EQUITEL_STK' : 'SAFARICOM_STK_VIA_EQUITY';
-                    await mpesaSet(payRef, {
-                        status:     'pending',
-                        phone:      msisdn,
-                        amount:     paymentAmount,
-                        context:    { accountRef, channel: channelLabelR, transactionId: retryData.transactionId },
-                        created_at: new Date().toISOString()
-                    });
-                    if (retryData.transactionId && retryData.transactionId !== payRef) {
-                        await mpesaSet(retryData.transactionId, { _indexFor: payRef, created_at: new Date().toISOString() });
-                    }
-                    return res.json({ success: true, payRef, transactionId: retryData.transactionId, message: 'STK push sent. Waiting for customer...' });
-
+                    text = await response.text();
+                    try { data = JSON.parse(text); } catch(e) { throw new Error('Non-JSON on retry: ' + text.substring(0,200)); }
                 } catch (retryErr) {
-                    log.error('[JENGA STK] Retry after token refresh failed:', retryErr.message);
-                    return res.status(502).json({ success: false, message: 'Bank connection failed after token refresh. Please try again.' });
+                    throw new Error('Bank connection failed after token refresh: ' + retryErr.message);
                 }
             }
 
-            log.warn(`[JENGA STK] ❌ Rejected (${telco}) HTTP=${response.status} full response: ${JSON.stringify(data)}`);
-            return res.status(400).json({ success: false, message: data.message || 'STK push rejected by Jenga', code: data.code });
+            if (!response.ok || data.status === false || data.code === 106201) {
+                log.warn(`[JENGA STK BG] ❌ Rejected (${telco}) HTTP=${response.status}: ${JSON.stringify(data)}`);
+                await mpesaSet(payRef, { 
+                    status: 'failed', 
+                    result_desc: data.message || 'STK push rejected by Jenga' 
+                });
+                return;
+            }
         }
 
-        // ── 6. Persist under payRef (frontend polls /api/jenga/status/:payRef) ───
-        const channelLabel = telco === 'Equitel' ? 'EQUITEL_STK' : 'SAFARICOM_STK_VIA_EQUITY';
+        // ── 6. Persist under payRef (frontend polls /api/jenga/status/:payRef) ──
         await mpesaSet(payRef, {
             status:     'pending',
             phone:      msisdn,
@@ -6759,11 +6675,9 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
         });
 
         // ── 7. Cross-reference index so IPN can map Jenga's transactionId → payRef ──
-        // Jenga's callback arrives with body.transactionReference = their transactionId,
-        // not our payRef. Without this the IPN can't find the pending row.
         if (data.transactionId && data.transactionId !== payRef) {
             await mpesaSet(data.transactionId, {
-                _indexFor:  payRef,       // the key the frontend polls
+                _indexFor:  payRef,
                 status:     'pending',
                 phone:      msisdn,
                 amount:     paymentAmount,
@@ -6771,38 +6685,107 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
             });
         }
 
-        log.info(`[JENGA STK] ✅ Queued → ${msisdn} (${telco}) payRef=${payRef} jengaTxId=${data.transactionId}`);
+        log.info(`[JENGA STK BG] ✅ Queued successfully → payRef=${payRef} jengaTxId=${data.transactionId}`);
+
+    } catch (err) {
+        const isTimeout  = err.name === 'TimeoutError' || err.code === 'UND_ERR_CONNECT_TIMEOUT' || err.name === 'AbortError' || (err.message || '').toLowerCase().includes('timeout');
+        const isNetwork  = err.name === 'FetchError' || (err.message || '').toLowerCase().includes('fetch failed') || (err.message || '').toLowerCase().includes('econnrefused');
+        
+        let errorMsg = 'Jenga API error: ' + err.message;
+        if (isTimeout) {
+            errorMsg = process.env.JENGA_ENV !== 'live' 
+                ? 'Jenga UAT sandbox is not responding (timeout). Try again.' 
+                : 'Jenga API timed out after 60 seconds.';
+            log.warn(`[JENGA STK BG] ⏱️ Request timed out: ${err.message}`);
+        } else if (isNetwork) {
+            errorMsg = 'Could not reach Jenga API (Network error).';
+            log.error(`[JENGA STK BG] 🌐 Network error: ${err.message}`);
+        } else {
+            log.error('[JENGA STK BG ERROR]', err.message || err);
+        }
+
+        await mpesaSet(payRef, { status: 'failed', result_desc: errorMsg });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNIFIED EQUITY STK PUSH — NON-BLOCKING ROUTE
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (req, res) => {
+    if (!JENGA_PRIVATE_KEY)
+        return res.status(503).json({ success: false, message: 'jenga-private.pem not loaded.' });
+    if (!JENGA_EQUITY_ACCOUNT)
+        return res.status(503).json({ success: false, message: 'JENGA_EQUITY_ACCOUNT not set in .env' });
+
+    const { phone, amount, accountRef, customerName = 'Walk-in Customer' } = req.body;
+
+    // ── 1. Normalise to 254XXXXXXXXX ──
+    let msisdn = String(phone || '').replace(/\s/g, '');
+    if (msisdn.startsWith('+'))  msisdn = msisdn.slice(1);
+    if (msisdn.startsWith('0'))  msisdn = '254' + msisdn.slice(1);
+
+    if (!/^2547\d{8}$|^2541[0-9]\d{7}$/.test(msisdn))
+        return res.status(400).json({ success: false, message: 'Invalid phone. Use 07XXXXXXXX (Safaricom) or 01XXXXXXXX (Equitel).' });
+
+    const telco = msisdn.startsWith('2541') ? 'Equitel' : 'Safaricom';
+    const paymentAmount = Math.ceil(parseFloat(amount));
+    
+    if (!paymentAmount || paymentAmount < 1)
+        return res.status(400).json({ success: false, message: 'Invalid amount' });
+
+    const amountStr = paymentAmount.toFixed(2);
+    const payRef = telco === 'Equitel'
+        ? `E${Date.now().toString().slice(-11)}`
+        : `S${Date.now().toString().slice(-5)}`;
+
+    const txDate = new Date().toISOString().split('T')[0];
+    const callbackBase = process.env.JENGA_CALLBACK_URL || 'https://example.com';
+    const channelLabel = telco === 'Equitel' ? 'EQUITEL_STK' : 'SAFARICOM_STK_VIA_EQUITY';
+
+    const payload = {
+        merchant: {
+            accountNumber: JENGA_EQUITY_ACCOUNT,
+            countryCode:   'KE',
+            name:          JENGA_MERCHANT_NAME
+        },
+        payment: {
+            ref:          payRef,
+            amount:       amountStr,
+            currency:     'KES',
+            telco:        telco,
+            mobileNumber: msisdn,
+            date:         txDate,
+            callBackUrl:  `${callbackBase}/api/jenga/ipn`,
+            pushType:     'STK'
+        }
+    };
+
+    try {
+        // ── 2. Seed the database so polling works immediately ──
+        await mpesaSet(payRef, {
+            status:     'pending',
+            phone:      msisdn,
+            amount:     paymentAmount,
+            context:    { accountRef, channel: channelLabel },
+            created_at: new Date().toISOString()
+        });
+
+        // ── 3. Fire background job (No await!) ──
+        processJengaStkInBackground(payRef, payload, msisdn, telco, paymentAmount, amountStr, accountRef, channelLabel, txDate)
+            .catch(err => log.error(`[JENGA STK BG] Unhandled error: ${err.message}`));
+
+        // ── 4. Respond to frontend immediately ──
+        log.info(`[JENGA STK] HTTP accepted for async processing → ref=${payRef}`);
         return res.json({
             success:           true,
-            message:           `${telco} payment prompt queued for ${msisdn}. Customer will receive an STK push.`,
-            checkoutRequestId: payRef,        // frontend polls /api/jenga/status/:payRef
-            transactionId:     data.transactionId
+            message:           `${telco} payment prompt queued for ${msisdn}. Customer will receive an STK push shortly.`,
+            checkoutRequestId: payRef,
+            transactionId:     null // Will be populated in the background by the worker
         });
 
     } catch (err) {
-        // Classify the error so the frontend shows a meaningful message
-        const isTimeout  = err.name === 'TimeoutError'  || err.code === 'UND_ERR_CONNECT_TIMEOUT'
-                        || err.name === 'AbortError'     || (err.message || '').toLowerCase().includes('timeout');
-        const isNetwork  = err.name === 'FetchError'    || (err.message || '').toLowerCase().includes('fetch failed')
-                        || (err.message || '').toLowerCase().includes('econnrefused')
-                        || (err.message || '').toLowerCase().includes('enotfound');
-        const isSandbox  = process.env.JENGA_ENV !== 'live';
-
-        if (isTimeout) {
-            const hint = isSandbox
-                ? 'Jenga UAT sandbox is not responding (known instability). Try again or switch to live env.'
-                : 'Jenga API timed out. Please try again in a moment.';
-            log.warn(`[JENGA STK] ⏱️ Request timed out after 45s (${isSandbox ? 'UAT sandbox' : 'LIVE'}) — ${err.message}`);
-            return res.status(504).json({ success: false, message: hint, code: 'TIMEOUT' });
-        }
-
-        if (isNetwork) {
-            log.error(`[JENGA STK] 🌐 Network error — ${err.message}`);
-            return res.status(502).json({ success: false, message: 'Could not reach Jenga API. Check your internet connection or try again.', code: 'NETWORK_ERROR' });
-        }
-
-        log.error('[JENGA STK ERROR]', err.message || err);
-        return res.status(500).json({ success: false, message: 'Jenga STK error: ' + err.message });
+        log.error('[JENGA STK INIT ERROR]', err.message || err);
+        return res.status(500).json({ success: false, message: 'Failed to queue Jenga STK error: ' + err.message });
     }
 });
 
