@@ -6682,7 +6682,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
                 'Accept':        'application/json' // Explicitly demand JSON
             },
             body:   JSON.stringify(payload),
-            signal: AbortSignal.timeout(45000)
+            signal: AbortSignal.timeout(20000)
         });
 
         const text = await response.text();
@@ -6712,7 +6712,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
                             'Content-Type':  'application/json'
                         },
                         body:   JSON.stringify(payload),
-                        signal: AbortSignal.timeout(45000) // Increased to 45s
+                        signal: AbortSignal.timeout(20000)
                     });
                     const retryText = await retryResp.text();
                     let retryData;
@@ -6780,6 +6780,27 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
         });
 
     } catch (err) {
+        // Classify the error so the frontend shows a meaningful message
+        const isTimeout  = err.name === 'TimeoutError'  || err.code === 'UND_ERR_CONNECT_TIMEOUT'
+                        || err.name === 'AbortError'     || (err.message || '').toLowerCase().includes('timeout');
+        const isNetwork  = err.name === 'FetchError'    || (err.message || '').toLowerCase().includes('fetch failed')
+                        || (err.message || '').toLowerCase().includes('econnrefused')
+                        || (err.message || '').toLowerCase().includes('enotfound');
+        const isSandbox  = process.env.JENGA_ENV !== 'live';
+
+        if (isTimeout) {
+            const hint = isSandbox
+                ? 'Jenga UAT sandbox is not responding (known instability). Try again or switch to live env.'
+                : 'Jenga API timed out. Please try again in a moment.';
+            log.warn(`[JENGA STK] ⏱️ Request timed out after 45s (${isSandbox ? 'UAT sandbox' : 'LIVE'}) — ${err.message}`);
+            return res.status(504).json({ success: false, message: hint, code: 'TIMEOUT' });
+        }
+
+        if (isNetwork) {
+            log.error(`[JENGA STK] 🌐 Network error — ${err.message}`);
+            return res.status(502).json({ success: false, message: 'Could not reach Jenga API. Check your internet connection or try again.', code: 'NETWORK_ERROR' });
+        }
+
         log.error('[JENGA STK ERROR]', err.message || err);
         return res.status(500).json({ success: false, message: 'Jenga STK error: ' + err.message });
     }
