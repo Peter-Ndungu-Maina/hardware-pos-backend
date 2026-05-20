@@ -6684,7 +6684,8 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
             signal: AbortSignal.timeout(20000)
         });
 
-        const text = await response.text();
+       const text = await response.text();
+        log.info(`[JENGA STK] Raw response HTTP=${response.status} body=${text.substring(0, 500)}`); // ← ADD THIS LINE
         let data;
         try { data = JSON.parse(text); } catch (e) { throw new Error('Non-JSON from Jenga: ' + text.substring(0, 300)); }
 
