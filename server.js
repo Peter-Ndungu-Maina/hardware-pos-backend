@@ -6613,8 +6613,7 @@ app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (
 
     // ── 2. Detect network → set correct telco string ─────────────────────────
     // Jenga is strict: "Safaricom" or "Equitel" (exact casing, no typos)
-    const telco = msisdn.startsWith('2541') ? 'Equitel' : 'Safaricom';
-
+   const telco = (msisdn.startsWith('2541') || msisdn.startsWith('25476')) ? 'Equitel' : 'Safaricom';
     const paymentAmount = Math.ceil(parseFloat(amount));
     if (!paymentAmount || paymentAmount < 1)
         return res.status(400).json({ success: false, message: 'Invalid amount' });
