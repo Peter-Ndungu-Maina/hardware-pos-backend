@@ -150,9 +150,9 @@ setInterval(() => {
 // ============================================================
 //  eTIMS — DigiTax Integration
 // ============================================================
-const DIGITAX_BASE_URL = process.env.DIGITAX_BASE_URL || 'https://api.digitax.tech/ke/v2';
+const DIGITAX_BASE_URL = process.env.DIGITAX_BASE_URL || null;
 const DIGITAX_API_KEY  = process.env.DIGITAX_API_KEY  || '';
-const DIGITAX_CALLBACK_URL = process.env.DIGITAX_CALLBACK_URL || 
+const DIGITAX_CALLBACK_URL = process.env.DIGITAX_CALLBACK_URL || null;
 
 async function submitSaleToEtims(saleData) {
     if (!DIGITAX_API_KEY) { log.warn('[eTIMS] DIGITAX_API_KEY not set — QR will use fallback placeholder'); return null; }
