@@ -13,6 +13,23 @@ const { sanitize, sanitizeQuery, validateBody } = require('./validate');
 const app = express();
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
+
+// ── PII masking — never log raw phone numbers, names, or KRA PINs ─────────────
+function maskPhone(phone) {
+    const s = String(phone || '');
+    if (s.length < 6) return '***';
+    return s.slice(0, 5) + '***' + s.slice(-3);
+}
+function maskName(name) {
+    const s = String(name || '');
+    if (!s) return '***';
+    return s.split(/\s+/).map(p => p[0] + '***').join(' ');
+}
+function maskPin(pin) {
+    const s = String(pin || '');
+    if (!s) return null;
+    return s.slice(0, 1) + '*'.repeat(Math.max(s.length - 2, 3)) + s.slice(-1);
+}
 const crypto = require('crypto'); 
 const fs = require('fs');
 app.set('trust proxy', 1);
@@ -4427,7 +4444,8 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 'kra_qr_url':          etimsResult.kraQrUrl          || null,
                 'E-tims_No':           etimsResult.etimsNo           ?? null,
                 'Control_unit_number': etimsResult.controlUnitNumber || null,
-                digitax_sale_id:       etimsResult.digitaxSaleId     || null
+                digitax_sale_id:       etimsResult.digitaxSaleId     || null,
+                etims_pending:         false
             }).in('id', saleIds);
             
             if (kraUpdateErr) log.warn('[eTIMS] KRA fields update failed (cart)', { error: kraUpdateErr.message, saleIds });
@@ -4435,6 +4453,10 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             if (!kraReceiptNo) kraReceiptNo = etimsResult.kraReceiptNo || null;
             if (!kraQrUrl)     kraQrUrl     = etimsResult.kraQrUrl     || null;
             if (!controlUnitNumber) controlUnitNumber = etimsResult.controlUnitNumber || null;
+        } else {
+            // eTIMS failed — mark sale as pending KRA compliance, queued for background retry
+            await supabase.from('Sales').update({ etims_pending: true }).in('id', saleIds);
+            log.warn('[eTIMS] Sale saved but eTIMS failed — marked etims_pending=true for retry', { saleIds });
         }
 
         if (linkedPhone) {
@@ -4463,7 +4485,8 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
             message: `${saleIds.length} item(s) sold. Total: KES ${cartTotal.toFixed(2)}`,
             receiptNumber, invoiceNumber, dnNumber, saleIds, total: cartTotal,
             kraReceiptNo, kraQrUrl: qrDataString, kraQrDataUrl: qrDataUrl,
-            Control_unit_number: controlUnitNumber
+            Control_unit_number: controlUnitNumber,
+            etimsPending: !etimsResult  // true = receipt is PROVISIONAL, KRA data pending
         });
 
     } catch (err) {
@@ -6291,7 +6314,7 @@ async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerN
         }
     }
 
-    log.info(`[JENGA ${channel}] 💰 KES ${amount} from ${customerName} (${bankRef}) acc="${accountRef}"`);
+    log.info(`[JENGA ${channel}] 💰 KES ${amount} from ${maskName(customerName)} (${bankRef}) acc="${accountRef}"`);
 
     // ── 2. Find matching debts ────────────────────────────────────────────────
     // Strategy A: exact invoice/receipt match on what the customer typed as account number
@@ -6561,7 +6584,7 @@ async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerN
     } else if (newTotalDebt > 0) {
         log.info(`[JENGA ${channel}] ℹ️ Partial: KES ${totalApplied} applied, KES ${newTotalDebt} still owed`);
     } else {
-        log.info(`[JENGA ${channel}] ✅ All debts cleared for ${customerName}`);
+        log.info(`[JENGA ${channel}] ✅ All debts cleared for ${maskName(customerName)}`);
     }
 }
 
@@ -6997,7 +7020,7 @@ app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
                 log.info(`[JENGA IPN] billNumber="${rawAccountRef}" matches JENGA_EQUITY_ACCOUNT — using phone matching only.`);
             }
 
-            log.info(`[JENGA IPN] ${channel} KES ${amount} from ${customerName}. accountRef="${accountRef || '(phone match)'}"`);
+            log.info(`[JENGA IPN] ${channel} KES ${amount} from ${maskName(customerName)}. accountRef="${accountRef || '(phone match)'}"`);
 
             await applyJengaPayment({ phone, amount, bankRef, accountRef, customerName, channel });
             return;
@@ -7247,13 +7270,31 @@ app.post('/api/verify-payment', requireAuth, async (req, res) => {
                 return res.status(403).json({ success: false, message: 'Manager approval required for manual entry.' });
             }
 
-            // Log the bypass for your security audit
-            log.warn(`[MANUAL-PAYMENT] Code ${code} authorized manually by ${req.user.name}`);
-            
+            const { manager_id } = req.body;
+            if (!manager_id) {
+                return res.status(400).json({ success: false, message: 'manager_id is required for manual override. A manager must authorize this entry.' });
+            }
+
+            // Verify the manager_id exists and has manager/admin role
+            const { data: authorizer } = await supabase
+                .from('users')
+                .select('id, name, role')
+                .eq('id', manager_id)
+                .in('role', ['admin', 'manager'])
+                .single();
+
+            if (!authorizer) {
+                return res.status(403).json({ success: false, message: 'Invalid manager_id — authorizing manager not found or insufficient role.' });
+            }
+
+            // Full audit trail: who requested + who authorized
+            log.warn(`[MANUAL-PAYMENT] Code ${code} — requested by ${req.user.name} (${req.user.role}) — authorized by ${authorizer.name} (${authorizer.role}) — IP: ${req.ip}`);
+
             return res.json({ 
                 success: true, 
                 status: 'PENDING_AUDIT', 
-                message: 'Manual entry accepted. Flagged for later reconciliation.' 
+                message: 'Manual entry accepted. Flagged for later reconciliation.',
+                authorizedBy: authorizer.name
             });
         }
 
