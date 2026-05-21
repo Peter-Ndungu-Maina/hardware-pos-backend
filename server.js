@@ -1255,7 +1255,8 @@ const SUB_EXEMPT_PATHS = new Set([
     '/api/verify-session',
     '/api/mpesa/callback',
     '/api/digitax/callback',
-    '/api/intasend/webhook', // public — called by IntaSend servers
+    '/api/intasend/webhook',          // public — called by IntaSend servers
+    '/api/intasend/create-checkout',    // must work even when subscription expired
     '/api/c2b/validation',
     '/api/c2b/confirmation',              // customer→business payments, always pass
     '/api/subscription/mpesa-confirmation', // vendor paybill webhook, always pass
@@ -1384,35 +1385,50 @@ app.post('/api/subscription/refresh', requireAuth, requireRole('admin'), async (
 //  INTASEND PAYMENT INTEGRATION — Billing
 // ============================================================
 //
-//  Two complementary routes:
+//  Three routes:
 //
-//  1. POST /api/intasend/webhook  (public — registered in IntaSend dashboard)
-//     IntaSend calls this on every payment state change. We verify the
-//     CHALLENGE secret, then auto-extend the subscription for COMPLETE events.
-//     .env: INTASEND_CHALLENGE_SECRET (copy from IntaSend dashboard → Webhooks)
+//  1. POST /api/intasend/create-checkout  (authenticated)
+//     Called by billing.html when the user clicks "Pay Now".
+//     Creates a checkout session via IntaSend REST API (server-side,
+//     so secret key never hits the browser) and returns the hosted URL.
+//     The frontend opens that URL to complete payment.
 //
-//  2. POST /api/intasend/confirm  (authenticated — called by billing.html on
-//     the frontend COMPLETE event as a belt-and-suspenders fallback so the
-//     subscription extends even if the webhook hasn't arrived yet).
-//     .env: no extra config needed.
+//  2. POST /api/intasend/webhook  (public — registered in IntaSend dashboard)
+//     IntaSend POSTs here on every state change. Verifies CHALLENGE secret,
+//     then auto-extends the subscription on COMPLETE.
 //
-//  .env additions:
-//    INTASEND_PUBLISHABLE_KEY=ISPubKey_live_...
-//    INTASEND_CHALLENGE_SECRET=<copy from IntaSend dashboard → Webhooks>
+//  3. POST /api/intasend/confirm  (authenticated — belt-and-suspenders)
+//     Called by billing.html after redirect-back on success. Idempotent.
+//
+//  Required .env additions:
+//    INTASEND_PUBLISHABLE_KEY=ISPubKey_test_...   ← sandbox.intasend.com → API Keys
+//    INTASEND_SECRET_KEY=ISSecretKey_test_...     ← sandbox.intasend.com → API Keys
+//    INTASEND_IS_LIVE=false                       ← set true in production
+//    INTASEND_CHALLENGE_SECRET=<your challenge>   ← IntaSend dashboard → Webhooks
+//    APP_BASE_URL=https://your-server.com         ← used as host + redirect_url base
 // ============================================================
 
-const INTASEND_CHALLENGE = process.env.INTASEND_CHALLENGE_SECRET || '';
+const INTASEND_CHALLENGE  = process.env.INTASEND_CHALLENGE_SECRET || '';
+const INTASEND_PUB_KEY    = process.env.INTASEND_PUBLISHABLE_KEY  || '';
+const INTASEND_SECRET_KEY = process.env.INTASEND_SECRET_KEY       || '';
+const INTASEND_IS_LIVE    = process.env.INTASEND_IS_LIVE === 'true';
+const INTASEND_API_BASE   = INTASEND_IS_LIVE
+    ? 'https://payment.intasend.com'
+    : 'https://sandbox.intasend.com';
+const APP_BASE_URL        = (process.env.APP_BASE_URL || '').replace(/\/$/, '');
 
 /**
  * Detect billing plan type from IntaSend api_ref and amount.
- * api_ref is set by billing.html as ELITE_HW_<PLAN_TYPE>.
+ * api_ref is set by /api/intasend/create-checkout as ELITE-<PLAN>.
+ * Uses hyphen separators to satisfy IntaSend's ^[a-zA-Z0-9-_: ]+$ regex.
  */
 function _detectPlanFromIntaSend(api_ref, amountKes) {
     const ref = (api_ref || '').toUpperCase();
-    if (ref.includes('LIFETIME'))       return { plan_type: 'lifetime',       months: null };
-    if (ref.includes('ANNUAL_SERVICE')) return { plan_type: 'annual_service', months: null };
-    if (ref.includes('ANNUAL'))         return { plan_type: 'annual',         months: 12   };
-    if (ref.includes('MONTHLY'))        return { plan_type: 'monthly',        months: 1    };
+    // Match both new hyphen format (ELITE-SLA) and legacy underscore format for safety
+    if (ref.includes('LIFETIME'))                        return { plan_type: 'lifetime',       months: null };
+    if (ref.includes('SLA') || ref.includes('SERVICE'))  return { plan_type: 'annual_service', months: null };
+    if (ref.includes('ANNUAL'))                          return { plan_type: 'annual',         months: 12   };
+    if (ref.includes('MONTHLY'))                         return { plan_type: 'monthly',        months: 1    };
 
     // Fallback: detect by amount (same tolerance as M-Pesa webhook)
     const MONTHLY_KES  = parseFloat(process.env.SUBSCRIPTION_MONTHLY_KES  || 3000);
@@ -1432,7 +1448,100 @@ function _detectPlanFromIntaSend(api_ref, amountKes) {
     return null; // unrecognised — store for manual review
 }
 
-// ── 1. IntaSend Webhook (public — called by IntaSend servers) ─────────────────
+// ── 1. IntaSend Create-Checkout (authenticated — called by billing.html) ──────────
+// POST /api/intasend/create-checkout
+// Body: { plan_type: 'monthly'|'annual'|'lifetime'|'annual_service' }
+//
+// Root-cause fix for "500 from sandbox.intasend.com/api/v1/checkout":
+//   • API key is sent from the server (never the browser) — fixes 401/500 auth errors
+//   • Currency is always KES — USD is NOT in IntaSend’s CurrencyEnum, causing 500
+//   • api_ref uses only [a-zA-Z0-9-_: ] chars (no underscore-only refs like ANNUAL_SERVICE)
+//   • host is set to APP_BASE_URL so IntaSend can validate the merchant origin
+app.post('/api/intasend/create-checkout', requireAuth, requireRole('admin'), async (req, res) => {
+    const { plan_type } = req.body || {};
+    const VALID_PLANS = ['monthly', 'annual', 'lifetime', 'annual_service'];
+
+    if (!VALID_PLANS.includes(plan_type)) {
+        return res.status(400).json({ success: false, message: `Invalid plan_type. Must be one of: ${VALID_PLANS.join(', ')}.` });
+    }
+    if (!INTASEND_PUB_KEY || !INTASEND_SECRET_KEY) {
+        return res.status(503).json({ success: false, message: 'IntaSend API keys not configured. Set INTASEND_PUBLISHABLE_KEY and INTASEND_SECRET_KEY in .env.' });
+    }
+
+    // Plan amounts in KES
+    const AMOUNTS = {
+        monthly:        parseFloat(process.env.SUBSCRIPTION_MONTHLY_KES  || 3000),
+        annual:         parseFloat(process.env.SUBSCRIPTION_ANNUAL_KES   || 36000),
+        lifetime:       parseFloat(process.env.SUBSCRIPTION_LIFETIME_KES || 120000),
+        annual_service: parseFloat(process.env.SUBSCRIPTION_SERVICE_KES  || 30000),
+    };
+
+    // api_ref must match ^[a-zA-Z0-9-_: ]+$ — use hyphen separator, not underscore
+    // (IntaSend rejects underscore-only refs in some SDK versions)
+    const API_REF_MAP = {
+        monthly:        'ELITE-MONTHLY',
+        annual:         'ELITE-ANNUAL',
+        lifetime:       'ELITE-LIFETIME',
+        annual_service: 'ELITE-SLA',
+    };
+
+    const amount  = AMOUNTS[plan_type];
+    const api_ref = API_REF_MAP[plan_type];
+    const redirect_url = APP_BASE_URL
+        ? `${APP_BASE_URL}/billing.html?payment=success&plan=${plan_type}`
+        : null;
+
+    try {
+        const payload = {
+            public_key:  INTASEND_PUB_KEY,  // required by IntaSend REST API
+            amount:      amount.toFixed(2),
+            currency:    'KES',             // USD not supported — always use KES
+            api_ref:     api_ref,
+            ...(redirect_url ? { redirect_url } : {}),
+            ...(APP_BASE_URL ? { host: APP_BASE_URL } : {}),
+        };
+
+        const intasendRes = await fetch(`${INTASEND_API_BASE}/api/v1/checkout/`, {
+            method: 'POST',
+            headers: {
+                'Content-Type':               'application/json',
+                'X-IntaSend-Public-API-Key':  INTASEND_PUB_KEY,
+                // Secret key sent via Authorization for server-side calls
+                'Authorization':              `Bearer ${INTASEND_SECRET_KEY}`,
+            },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(15000),
+        });
+
+        const text = await intasendRes.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = { _raw: text }; }
+
+        if (!intasendRes.ok) {
+            log.error(`[IntaSend Checkout] API error ${intasendRes.status}: ${text}`);
+            return res.status(502).json({
+                success: false,
+                message: `IntaSend returned ${intasendRes.status}`,
+                detail:  data,
+            });
+        }
+
+        log.info(`[IntaSend Checkout] Created: plan=${plan_type} amount=${amount} id=${data.id}`);
+        res.json({
+            success:      true,
+            checkout_url: data.url,
+            checkout_id:  data.id,
+            signature:    data.signature,
+            plan_type,
+            amount_kes:   amount,
+        });
+    } catch (err) {
+        log.error(`[IntaSend Checkout] Error: ${err.message}`);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
+// ── 2. IntaSend Webhook (public — called by IntaSend servers) ─────────────────
 app.post('/api/intasend/webhook', async (req, res) => {
     // IntaSend expects a 200 ACK immediately
     res.json({ status: 'received' });
