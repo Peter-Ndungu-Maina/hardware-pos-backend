@@ -1255,6 +1255,7 @@ const SUB_EXEMPT_PATHS = new Set([
     '/api/verify-session',
     '/api/mpesa/callback',
     '/api/digitax/callback',
+    '/api/intasend/webhook', // public — called by IntaSend servers
     '/api/c2b/validation',
     '/api/c2b/confirmation',              // customer→business payments, always pass
     '/api/subscription/mpesa-confirmation', // vendor paybill webhook, always pass
@@ -1379,7 +1380,160 @@ app.post('/api/subscription/refresh', requireAuth, requireRole('admin'), async (
         status: _subCache.status, plan: _subCache.plan });
 });
 
-// ── VENDOR M-PESA AUTO-PAYMENT WEBHOOK ───────────────────────────────────────
+// ============================================================
+//  INTASEND PAYMENT INTEGRATION — Billing
+// ============================================================
+//
+//  Two complementary routes:
+//
+//  1. POST /api/intasend/webhook  (public — registered in IntaSend dashboard)
+//     IntaSend calls this on every payment state change. We verify the
+//     CHALLENGE secret, then auto-extend the subscription for COMPLETE events.
+//     .env: INTASEND_CHALLENGE_SECRET (copy from IntaSend dashboard → Webhooks)
+//
+//  2. POST /api/intasend/confirm  (authenticated — called by billing.html on
+//     the frontend COMPLETE event as a belt-and-suspenders fallback so the
+//     subscription extends even if the webhook hasn't arrived yet).
+//     .env: no extra config needed.
+//
+//  .env additions:
+//    INTASEND_PUBLISHABLE_KEY=ISPubKey_live_...
+//    INTASEND_CHALLENGE_SECRET=<copy from IntaSend dashboard → Webhooks>
+// ============================================================
+
+const INTASEND_CHALLENGE = process.env.INTASEND_CHALLENGE_SECRET || '';
+
+/**
+ * Detect billing plan type from IntaSend api_ref and amount.
+ * api_ref is set by billing.html as ELITE_HW_<PLAN_TYPE>.
+ */
+function _detectPlanFromIntaSend(api_ref, amountKes) {
+    const ref = (api_ref || '').toUpperCase();
+    if (ref.includes('LIFETIME'))       return { plan_type: 'lifetime',       months: null };
+    if (ref.includes('ANNUAL_SERVICE')) return { plan_type: 'annual_service', months: null };
+    if (ref.includes('ANNUAL'))         return { plan_type: 'annual',         months: 12   };
+    if (ref.includes('MONTHLY'))        return { plan_type: 'monthly',        months: 1    };
+
+    // Fallback: detect by amount (same tolerance as M-Pesa webhook)
+    const MONTHLY_KES  = parseFloat(process.env.SUBSCRIPTION_MONTHLY_KES  || 3000);
+    const ANNUAL_KES   = parseFloat(process.env.SUBSCRIPTION_ANNUAL_KES   || 36000);
+    const SERVICE_KES  = parseFloat(process.env.SUBSCRIPTION_SERVICE_KES  || 30000);
+    const LIFETIME_KES = parseFloat(process.env.SUBSCRIPTION_LIFETIME_KES || 120000);
+    const near = (a, b) => Math.abs(a - b) <= b * 0.05;
+    const amt  = parseFloat(amountKes || 0);
+
+    if (near(amt, LIFETIME_KES)) return { plan_type: 'lifetime',       months: null };
+    if (near(amt, SERVICE_KES))  return { plan_type: 'annual_service', months: null };
+    if (near(amt, ANNUAL_KES))   return { plan_type: 'annual',         months: 12   };
+    if (amt >= MONTHLY_KES * 0.9) {
+        const months = Math.max(1, Math.round(amt / MONTHLY_KES));
+        return { plan_type: 'monthly', months };
+    }
+    return null; // unrecognised — store for manual review
+}
+
+// ── 1. IntaSend Webhook (public — called by IntaSend servers) ─────────────────
+app.post('/api/intasend/webhook', async (req, res) => {
+    // IntaSend expects a 200 ACK immediately
+    res.json({ status: 'received' });
+
+    try {
+        const payload = req.body || {};
+        log.info(`[IntaSend Webhook] state=${payload.state} tracking_id=${payload.tracking_id} api_ref=${payload.api_ref} amount=${payload.net_amount}`);
+
+        // Verify challenge secret (set in IntaSend dashboard → Webhooks → Challenge)
+        if (INTASEND_CHALLENGE && payload.challenge !== INTASEND_CHALLENGE) {
+            log.warn('[IntaSend Webhook] Challenge mismatch — ignoring.');
+            return;
+        }
+
+        // Only process completed payments
+        if (payload.state !== 'COMPLETE') {
+            log.info(`[IntaSend Webhook] Skipping state=${payload.state}`);
+            return;
+        }
+
+        const amountKes = parseFloat(payload.net_amount || payload.value || 0);
+        const detected  = _detectPlanFromIntaSend(payload.api_ref, amountKes);
+
+        if (!detected) {
+            log.warn(`[IntaSend Webhook] ⚠ Unrecognised amount KES ${amountKes} ref=${payload.api_ref} — storing for manual review`);
+            await supabase.from('subscription_payments').insert([{
+                client_id:      CLIENT_ID,
+                amount_kes:     amountKes,
+                plan_type:      'unknown',
+                payment_method: 'IntaSend (webhook)',
+                mpesa_code:     payload.tracking_id || null,
+                months_paid:    null,
+                notes:          `UNRECOGNISED AMOUNT — manual review. ref=${payload.api_ref} tracking=${payload.tracking_id}`,
+                recorded_by:    'system',
+            }]);
+            return;
+        }
+
+        await _applySubscriptionPayment({
+            plan_type:  detected.plan_type,
+            amount_kes: amountKes,
+            mpesa_code: payload.tracking_id || null, // IntaSend tracking ID doubles as receipt ref
+            phone:      payload.phone_number || '',
+            source:     `IntaSend webhook (${payload.provider || 'unknown'})`,
+        });
+
+        log.info(`[IntaSend Webhook] ✅ Applied plan=${detected.plan_type} KES=${amountKes} tracking=${payload.tracking_id}`);
+    } catch (err) {
+        log.error(`[IntaSend Webhook] Error: ${err.message}`);
+    }
+});
+
+// ── 2. IntaSend Confirm (authenticated — belt-and-suspenders from frontend) ───
+// Called by billing.html immediately after IntaSend fires COMPLETE.
+// Idempotent: if the webhook already applied the payment, a second call just
+// refreshes the cache without inserting a duplicate (the supabase insert will
+// create a new row, so we guard against duplicates via tracking_id check).
+app.post('/api/intasend/confirm', requireAuth, requireRole('admin'), async (req, res) => {
+    const { tracking_id, plan_type, amount_kes } = req.body || {};
+
+    if (!tracking_id || !plan_type || !amount_kes) {
+        return res.status(400).json({ success: false, message: 'tracking_id, plan_type, and amount_kes are required.' });
+    }
+
+    const VALID_PLANS = ['monthly', 'annual', 'lifetime', 'annual_service'];
+    if (!VALID_PLANS.includes(plan_type)) {
+        return res.status(400).json({ success: false, message: `Invalid plan_type. Must be one of: ${VALID_PLANS.join(', ')}.` });
+    }
+
+    try {
+        // Idempotency: if this tracking_id was already applied via webhook, skip re-applying
+        const { data: existing } = await supabase
+            .from('subscription_payments')
+            .select('id')
+            .eq('mpesa_code', tracking_id)
+            .maybeSingle();
+
+        if (existing) {
+            log.info(`[IntaSend Confirm] Already applied tracking_id=${tracking_id} — refreshing cache only`);
+            await refreshSubscriptionStatus();
+            return res.json({ success: true, message: 'Already applied. Cache refreshed.', readOnly: _subCache.readOnly });
+        }
+
+        await _applySubscriptionPayment({
+            plan_type,
+            amount_kes: parseFloat(amount_kes),
+            mpesa_code: tracking_id,
+            phone:      req.user?.empId || '',
+            source:     'IntaSend frontend confirm',
+            _recordedBy: req.user?.name || 'admin',
+        });
+
+        log.info(`[IntaSend Confirm] ✅ Applied plan=${plan_type} KES=${amount_kes} by=${req.user?.name} tracking=${tracking_id}`);
+        res.json({ success: true, message: `Payment applied. Plan: ${plan_type}.`, readOnly: _subCache.readOnly });
+    } catch (err) {
+        log.error(`[IntaSend Confirm] Error: ${err.message}`);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
+
 // POST /api/subscription/mpesa-confirmation
 //
 // This endpoint is for YOUR paybill as the software vendor —
