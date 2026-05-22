@@ -1492,25 +1492,23 @@ app.post('/api/intasend/create-checkout', requireAuth, requireRole('admin'), asy
         : null;
 
     try {
+        // /api/v1/checkout/ is a PUBLIC endpoint — only needs public_key in the body.
+        // DO NOT send Authorization: Bearer <secret> — IntaSend treats it as a
+        // session-token login and returns 401 "Session expired".
         const payload = {
-            public_key:  INTASEND_PUB_KEY,  // required by IntaSend REST API
-            amount:      amount.toFixed(2),
-            currency:    'KES',             // USD not supported — always use KES
-            api_ref:     api_ref,
+            public_key:   INTASEND_PUB_KEY,
+            amount:       amount.toFixed(2),
+            currency:     'KES',
+            api_ref:      api_ref,
             ...(redirect_url ? { redirect_url } : {}),
             ...(APP_BASE_URL ? { host: APP_BASE_URL } : {}),
         };
 
         const intasendRes = await fetch(`${INTASEND_API_BASE}/api/v1/checkout/`, {
-            method: 'POST',
-            headers: {
-                'Content-Type':               'application/json',
-                'X-IntaSend-Public-API-Key':  INTASEND_PUB_KEY,
-                // Secret key sent via Authorization for server-side calls
-                'Authorization':              `Bearer ${INTASEND_SECRET_KEY}`,
-            },
-            body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(15000),
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' }, // NO Authorization header
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(15000),
         });
 
         const text = await intasendRes.text();
