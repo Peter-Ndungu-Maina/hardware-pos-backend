@@ -1487,18 +1487,21 @@ app.post('/api/intasend/create-checkout', requireAuth, requireRole('admin'), asy
 
     const amount  = AMOUNTS[plan_type];
     const api_ref = API_REF_MAP[plan_type];
+    const redirect_url = APP_BASE_URL
+        ? `${APP_BASE_URL}/billing.html?payment=success&plan=${plan_type}`
+        : null;
 
     try {
-        // /api/v1/checkout/ only needs public_key, amount, currency, api_ref.
-        // redirect_url and host are omitted — IntaSend validates their format
-        // strictly (HTTPS only, no special chars) and rejects with 400 if they
-        // don't pass. The user is redirected to IntaSend's own success page
-        // instead; billing.html confirms via /api/intasend/confirm on demand.
+        // /api/v1/checkout/ is a PUBLIC endpoint — only needs public_key in the body.
+        // DO NOT send Authorization: Bearer <secret> — IntaSend treats it as a
+        // session-token login and returns 401 "Session expired".
         const payload = {
-            public_key: INTASEND_PUB_KEY,
-            amount:     amount.toFixed(2),
-            currency:   'KES',
-            api_ref:    api_ref,
+            public_key:   INTASEND_PUB_KEY,
+            amount:       amount.toFixed(2),
+            currency:     'KES',
+            api_ref:      api_ref,
+            ...(redirect_url ? { redirect_url } : {}),
+            ...(APP_BASE_URL ? { host: APP_BASE_URL } : {}),
         };
 
         const intasendRes = await fetch(`${INTASEND_API_BASE}/api/v1/checkout/`, {
@@ -6192,23 +6195,45 @@ async function _applySubscriptionPayment(opts) {
         if (svcErr) throw new Error(`subscriptions UPDATE (annual_service) failed — code=${svcErr.code} | ${svcErr.message} | hint=${svcErr.hint}`);
 
     } else {
-        // monthly or annual — reset paid_until if switching from lifetime (was 9999-12-31)
-        if (_subCache.plan === 'lifetime') {
-            const { error: resetErr } = await supabase.from('subscriptions')
-                .update({ paid_until: new Date().toISOString().split('T')[0] })
-                .eq('client_id', CLIENT_ID);
-            if (resetErr) throw new Error(`Could not reset paid_until before extending: ${resetErr.message}`);
-            log.info(`[SUB] Reset paid_until from 9999-12-31 to today before applying ${plan_type} extension`);
+        // monthly or annual — always stack new months ON TOP of the current paid_until.
+        // The extend_subscription RPC may use NOW() as the base; to guarantee stacking
+        // we compute the new paid_until here and write it directly so remaining days
+        // are never lost when a client renews before their plan expires.
+
+        // Base: whichever is later — today or current paid_until.
+        // If switching from lifetime (paid_until = 9999-12-31) reset base to today.
+        let baseDate;
+        const isFromLifetime = _subCache.plan === 'lifetime';
+        if (isFromLifetime) {
+            baseDate = new Date();
+            log.info(`[SUB] Switching from lifetime → ${plan_type}: base reset to today`);
+        } else {
+            const currentPaidUntil = _subCache.paid_until ? new Date(_subCache.paid_until) : new Date();
+            baseDate = currentPaidUntil > new Date() ? currentPaidUntil : new Date();
         }
-        // Pass p_plan so the plan column is updated INSIDE the SECURITY DEFINER function —
-        // a separate .update({ plan }) call here can be silently blocked by RLS if
-        // SUPABASE_KEY is the anon key instead of service_role.
+
+        // Add purchased months to the base date
+        const newPaidUntil = new Date(baseDate);
+        newPaidUntil.setMonth(newPaidUntil.getMonth() + months);
+        const newPaidUntilStr = newPaidUntil.toISOString().split('T')[0];
+
+        log.info(`[SUB] Extending ${plan_type}: base=${baseDate.toISOString().split('T')[0]} +${months}mo → ${newPaidUntilStr} (was: ${_subCache.paid_until})`);
+
+        // Call the RPC first so plan column update happens inside SECURITY DEFINER context.
+        // We ignore RPC errors here because we do a direct UPDATE immediately after to
+        // guarantee the correct stacked paid_until regardless of what base date the RPC used.
         const { error: rpcErr } = await supabase.rpc('extend_subscription', {
             p_client_id: CLIENT_ID,
             p_months:    months,
             p_plan:      plan_type,
         });
-        if (rpcErr) throw new Error(`extend_subscription RPC failed — code=${rpcErr.code} | ${rpcErr.message} | hint=${rpcErr.hint}`);
+        if (rpcErr) log.warn(`[SUB] extend_subscription RPC warning (${rpcErr.code}): ${rpcErr.message} — overriding with direct UPDATE`);
+
+        // Always overwrite paid_until with our stacked value to guarantee correctness.
+        const { error: updateErr } = await supabase.from('subscriptions')
+            .update({ paid_until: newPaidUntilStr, plan: plan_type, status: 'active' })
+            .eq('client_id', CLIENT_ID);
+        if (updateErr) throw new Error(`subscriptions UPDATE (paid_until stack) failed — code=${updateErr.code} | ${updateErr.message}`);
     }
 
     // 3. Refresh cache so POS unlocks on the next request
