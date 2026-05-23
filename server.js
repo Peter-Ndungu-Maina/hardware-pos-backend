@@ -1487,21 +1487,16 @@ app.post('/api/intasend/create-checkout', requireAuth, requireRole('admin'), asy
 
     const amount  = AMOUNTS[plan_type];
     const api_ref = API_REF_MAP[plan_type];
-    const redirect_url = APP_BASE_URL
-        ? `${APP_BASE_URL}/billing.html?payment=success&plan=${plan_type}`
-        : null;
 
     try {
-        // /api/v1/checkout/ is a PUBLIC endpoint — only needs public_key in the body.
-        // DO NOT send Authorization: Bearer <secret> — IntaSend treats it as a
-        // session-token login and returns 401 "Session expired".
+        // Minimal payload — redirect_url and host are intentionally excluded.
+        // IntaSend rejects redirect_url values that contain query params (?plan=...)
+        // or non-standard characters, returning 400 validation_error. They are optional.
         const payload = {
-            public_key:   INTASEND_PUB_KEY,
-            amount:       amount.toFixed(2),
-            currency:     'KES',
-            api_ref:      api_ref,
-            ...(redirect_url ? { redirect_url } : {}),
-            ...(APP_BASE_URL ? { host: APP_BASE_URL } : {}),
+            public_key: INTASEND_PUB_KEY,
+            amount:     amount.toFixed(2),
+            currency:   'KES',
+            api_ref:    api_ref,
         };
 
         const intasendRes = await fetch(`${INTASEND_API_BASE}/api/v1/checkout/`, {
