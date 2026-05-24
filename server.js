@@ -9935,6 +9935,144 @@ app.post('/api/scripts/etims-retry', requireAuth, requireRole('admin'), async (r
     retryPendingEtims();
 });
 
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  SCRIPT 7: DIGITAX ITEM REGISTRATION CHECK
+//  Scans Inventory for items with no digitax_item_id / kra_registered = false
+//  and attempts to register them with DigiTax (eTIMS). Triggered manually via
+//  POST /api/scripts/digitax-item-check or auto-runs every 6 hours.
+//
+//  Covers two pages:
+//   • add_product.html  — items added manually one by one
+//   • purchase_orders.html — items received via PO that may have been added
+//     before DigiTax was configured
+//
+//  Rate-limited to 1 registration per second to respect DigiTax API limits.
+// ════════════════════════════════════════════════════════════════════════════════
+async function runDigitaxItemCheck() {
+    if (!DIGITAX_API_KEY) {
+        log.warn('[DigiTax Item Check] Skipping — DIGITAX_API_KEY not configured');
+        return { skipped: true, reason: 'DIGITAX_API_KEY not set' };
+    }
+
+    log.info('[DigiTax Item Check] Starting scan for unregistered inventory items...');
+
+    try {
+        // Fetch all items that are NOT yet registered with DigiTax
+        const { data: unregistered, error } = await supabase
+            .from('Inventory')
+            .select('id, item_name, category, unit, price, cost_price, stock_quantity, barcode, sub_unit, sub_unit_qty, sub_unit_price, digitax_item_id, kra_registered')
+            .or('digitax_item_id.is.null,kra_registered.eq.false')
+            .order('item_name');
+
+        if (error) throw error;
+
+        const total = (unregistered || []).length;
+        if (total === 0) {
+            log.info('[DigiTax Item Check] ✅ All inventory items are registered with DigiTax');
+            return { total: 0, registered: 0, failed: 0, items: [] };
+        }
+
+        log.info(`[DigiTax Item Check] Found ${total} unregistered item(s) — attempting registration...`);
+
+        let registered = 0, failed = 0;
+        const results = [];
+
+        for (const item of unregistered) {
+            try {
+                const digitaxItemId = await registerItemWithEtims({
+                    itemName:    item.item_name,
+                    category:    item.category,
+                    unit:        item.unit,
+                    price:       item.price,
+                    cost_price:  item.cost_price,
+                    stockQty:    item.stock_quantity,
+                    barcode:     item.barcode,
+                    sub_unit:       item.sub_unit,
+                    sub_unit_qty:   item.sub_unit_qty,
+                    sub_unit_price: item.sub_unit_price,
+                });
+
+                if (digitaxItemId) {
+                    // Update both digitax_item_id and kra_registered in DB
+                    const { error: updErr } = await supabase
+                        .from('Inventory')
+                        .update({ digitax_item_id: digitaxItemId, kra_registered: true })
+                        .eq('id', item.id);
+
+                    if (updErr) {
+                        log.warn(`[DigiTax Item Check] DB update failed for "${item.item_name}": ${updErr.message}`);
+                        results.push({ id: item.id, item_name: item.item_name, status: 'db_update_failed', digitax_id: digitaxItemId });
+                        failed++;
+                    } else {
+                        log.info(`[DigiTax Item Check] ✅ Registered: "${item.item_name}" → digitax_id=${digitaxItemId}`);
+                        results.push({ id: item.id, item_name: item.item_name, status: 'registered', digitax_id: digitaxItemId });
+                        registered++;
+                    }
+                } else {
+                    log.warn(`[DigiTax Item Check] ❌ Registration returned no ID for "${item.item_name}"`);
+                    results.push({ id: item.id, item_name: item.item_name, status: 'failed', digitax_id: null });
+                    failed++;
+                }
+            } catch (itemErr) {
+                log.warn(`[DigiTax Item Check] ❌ Error registering "${item.item_name}": ${itemErr.message}`);
+                results.push({ id: item.id, item_name: item.item_name, status: 'error', error: itemErr.message });
+                failed++;
+            }
+
+            // Throttle: 1 per second — DigiTax rate limit
+            await new Promise(r => setTimeout(r, 1000));
+        }
+
+        const summary = `${registered}/${total} items registered, ${failed} failed`;
+        log.info(`[DigiTax Item Check] Complete — ${summary}`);
+        return { total, registered, failed, results };
+
+    } catch (err) {
+        log.error('[DigiTax Item Check] Script error:', err.message);
+        return { total: 0, registered: 0, failed: 0, error: err.message };
+    }
+}
+
+// POST /api/scripts/digitax-item-check — manually trigger from Scripts panel
+app.post('/api/scripts/digitax-item-check', requireAuth, requireRole('admin'), async (req, res) => {
+    // Return immediately so the browser doesn't time out — registration can take minutes
+    res.json({ success: true, message: 'DigiTax item registration check started in background. Check server logs for progress.' });
+    const result = await runDigitaxItemCheck();
+    log.info('[DigiTax Item Check] Background run complete:', result);
+});
+
+// GET /api/scripts/digitax-item-status — called by the Scripts panel to show live counts
+app.get('/api/scripts/digitax-item-status', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const [{ count: total }, { count: unregistered }] = await Promise.all([
+            supabase.from('Inventory').select('*', { count: 'exact', head: true }),
+            supabase.from('Inventory').select('*', { count: 'exact', head: true })
+                .or('digitax_item_id.is.null,kra_registered.eq.false'),
+        ]);
+
+        const registered = (total || 0) - (unregistered || 0);
+        const pct = total > 0 ? Math.round((registered / total) * 100) : 100;
+
+        res.json({
+            success:      true,
+            total:        total        || 0,
+            registered:   registered   || 0,
+            unregistered: unregistered || 0,
+            pct_complete: pct,
+            health:       unregistered === 0 ? 'healthy' : unregistered > 10 ? 'critical' : 'warning',
+        });
+    } catch (err) {
+        log.error('[DigiTax Item Status]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
+// Auto-run every 6 hours so newly added items are registered without manual intervention
+setInterval(runDigitaxItemCheck, 6 * 60 * 60 * 1000);
+// Also run once on startup (after 30s delay to let DB connections settle)
+setTimeout(runDigitaxItemCheck, 30 * 1000);
+
 app.post('/api/scripts/eod-summary', requireAuth, requireRole('admin'), async (req, res) => {
     res.json({ success: true, message: 'EOD summary email triggered' });
     sendEodSummary();
