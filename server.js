@@ -1361,6 +1361,7 @@ app.post('/api/subscription/payment', requireAuth, requireRole('admin'), async (
                 : _subCache.paid_until;
 
         log.info(`[SUB] ✅ Manual payment: KES ${amount_kes} plan=${plan_type} newExpiry=${newDate} by=${req.user.name}`);
+        await logActivity(ACT.SUBSCRIPTION_PAYMENT, req.user.name, { amount_kes, plan_type, new_expiry: newDate, method: req.body.payment_method || 'manual' }, { role: req.user.role, ip: req.ip });
         res.json({
             success:       true,
             message:       `Payment recorded. Plan: ${plan_type}. New expiry: ${newDate}.`,
@@ -1520,6 +1521,7 @@ app.post('/api/intasend/create-checkout', requireAuth, requireRole('admin'), asy
         }
 
         log.info(`[IntaSend Checkout] Created: plan=${plan_type} amount=${amount} id=${data.id}`);
+        await logActivity(ACT.INTASEND_CHECKOUT, req.user.name, { plan_type, amount_kes: amount, checkout_id: data.id }, { role: req.user.role, ip: req.ip });
         res.json({
             success:      true,
             checkout_url: data.url,
@@ -1787,6 +1789,7 @@ app.post('/api/login', loginLimiter, async (req, res) => {
         const isMatch = await bcrypt.compare(String(pin), user ? user.pin : DUMMY_HASH);
 
         if (error || !user || !isMatch || user.is_active === false) {
+            await logActivity(ACT.LOGIN_FAILED, employeeId || 'unknown', { reason: error ? 'user_not_found' : !isMatch ? 'wrong_pin' : 'inactive' }, { ip: req.ip });
             return res.status(401).json({ success: false, message: 'Invalid credentials.' });
         }
 
@@ -1827,6 +1830,7 @@ app.post('/api/login', loginLimiter, async (req, res) => {
                 mfa_secret:         user.mfa_pending_secret,
                 mfa_pending_secret: null
             }).eq('id', user.id);
+            await logActivity(ACT.MFA_SETUP, user.name, { emp_id: user.emp_id }, { role: user.role, ip: req.ip });
         }
         // --- 3. STANDARD MFA CHECK (Already set up) ---
         else if (user.mfa_secret) {
@@ -1853,6 +1857,7 @@ app.post('/api/login', loginLimiter, async (req, res) => {
             { expiresIn: '8h', algorithm: 'HS256' }
         );
         res.cookie('authToken', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'Strict', maxAge: 28800000 });
+        await logActivity(ACT.LOGIN_SUCCESS, user.name, { emp_id: user.emp_id }, { role: user.role, ip: req.ip });
         res.json({ success: true, token, role: user.role, name: user.name });
     } catch (err) {
         log.error('[LOGIN ERROR]', err);
@@ -3225,6 +3230,7 @@ app.post('/api/supplier-payments', requireAuth, requireRole('admin', 'manager'),
             details:      `Payment KES ${paying.toFixed(2)} to ${po.supplier_name} | PO: ${po.po_number} | Method: ${payment_method || 'N/A'} | Ref: ${reference || 'N/A'} | Paid: KES ${newAmountPaid.toFixed(2)} / KES ${totalOwed.toFixed(2)} | By: ${userName}`,
             timestamp:    new Date().toISOString(),
         }]);
+        await logActivity(ACT.SUPPLIER_PAYMENT, userName, { po_number: po.po_number, supplier: po.supplier_name, amount: paying.toFixed(2), method: payment_method }, { role: req.user.role, ip: req.ip, target_name: po.supplier_name });
 
         res.json({
             success:           true,
@@ -4971,6 +4977,8 @@ app.post('/api/sell', requireAuth, requireSubscription, validateBody({
             `PIN:A014661185V|REF:${receiptNumber || invoiceNumber}|AMT:${totalAmount.toFixed(2)}|DATE:${new Date().toLocaleDateString()}`
         );
         const qrDataUrlSingle = await generateQrDataUrl(qrDataStringSingle);
+        const _actSaleType = paymentMethod === 'Credit' ? ACT.SALE_CREDIT : ACT.SALE_COMPLETED;
+        await logActivity(_actSaleType, soldBy, { item: item?.item_name, qty: quantity, amount: saleData[0]?.total_amount, payment: paymentMethod, receipt: receiptNumber, customer: customerName || null }, { role: req.user.role, ip: req.ip, target_id: saleData[0]?.id, target_name: item?.item_name });
         res.json({ success: true, message: `Sale recorded. Stock: ${newStock}`, receiptNumber, invoiceNumber, dnNumber, saleId: saleData[0].id, kraReceiptNo, kraQrUrl: qrDataStringSingle, kraQrDataUrl: qrDataUrlSingle, Control_unit_number: controlUnitNumber });
     } catch (err) {
         log.error('Sale error', err);
@@ -5194,6 +5202,64 @@ app.get('/api/sales/:id', requireAuth, requireRole('admin', 'manager'), async (r
     }
 });
 
+
+// ── PATCH /api/sales/:id/void — void a sale (server-side so it's always logged)
+app.patch('/api/sales/:id/void', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
+    const { voidReason, notes } = req.body || {};
+    const userName = req.user.name;
+
+    if (!voidReason) return res.status(400).json({ success: false, message: 'voidReason is required.' });
+
+    try {
+        const { data: sale, error: fetchErr } = await supabase
+            .from('Sales').select('*').eq('id', req.params.id).single();
+        if (fetchErr || !sale) return res.status(404).json({ success: false, message: 'Sale not found.' });
+        if (sale.is_voided)   return res.status(400).json({ success: false, message: 'Sale is already voided.' });
+
+        // Mark as voided
+        const { error: voidErr } = await supabase.from('Sales').update({
+            is_voided:      true,
+            voided_by:      userName,
+            voided_at:      new Date().toISOString(),
+            void_reason:    voidReason,
+            void_notes:     notes || null,
+        }).eq('id', req.params.id);
+        if (voidErr) throw voidErr;
+
+        // Reverse stock
+        const { data: item } = await supabase.from('Inventory').select('stock_quantity, item_name').eq('id', sale.item_id).single();
+        if (item) {
+            await supabase.from('Inventory').update({
+                stock_quantity: (parseFloat(item.stock_quantity) || 0) + (parseFloat(sale.quantity_sold) || 0)
+            }).eq('id', sale.item_id);
+        }
+
+        // Write to BOTH audit tables for full compatibility
+        await supabase.from('audit_logs').insert([{
+            performed_by: userName,
+            action:       'VOID_TRANSACTION',
+            item_name:    sale.item_name,
+            details:      `Voided sale #${sale.receipt_number || req.params.id} | KES ${sale.total_amount} | Reason: ${voidReason} | ${notes || ''}`,
+            timestamp:    new Date().toISOString(),
+        }]);
+        await logActivity(ACT.SALE_VOIDED, userName, {
+            sale_id:       req.params.id,
+            receipt:       sale.receipt_number,
+            amount:        sale.total_amount,
+            item:          sale.item_name,
+            qty:           sale.quantity_sold,
+            void_reason:   voidReason,
+            notes:         notes || null,
+        }, { role: req.user.role, ip: req.ip, target_id: req.params.id, target_name: sale.item_name });
+
+        log.info(`[VOID] ✅ ${userName} voided sale #${sale.receipt_number} KES ${sale.total_amount} reason=${voidReason}`);
+        res.json({ success: true, message: `Sale #${sale.receipt_number || req.params.id} voided.` });
+    } catch (err) {
+        log.error('[VOID]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
 // PATCH /api/sales/:id/edit — edit customer details or payment method only
 app.patch('/api/sales/:id/edit', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
     const { customerName, customerPhone, paymentMethod, editNotes } = req.body;
@@ -5221,7 +5287,7 @@ app.patch('/api/sales/:id/edit', requireAuth, requireRole('admin', 'manager'), r
 
         const { error: updateErr } = await supabase.from('Sales').update(updates).eq('id', req.params.id);
         if (updateErr) throw updateErr;
-
+        await logActivity(ACT.SALE_EDITED, editedBy, { sale_id: req.params.id, changes: updates, notes: editNotes }, { role: req.user.role, ip: req.ip, target_id: req.params.id });
         res.json({ success: true, message: 'Transaction updated.' });
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
@@ -5238,6 +5304,7 @@ app.post('/api/employees', requireAuth, requireRole('admin'), requireSubscriptio
         const hashedPin = await bcrypt.hash(String(pin), 10);
         const { error } = await supabase.from('employees').insert([{ name, emp_id: employeeId.toUpperCase(), pin: hashedPin, role }]);
         if (error) throw error;
+        await logActivity(ACT.EMPLOYEE_CREATED, req.user.name, { new_employee: name, emp_id: employeeId.toUpperCase(), role }, { role: req.user.role, ip: req.ip, target_name: name });
         res.json({ success: true, message: 'Staff created securely!' });
     } catch {
         res.status(500).json({ success: false, message: 'ID already exists or database error.' });
@@ -5263,7 +5330,8 @@ app.post('/api/employees/request-pin-reset', async (req, res) => {
 
         if (findErr || !emp) {
             // Return generic message — don't leak whether ID exists
-            return res.json({ success: true, message: 'If that ID exists, your request has been sent to the Admin.' });
+            return await logActivity(ACT.PIN_RESET_REQUESTED, req.body.employeeId || 'unknown', { emp_id: req.body.employeeId }, { ip: req.ip });
+        res.json({ success: true, message: 'If that ID exists, your request has been sent to the Admin.' });
         }
 
         // Admins must reset their own PIN through the admin panel
@@ -5453,6 +5521,7 @@ app.put('/api/customers/:phone/credit-limit', requireAuth, requireRole('admin', 
             timestamp:    new Date().toISOString()
         }]);
 
+        await logActivity(ACT.CREDIT_LIMIT_CHANGED, req.user.name, { phone: req.params.phone, new_limit: req.body.creditLimit }, { role: req.user.role, ip: req.ip, target_name: req.params.phone });
         res.json({
             success: true,
             message: limitValue === null
@@ -5476,6 +5545,7 @@ app.post('/api/expenses', requireAuth, requireRole('admin', 'manager'), requireS
     try {
         const { error } = await supabase.from('expenses').insert([{ description, category, amount: parseFloat(amount), spent_by: spentBy, expense_date: nowEATIso() }]);
         if (error) throw error;
+                await logActivity(ACT.EXPENSE_ADDED, req.user.name, { amount: req.body.amount, category: req.body.category, description: req.body.description }, { role: req.user.role, ip: req.ip });
         res.json({ success: true, message: 'Expense recorded!' });
     } catch (err) {
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
@@ -5931,6 +6001,7 @@ app.post('/api/returns/exchange', requireAuth, requireRole('admin', 'manager'), 
             kraReplRef,       kraReplQrUrl,
             etimsSubmitted:   !!(kraReturnRef || kraReplRef)
         });
+        await logActivity(ACT.EXCHANGE_PROCESSED, req.user.name, { returned: retItem?.item_name, replacement: repItem?.item_name, qty: retQty, reason: returnReason }, { role: req.user.role, ip: req.ip });
     } catch (err) {
         log.error('[RETURNS] Exchange error:', err);
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
@@ -6135,6 +6206,112 @@ async function getMpesaToken() {
 // ── Shared subscription extension helper ─────────────────────────────────────
 // Called by both the STK callback (billing page) and the C2B vendor webhook
 // (direct Lipa na M-Pesa paybill payment). Single source of truth for all
+// ============================================================
+//  ACTIVITY LOG — Central audit helper
+// ============================================================
+//  Writes one row to the activity_log table for every significant
+//  business event. Never throws — a logging failure must never
+//  break the parent transaction.
+//
+//  SQL to create the table (run once in Supabase SQL editor):
+//  ─────────────────────────────────────────────────────────────
+//  create table if not exists activity_log (
+//    id           bigserial primary key,
+//    action       text        not null,
+//    performed_by text        not null default 'system',
+//    role         text,
+//    ip           text,
+//    target_id    text,           -- sale id, item id, employee id, etc.
+//    target_name  text,           -- human-readable label
+//    details      jsonb,          -- arbitrary extra context
+//    created_at   timestamptz not null default now()
+//  );
+//  create index on activity_log (action);
+//  create index on activity_log (performed_by);
+//  create index on activity_log (created_at desc);
+//  alter table activity_log enable row level security;
+//  create policy "service role full access" on activity_log
+//    using (true) with check (true);
+//  ─────────────────────────────────────────────────────────────
+//
+//  Action constants — use these everywhere so queries are consistent:
+
+const ACT = {
+    // Auth
+    LOGIN_SUCCESS:        'LOGIN_SUCCESS',
+    LOGIN_FAILED:         'LOGIN_FAILED',
+    MFA_SETUP:            'MFA_SETUP',
+    SESSION_EXPIRED:      'SESSION_EXPIRED',
+    // Employees
+    EMPLOYEE_CREATED:     'EMPLOYEE_CREATED',
+    EMPLOYEE_DELETED:     'EMPLOYEE_DELETED',
+    EMPLOYEE_UPDATED:     'EMPLOYEE_UPDATED',
+    ROLE_CHANGED:         'ROLE_CHANGED',
+    PIN_RESET_REQUESTED:  'PIN_RESET_REQUESTED',
+    PIN_RESET_APPROVED:   'PIN_RESET_APPROVED',
+    // Sales
+    SALE_COMPLETED:       'SALE_COMPLETED',
+    SALE_CREDIT:          'SALE_CREDIT',
+    SALE_VOIDED:          'SALE_VOIDED',
+    SALE_EDITED:          'SALE_EDITED',
+    DISCOUNT_APPLIED:     'DISCOUNT_APPLIED',
+    DEBT_CLEARED:         'DEBT_CLEARED',
+    CREDIT_LIMIT_CHANGED: 'CREDIT_LIMIT_CHANGED',
+    // Returns
+    RETURN_PROCESSED:     'RETURN_PROCESSED',
+    EXCHANGE_PROCESSED:   'EXCHANGE_PROCESSED',
+    // Inventory
+    STOCK_WRITE_OFF:      'STOCK_WRITE_OFF',
+    STOCK_RESTOCK:        'STOCK_RESTOCK',
+    STOCK_RECEIVED:       'STOCK_RECEIVED',
+    BULK_IMPORT:          'BULK_IMPORT',
+    PRICE_CHANGED:        'PRICE_CHANGED',
+    ITEM_DELETED:         'ITEM_DELETED',
+    ITEM_EDITED:          'ITEM_EDITED',
+    // Suppliers & POs
+    SUPPLIER_PAYMENT:     'SUPPLIER_PAYMENT',
+    SUPPLIER_RETURN:      'SUPPLIER_RETURN',
+    PO_CREATED:           'PO_CREATED',
+    PO_RECEIVED:          'PO_RECEIVED',
+    PO_DELETED:           'PO_DELETED',
+    // Expenses
+    EXPENSE_ADDED:        'EXPENSE_ADDED',
+    // Billing / Subscription
+    SUBSCRIPTION_PAYMENT: 'SUBSCRIPTION_PAYMENT',
+    INTASEND_CHECKOUT:    'INTASEND_CHECKOUT',
+    // System
+    BACKUP_CREATED:       'BACKUP_CREATED',
+    DB_CLEANUP:           'DB_CLEANUP',
+    SETTINGS_CHANGED:     'SETTINGS_CHANGED',
+    VOID_TRANSACTION:     'VOID_TRANSACTION', // alias for SALE_VOIDED — used by void detector script
+};
+
+/**
+ * logActivity(action, performedBy, details, opts?)
+ *
+ * @param {string} action       - one of ACT.*
+ * @param {string} performedBy  - user name or 'system'
+ * @param {object} details      - any extra context (stored as jsonb)
+ * @param {object} [opts]       - { role, ip, target_id, target_name }
+ */
+async function logActivity(action, performedBy, details = {}, opts = {}) {
+    try {
+        await supabase.from('activity_log').insert([{
+            action,
+            performed_by: performedBy || 'system',
+            role:         opts.role        || null,
+            ip:           opts.ip          || null,
+            target_id:    opts.target_id   ? String(opts.target_id) : null,
+            target_name:  opts.target_name || null,
+            details:      details,
+        }]);
+    } catch (err) {
+        // Never let logging break the parent request
+        log.warn(`[ActivityLog] Failed to write ${action}: ${err.message}`);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // subscription writes so both payment paths behave identically.
 //
 // opts: { plan_type, amount_kes, mpesa_code, phone?, source? }
@@ -8376,6 +8553,7 @@ app.post('/api/inventory/:id/write-off', requireAuth, requireRole('admin', 'mana
             });
         }
 
+        await logActivity(ACT.STOCK_WRITE_OFF, userName, { item: item?.item_name, qty: writeOffQty, reason: req.body.reason, cost_lost: totalCostLost }, { role: req.user?.role, ip: req.ip, target_id: req.params.id, target_name: item?.item_name });
         res.json({
             success:      true,
             message:      `${writeOffQty} unit(s) of "${item.item_name}" written off. KES ${totalCostLost.toFixed(2)} recorded as expense.${kraNotified ? ' ✅ KRA notified.' : ' ⚠ KRA sync pending — item may not be registered.'}`,
@@ -8398,6 +8576,43 @@ app.post('/api/inventory/:id/write-off', requireAuth, requireRole('admin', 'mana
 // ============================================================
 
 // ── GET Balance Sheet ─────────────────────────────────────────────────────────
+
+// ── GET /api/activity-log — queryable audit log ───────────────────────────────
+app.get('/api/activity-log', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    const { action, from, to, performed_by, page } = req.query;
+    const perPage = 50;
+    const pageNum = parseInt(page) || 1;
+    const fromISO = from ? `${from}T00:00:00.000+03:00` : null;
+    const toISO   = to   ? `${to}T23:59:59.999+03:00`   : null;
+
+    try {
+        let q = supabase.from('activity_log')
+            .select('*', { count: 'exact' })
+            .order('created_at', { ascending: false });
+
+        if (action)       q = q.eq('action', action);
+        if (performed_by) q = q.ilike('performed_by', `%${performed_by}%`);
+        if (fromISO)      q = q.gte('created_at', fromISO);
+        if (toISO)        q = q.lte('created_at', toISO);
+
+        const start = (pageNum - 1) * perPage;
+        const { data, count, error } = await q.range(start, start + perPage - 1);
+        if (error) throw error;
+
+        res.json({
+            success: true,
+            logs:       data || [],
+            totalCount: count || 0,
+            totalPages: Math.ceil((count || 0) / perPage),
+            page:       pageNum,
+            actions:    Object.values(ACT), // send all known action types for filter dropdowns
+        });
+    } catch (err) {
+        log.error('[ActivityLog]', err.message);
+        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
 app.get('/api/accounting/balance-sheet', requireAuth, requireRole('admin','manager'), async (req, res) => {
     try {
         // Pull live figures from operational tables
@@ -9415,14 +9630,26 @@ async function checkSuspiciousVoids() {
         const todayStart = new Date(); todayStart.setHours(0,0,0,0);
         const fmt = n => `KES ${parseFloat(n||0).toLocaleString('en-KE', {minimumFractionDigits:2})}`;
 
-        const { data: recentVoids, error } = await supabase
-            .from('audit_logs')
-            .select('performed_by, item_name, details, timestamp')
-            .eq('action', 'VOID_TRANSACTION')
-            .gte('timestamp', todayStart.toISOString())
-            .order('timestamp', { ascending: false });
+        // Check both legacy audit_logs AND the new activity_log table
+        const [{ data: legacyVoids }, { data: actVoids }] = await Promise.all([
+            supabase.from('audit_logs').select('performed_by, item_name, details, timestamp')
+                .eq('action', 'VOID_TRANSACTION').gte('timestamp', todayStart.toISOString())
+                .order('timestamp', { ascending: false }),
+            supabase.from('activity_log').select('performed_by, target_name, details, created_at')
+                .eq('action', 'SALE_VOIDED').gte('created_at', todayStart.toISOString())
+                .order('created_at', { ascending: false }),
+        ]);
+        // Normalise both sources into the same shape
+        const recentVoids = [
+            ...(legacyVoids || []),
+            ...(actVoids || []).map(v => ({
+                performed_by: v.performed_by,
+                item_name:    v.target_name,
+                details:      JSON.stringify(v.details || {}),
+                timestamp:    v.created_at,
+            })),
+        ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
-        if (error) throw error;
         if (!recentVoids || recentVoids.length === 0) return;
 
         const lastHourVoids = recentVoids.filter(v => new Date(v.timestamp) >= new Date(oneHourAgo));
@@ -9724,12 +9951,14 @@ app.post('/api/scripts/dead-stock', requireAuth, requireRole('admin'), async (re
 });
 
 app.post('/api/scripts/db-cleanup', requireAuth, requireRole('admin'), async (req, res) => {
+    await logActivity(ACT.DB_CLEANUP, req.user?.name || 'system', { triggered_at: new Date().toISOString() }, { role: req.user?.role, ip: req.ip });
     res.json({ success: true, message: 'Database cleanup started' });
     runDatabaseCleanup();
 });
 
 app.post('/api/scripts/backup', requireAuth, requireRole('admin'), async (req, res) => {
-    res.json({ success: true, message: 'Database backup started — check your email in ~1 minute' });
+    await logActivity(ACT.BACKUP_CREATED, req.user?.name || 'system', {}, { role: req.user?.role, ip: req.ip });
+        res.json({ success: true, message: 'Database backup started — check your email in ~1 minute' });
     runDailyBackup();
 });
 
