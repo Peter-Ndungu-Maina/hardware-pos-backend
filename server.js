@@ -6141,6 +6141,25 @@ if (!INTASEND_STK_PUB || !INTASEND_STK_SEC) {
     log.warn('⚠️  INTASEND_PUBLISHABLE_KEY or INTASEND_SECRET_KEY not set — M-Pesa STK push will return 503.');
 }
 
+// ── pending_mpesa read/write helpers ──────────────────────────────────────────
+// checkout_id is the IntaSend invoice_id (kept as "checkout_id" for continuity
+// with the earlier Safaricom CheckoutRequestID naming).
+async function mpesaSet(checkoutId, fields) {
+    const { error } = await supabase
+        .from('pending_mpesa')
+        .upsert({ checkout_id: checkoutId, ...fields }, { onConflict: 'checkout_id' });
+    if (error) log.error('mpesaSet failed', error, { checkoutId });
+}
+async function mpesaGet(checkoutId) {
+    const { data, error } = await supabase
+        .from('pending_mpesa')
+        .select('*')
+        .eq('checkout_id', checkoutId)
+        .maybeSingle();
+    if (error) log.error('mpesaGet failed', error, { checkoutId });
+    return data;
+}
+
 // ── POST /api/mpesa/stk-push ──────────────────────────────────────────────────
 app.post('/api/mpesa/stk-push', requireAuth, requireSubscription, async (req, res) => {
     if (!INTASEND_STK_PUB || !INTASEND_STK_SEC)
