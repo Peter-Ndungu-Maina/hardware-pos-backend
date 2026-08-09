@@ -6106,301 +6106,6 @@ app.get('/api/returns/search-sale', requireAuth, requireRole('admin', 'manager')
         log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
-// ╔══════════════════════════════════════════════════════════════╗
-// ║              M-PESA STK PUSH INTEGRATION                     ║
-// ╚══════════════════════════════════════════════════════════════╝
-// SECURITY: All M-Pesa credentials MUST be set in .env — no hardcoded fallbacks.
-// If any are missing, STK push routes will respond with 503.
-const MPESA_CONSUMER_KEY    = process.env.MPESA_CONSUMER_KEY;
-const MPESA_CONSUMER_SECRET = process.env.MPESA_CONSUMER_SECRET;
-const MPESA_SHORTCODE       = process.env.MPESA_SHORTCODE;
-const MPESA_PASSKEY         = process.env.MPESA_PASSKEY;
-const MPESA_CALLBACK_URL    = process.env.MPESA_CALLBACK_URL;
-
-if (!MPESA_CONSUMER_KEY || !MPESA_CONSUMER_SECRET || !MPESA_PASSKEY || !MPESA_SHORTCODE || !MPESA_CALLBACK_URL) {
-    log.error('\u274c  Missing required M-Pesa env vars. STK push will return 503 until all vars are set.');
-}
-// MPESA_TRANSACTION_TYPE controls Till vs Paybill:
-//   CustomerPayBillOnline  → Paybill (customer enters account number, e.g. invoice no.)
-//   CustomerBuyGoodsOnline → Till / BuyGoods (no account number prompt)
-const MPESA_TRANSACTION_TYPE = process.env.MPESA_TRANSACTION_TYPE || 'CustomerPayBillOnline';
-const MPESA_BASE_URL        = process.env.MPESA_ENV === 'live'
-    ? 'https://api.safaricom.co.ke'
-    : 'https://sandbox.safaricom.co.ke';
-
-// ── Supabase-persisted M-Pesa helpers (survives server restarts) ──────────────
-// Requires table: pending_mpesa (checkout_id TEXT PK, status TEXT, phone TEXT,
-//   amount INT, context JSONB, mpesa_code TEXT, result_desc TEXT, created_at TIMESTAMPTZ)
-async function mpesaSet(checkoutId, fields) {
-    const { error } = await supabase
-        .from('pending_mpesa')
-        .upsert({ checkout_id: checkoutId, ...fields }, { onConflict: 'checkout_id' });
-    if (error) log.error('mpesaSet failed', error, { checkoutId });
-}
-async function mpesaGet(checkoutId) {
-    const { data, error } = await supabase
-        .from('pending_mpesa')
-        .select('*')
-        .eq('checkout_id', checkoutId)
-        .maybeSingle(); // maybeSingle returns null instead of error when not found
-    if (error) log.error('mpesaGet failed', error, { checkoutId });
-    return data || null;
-}
-async function mpesaDel(checkoutId) {
-    await supabase.from('pending_mpesa').delete().eq('checkout_id', checkoutId);
-}
-
-// ── M-Pesa token cache — token is valid for 3600s, refresh 5min before expiry ──
-let _mpesaToken    = null;
-let _mpesaTokenExp = 0;   // Unix ms when token expires
-
-async function getMpesaToken() {
-    if (!MPESA_CONSUMER_KEY || !MPESA_CONSUMER_SECRET) {
-        throw new Error('M-Pesa credentials not configured. Set MPESA_CONSUMER_KEY and MPESA_CONSUMER_SECRET in .env');
-    }
-    const now = Date.now();
-    // Return cached token if it's still valid (with 5-minute buffer)
-    if (_mpesaToken && now < _mpesaTokenExp - 5 * 60 * 1000) {
-        return _mpesaToken;
-    }
-    const auth = Buffer.from(`${MPESA_CONSUMER_KEY}:${MPESA_CONSUMER_SECRET}`).toString('base64');
-    let res;
-    try {
-        res = await fetch(`${MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials`, {
-            headers: { Authorization: `Basic ${auth}` },
-            signal: AbortSignal.timeout(10000)
-        });
-    } catch (fetchErr) {
-        const hint = fetchErr.cause?.code || fetchErr.code || fetchErr.name || '';
-        if (hint === 'ENOTFOUND' || hint === 'EAI_AGAIN')
-            throw new Error(`Cannot reach Safaricom — DNS failure (${hint}). Check internet/VPN.`);
-        if (hint === 'ECONNREFUSED')
-            throw new Error(`Safaricom connection refused (${hint}). Check firewall/proxy.`);
-        if (hint === 'TimeoutError' || hint === 'AbortError')
-            throw new Error('Safaricom token request timed out.');
-        throw new Error(`Safaricom fetch failed: ${fetchErr.message}`);
-    }
-    if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`Safaricom token error ${res.status}: ${body}`);
-    }
-    const data = await res.json();
-    if (!data.access_token) throw new Error('Safaricom returned no access_token. Check Consumer Key/Secret.');
-    _mpesaToken    = data.access_token;
-    _mpesaTokenExp = now + (parseInt(data.expires_in) || 3600) * 1000;
-    log.info('[MPESA] 🔑 Token refreshed, valid for', Math.round((parseInt(data.expires_in)||3600)/60), 'min');
-    return _mpesaToken;
-}
-
-// ── Shared subscription extension helper ─────────────────────────────────────
-// Called by both the STK callback (billing page) and the C2B vendor webhook
-// (direct Lipa na M-Pesa paybill payment). Single source of truth for all
-// ============================================================
-//  ACTIVITY LOG — Central audit helper
-// ============================================================
-//  Writes one row to the activity_log table for every significant
-//  business event. Never throws — a logging failure must never
-//  break the parent transaction.
-//
-//  SQL to create the table (run once in Supabase SQL editor):
-//  ─────────────────────────────────────────────────────────────
-//  create table if not exists activity_log (
-//    id           bigserial primary key,
-//    action       text        not null,
-//    performed_by text        not null default 'system',
-//    role         text,
-//    ip           text,
-//    target_id    text,           -- sale id, item id, employee id, etc.
-//    target_name  text,           -- human-readable label
-//    details      jsonb,          -- arbitrary extra context
-//    created_at   timestamptz not null default now()
-//  );
-//  create index on activity_log (action);
-//  create index on activity_log (performed_by);
-//  create index on activity_log (created_at desc);
-//  alter table activity_log enable row level security;
-//  create policy "service role full access" on activity_log
-//    using (true) with check (true);
-//  ─────────────────────────────────────────────────────────────
-//
-//  Action constants — use these everywhere so queries are consistent:
-
-const ACT = {
-    // Auth
-    LOGIN_SUCCESS:        'LOGIN_SUCCESS',
-    LOGIN_FAILED:         'LOGIN_FAILED',
-    MFA_SETUP:            'MFA_SETUP',
-    SESSION_EXPIRED:      'SESSION_EXPIRED',
-    // Employees
-    EMPLOYEE_CREATED:     'EMPLOYEE_CREATED',
-    EMPLOYEE_DELETED:     'EMPLOYEE_DELETED',
-    EMPLOYEE_UPDATED:     'EMPLOYEE_UPDATED',
-    ROLE_CHANGED:         'ROLE_CHANGED',
-    PIN_RESET_REQUESTED:  'PIN_RESET_REQUESTED',
-    PIN_RESET_APPROVED:   'PIN_RESET_APPROVED',
-    // Sales
-    SALE_COMPLETED:       'SALE_COMPLETED',
-    SALE_CREDIT:          'SALE_CREDIT',
-    SALE_VOIDED:          'SALE_VOIDED',
-    SALE_EDITED:          'SALE_EDITED',
-    DISCOUNT_APPLIED:     'DISCOUNT_APPLIED',
-    DEBT_CLEARED:         'DEBT_CLEARED',
-    CREDIT_LIMIT_CHANGED: 'CREDIT_LIMIT_CHANGED',
-    // Returns
-    RETURN_PROCESSED:     'RETURN_PROCESSED',
-    EXCHANGE_PROCESSED:   'EXCHANGE_PROCESSED',
-    // Inventory
-    STOCK_WRITE_OFF:      'STOCK_WRITE_OFF',
-    STOCK_RESTOCK:        'STOCK_RESTOCK',
-    STOCK_RECEIVED:       'STOCK_RECEIVED',
-    BULK_IMPORT:          'BULK_IMPORT',
-    PRICE_CHANGED:        'PRICE_CHANGED',
-    ITEM_DELETED:         'ITEM_DELETED',
-    ITEM_EDITED:          'ITEM_EDITED',
-    // Suppliers & POs
-    SUPPLIER_PAYMENT:     'SUPPLIER_PAYMENT',
-    SUPPLIER_RETURN:      'SUPPLIER_RETURN',
-    PO_CREATED:           'PO_CREATED',
-    PO_RECEIVED:          'PO_RECEIVED',
-    PO_DELETED:           'PO_DELETED',
-    // Expenses
-    EXPENSE_ADDED:        'EXPENSE_ADDED',
-    // Billing / Subscription
-    SUBSCRIPTION_PAYMENT: 'SUBSCRIPTION_PAYMENT',
-    INTASEND_CHECKOUT:    'INTASEND_CHECKOUT',
-    // System
-    BACKUP_CREATED:       'BACKUP_CREATED',
-    DB_CLEANUP:           'DB_CLEANUP',
-    SETTINGS_CHANGED:     'SETTINGS_CHANGED',
-    VOID_TRANSACTION:     'VOID_TRANSACTION', // alias for SALE_VOIDED — used by void detector script
-};
-
-/**
- * logActivity(action, performedBy, details, opts?)
- *
- * @param {string} action       - one of ACT.*
- * @param {string} performedBy  - user name or 'system'
- * @param {object} details      - any extra context (stored as jsonb)
- * @param {object} [opts]       - { role, ip, target_id, target_name }
- */
-async function logActivity(action, performedBy, details = {}, opts = {}) {
-    try {
-        await supabase.from('activity_log').insert([{
-            action,
-            performed_by: performedBy || 'system',
-            role:         opts.role        || null,
-            ip:           opts.ip          || null,
-            target_id:    opts.target_id   ? String(opts.target_id) : null,
-            target_name:  opts.target_name || null,
-            details:      details,
-        }]);
-    } catch (err) {
-        // Never let logging break the parent request
-        log.warn(`[ActivityLog] Failed to write ${action}: ${err.message}`);
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// subscription writes so both payment paths behave identically.
-//
-// opts: { plan_type, amount_kes, mpesa_code, phone?, source? }
-async function _applySubscriptionPayment(opts) {
-    const {
-        plan_type,
-        amount_kes,
-        mpesa_code,
-        phone        = '',
-        source       = 'unknown',
-        _overrideNotes = null,    // set by manual payment route
-        _recordedBy    = 'system' // set by manual payment route
-    } = opts;
-    const months = plan_type === 'annual' ? 12 : (plan_type === 'monthly' ? 1 : null);
-
-    // 1. Record payment row
-    const { error: payErr } = await supabase.from('subscription_payments').insert([{
-        client_id:      CLIENT_ID,
-        amount_kes:     parseFloat(amount_kes),
-        plan_type,
-        payment_method: source,
-        mpesa_code:     mpesa_code || null,
-        months_paid:    ['annual_service','lifetime'].includes(plan_type) ? null : months,
-        notes:          _overrideNotes || `Auto-applied via ${source}. Phone: ${phone}`,
-        recorded_by:    _recordedBy,
-    }]);
-    if (payErr) {
-        const detail = `code=${payErr.code} | msg=${payErr.message} | hint=${payErr.hint || 'none'}`;
-        if (payErr.code === '42703') throw new Error(`subscription_payments INSERT — MISSING COLUMN. ${detail}. Run subscription_migration_v2.sql.`);
-        if (payErr.code === '42501') throw new Error(`subscription_payments INSERT — RLS BLOCKED. ${detail}. Use service_role key.`);
-        if (payErr.code === '23503') throw new Error(`subscription_payments INSERT — FOREIGN KEY: client_id '${CLIENT_ID}' not in subscriptions. Seed the row first.`);
-        throw new Error(`subscription_payments INSERT failed — ${detail}`);
-    }
-
-    // 2. Apply the correct subscription change per plan type
-    if (plan_type === 'lifetime') {
-        const { error: ltErr } = await supabase.from('subscriptions')
-            .update({ plan: 'lifetime', status: 'active', paid_until: '9999-12-31' })
-            .eq('client_id', CLIENT_ID);
-        if (ltErr) throw new Error(`subscriptions UPDATE (lifetime) failed — code=${ltErr.code} | ${ltErr.message}`);
-
-    } else if (plan_type === 'annual_service') {
-        const { data: cur, error: fetchErr } = await supabase.from('subscriptions')
-            .select('annual_service_paid_until').eq('client_id', CLIENT_ID).single();
-        if (fetchErr) throw new Error(`subscriptions SELECT failed — code=${fetchErr.code} | ${fetchErr.message}`);
-        const base = (cur?.annual_service_paid_until && new Date(cur.annual_service_paid_until) > new Date())
-            ? new Date(cur.annual_service_paid_until) : new Date();
-        base.setFullYear(base.getFullYear() + 1);
-        const newSvcDate = base.toISOString().split('T')[0];
-        const { error: svcErr } = await supabase.from('subscriptions')
-            .update({ annual_service_paid_until: newSvcDate, status: 'active' })
-            .eq('client_id', CLIENT_ID);
-        if (svcErr) throw new Error(`subscriptions UPDATE (annual_service) failed — code=${svcErr.code} | ${svcErr.message} | hint=${svcErr.hint}`);
-
-    } else {
-        // monthly or annual — always stack new months ON TOP of the current paid_until.
-        // The extend_subscription RPC may use NOW() as the base; to guarantee stacking
-        // we compute the new paid_until here and write it directly so remaining days
-        // are never lost when a client renews before their plan expires.
-
-        // Base: whichever is later — today or current paid_until.
-        // If switching from lifetime (paid_until = 9999-12-31) reset base to today.
-        let baseDate;
-        const isFromLifetime = _subCache.plan === 'lifetime';
-        if (isFromLifetime) {
-            baseDate = new Date();
-            log.info(`[SUB] Switching from lifetime → ${plan_type}: base reset to today`);
-        } else {
-            const currentPaidUntil = _subCache.paid_until ? new Date(_subCache.paid_until) : new Date();
-            baseDate = currentPaidUntil > new Date() ? currentPaidUntil : new Date();
-        }
-
-        // Add purchased months to the base date
-        const newPaidUntil = new Date(baseDate);
-        newPaidUntil.setMonth(newPaidUntil.getMonth() + months);
-        const newPaidUntilStr = newPaidUntil.toISOString().split('T')[0];
-
-        log.info(`[SUB] Extending ${plan_type}: base=${baseDate.toISOString().split('T')[0]} +${months}mo → ${newPaidUntilStr} (was: ${_subCache.paid_until})`);
-
-        // Call the RPC first so plan column update happens inside SECURITY DEFINER context.
-        // We ignore RPC errors here because we do a direct UPDATE immediately after to
-        // guarantee the correct stacked paid_until regardless of what base date the RPC used.
-        const { error: rpcErr } = await supabase.rpc('extend_subscription', {
-            p_client_id: CLIENT_ID,
-            p_months:    months,
-            p_plan:      plan_type,
-        });
-        if (rpcErr) log.warn(`[SUB] extend_subscription RPC warning (${rpcErr.code}): ${rpcErr.message} — overriding with direct UPDATE`);
-
-        // Always overwrite paid_until with our stacked value to guarantee correctness.
-        const { error: updateErr } = await supabase.from('subscriptions')
-            .update({ paid_until: newPaidUntilStr, plan: plan_type, status: 'active' })
-            .eq('client_id', CLIENT_ID);
-        if (updateErr) throw new Error(`subscriptions UPDATE (paid_until stack) failed — code=${updateErr.code} | ${updateErr.message}`);
-    }
-
-    // 3. Refresh cache so POS unlocks on the next request
-    await refreshSubscriptionStatus();
-}
-
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║                     INTASEND — M-PESA STK PUSH                              ║
 // ║                                                                              ║
@@ -6525,87 +6230,62 @@ app.post('/api/mpesa/stk-push', requireAuth, requireSubscription, async (req, re
 });
 
 // ── GET /api/mpesa/status/:invoiceId ─────────────────────────────────────────
-// Frontend polls every 3 s. When IntaSend webhook fires it updates the
-// pending_mpesa row. But in sandbox the webhook may be delayed or not
-// reachable — so this endpoint also queries IntaSend directly when the
-// local row is still 'pending' after 30 s, as a belt-and-suspenders fallback.
+// Polls local pending_mpesa row. If still pending, queries IntaSend API directly.
+// This means payment is detected even when the webhook hasn't fired (e.g. sandbox).
 app.get('/api/mpesa/status/:invoiceId', requireAuth, async (req, res) => {
     try {
         res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.set('Pragma', 'no-cache');
 
-        const { invoiceId } = req.params;
+        const invoiceId = req.params.invoiceId;
         const tx = await mpesaGet(invoiceId);
         if (!tx) return res.status(404).json({ success: false, status: 'not_found', message: 'Transaction not found or expired.' });
 
-        // If already resolved locally just return it
+        // Already resolved locally — return immediately
         if (tx.status !== 'pending') {
-            return res.json({
-                success:    true,
-                status:     tx.status,
-                mpesaCode:  tx.mpesa_code  || null,
-                amount:     tx.amount,
-                phone:      tx.phone,
-                channel:    tx.context?.channel || 'INTASEND_MPESA',
-                resultDesc: tx.result_desc || null,
-            });
+            return res.json({ success: true, status: tx.status, mpesaCode: tx.mpesa_code || null, amount: tx.amount, phone: tx.phone, channel: tx.context?.channel || 'INTASEND_MPESA', resultDesc: tx.result_desc || null });
         }
 
-        // Still pending — check directly with IntaSend API
-        // This covers sandbox where webhook may not reach Render,
-        // and production where webhook could be delayed.
-        // IntaSend: GET /api/v1/payment/collection/:invoice_id/
-        if (INTASEND_STK_SEC && INTASEND_STK_PUB) {
+        // Still pending — query IntaSend directly (covers sandbox + webhook delays)
+        if (INTASEND_STK_SEC) {
             try {
                 const checkRes = await fetch(`${INTASEND_STK_BASE}/api/v1/payment/collection/${invoiceId}/`, {
-                    method:  'GET',
                     headers: { 'Authorization': `Bearer ${INTASEND_STK_SEC}` },
                     signal:  AbortSignal.timeout(8000),
                 });
                 if (checkRes.ok) {
-                    const checkData = await checkRes.json();
-                    const state     = checkData?.invoice?.state || checkData?.state || 'PENDING';
-                    const reason    = (checkData?.invoice?.failed_reason || checkData?.failed_reason || '').toLowerCase();
-                    const failCode  = String(checkData?.invoice?.failed_code || checkData?.failed_code || '');
+                    const d     = await checkRes.json();
+                    log.info(`[INTASEND STATUS CHECK] invoiceId=${invoiceId} state=${d?.invoice?.state || d?.state} failed_reason=${d?.invoice?.failed_reason || ''}`);
+                    const state  = (d?.invoice?.state || d?.state || 'PENDING').toUpperCase();
+                    const reason = (d?.invoice?.failed_reason || d?.failed_reason || '').toLowerCase();
+                    const fcode  = String(d?.invoice?.failed_code || d?.failed_code || '');
 
                     if (state === 'COMPLETE') {
-                        const amount = Math.round(parseFloat(checkData?.invoice?.net_amount || checkData?.net_amount || tx.amount || 0));
+                        const amount = Math.round(parseFloat(d?.invoice?.net_amount || d?.net_amount || tx.amount || 0));
                         await mpesaSet(invoiceId, { ...tx, status: 'confirmed', mpesa_code: invoiceId, amount, result_desc: 'Confirmed via IntaSend API' });
                         log.info(`[INTASEND STATUS CHECK] ✅ COMPLETE invoiceId=${invoiceId} KES=${amount}`);
-
-                        // Fire full debt-matching async (don't await — return fast to frontend)
-                        setImmediate(() => processIntaSendComplete({ invoiceId, amount, tx }).catch(e => log.error('[INTASEND ASYNC MATCH]', e.message)));
-
+                        setImmediate(() => processIntaSendComplete({ invoiceId, amount, tx }).catch(e => log.error('[INTASEND MATCH]', e.message)));
                         return res.json({ success: true, status: 'confirmed', mpesaCode: invoiceId, amount, phone: tx.phone, channel: 'INTASEND_MPESA', resultDesc: 'Payment confirmed' });
+                    }
 
-                    } else if (state === 'FAILED') {
+                    if (state === 'FAILED') {
                         let newStatus = 'failed';
-                        if (reason.includes('cancel') || reason.includes('reject') || failCode === '1032') newStatus = 'cancelled';
-                        else if (reason.includes('insufficient') || reason.includes('balance'))           newStatus = 'insufficient_funds';
-                        else if (reason.includes('timeout') || reason.includes('expired') || failCode === '1037') newStatus = 'timeout';
-
-                        const resultDesc = checkData?.invoice?.failed_reason || checkData?.failed_reason || 'Payment failed';
+                        if (reason.includes('cancel') || reason.includes('reject') || fcode === '1032') newStatus = 'cancelled';
+                        else if (reason.includes('insufficient') || reason.includes('balance'))         newStatus = 'insufficient_funds';
+                        else if (reason.includes('timeout') || reason.includes('expired') || fcode === '1037') newStatus = 'timeout';
+                        const resultDesc = d?.invoice?.failed_reason || d?.failed_reason || 'Payment failed';
                         await mpesaSet(invoiceId, { ...tx, status: newStatus, result_desc: resultDesc });
                         log.info(`[INTASEND STATUS CHECK] ❌ ${newStatus} invoiceId=${invoiceId}`);
                         return res.json({ success: true, status: newStatus, mpesaCode: null, amount: tx.amount, phone: tx.phone, channel: 'INTASEND_MPESA', resultDesc });
                     }
-                    // PENDING / PROCESSING — fall through and return pending below
+                    // PENDING / PROCESSING — fall through
                 }
-            } catch (checkErr) {
-                log.warn(`[INTASEND STATUS CHECK] IntaSend API unreachable: ${checkErr.message}`);
+            } catch (e) {
+                log.warn(`[INTASEND STATUS CHECK] API call failed: ${e.message}`);
             }
         }
 
-        // Still pending
-        return res.json({
-            success:    true,
-            status:     'pending',
-            mpesaCode:  null,
-            amount:     tx.amount,
-            phone:      tx.phone,
-            channel:    tx.context?.channel || 'INTASEND_MPESA',
-            resultDesc: null,
-        });
+        return res.json({ success: true, status: 'pending', mpesaCode: null, amount: tx.amount, phone: tx.phone, channel: tx.context?.channel || 'INTASEND_MPESA', resultDesc: null });
 
     } catch (err) {
         log.error('[MPESA STATUS]', err.message);
@@ -6613,13 +6293,10 @@ app.get('/api/mpesa/status/:invoiceId', requireAuth, async (req, res) => {
     }
 });
 
-// ── Shared IntaSend COMPLETE processor ───────────────────────────────────────
-// Called from both the webhook and the status-check fallback above.
-// Runs FIFO debt matching, updates Sales/payments/debt_payments/customers.
+// ── Shared FIFO debt matcher — called from both webhook and status check ──────
 async function processIntaSendComplete({ invoiceId, amount, tx }) {
-    // Duplicate guard
     const { data: existingC2B } = await supabase.from('c2b_payments').select('id').eq('mpesa_code', invoiceId).maybeSingle();
-    if (existingC2B) { log.warn(`[INTASEND] Duplicate invoiceId=${invoiceId} — skipping`); return; }
+    if (existingC2B) { log.warn(`[INTASEND] Duplicate invoiceId=${invoiceId} — skip`); return; }
 
     const phone      = tx?.phone ? String(tx.phone).replace(/^254/, '0') : '';
     const accountRef = tx?.context?.accountRef || null;
@@ -6629,19 +6306,11 @@ async function processIntaSendComplete({ invoiceId, amount, tx }) {
 
     let activeDebts = [];
     if (accountRef?.trim().length > 2) {
-        const { data: byInvoice } = await supabase.from('Sales')
-            .select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
-            .or(`invoice_number.ilike.%${accountRef.trim()}%,receipt_number.ilike.%${accountRef.trim()}%`)
-            .eq('is_voided', false).in('payment_status', ['Credit','Partial','credit','partial','Unpaid'])
-            .order('sale_date', { ascending: true });
+        const { data: byInvoice } = await supabase.from('Sales').select('id,item_name,total_amount,amount_paid,customer_name,customer_phone').or(`invoice_number.ilike.%${accountRef.trim()}%,receipt_number.ilike.%${accountRef.trim()}%`).eq('is_voided', false).in('payment_status', ['Credit','Partial','credit','partial','Unpaid']).order('sale_date', { ascending: true });
         if (byInvoice?.length) activeDebts = byInvoice;
     }
     if (!activeDebts.length && phone) {
-        const { data: byPhone } = await supabase.from('Sales')
-            .select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
-            .eq('customer_phone', phone).eq('is_voided', false)
-            .in('payment_status', ['Credit','Partial','credit','partial','Unpaid'])
-            .order('sale_date', { ascending: true });
+        const { data: byPhone } = await supabase.from('Sales').select('id,item_name,total_amount,amount_paid,customer_name,customer_phone').eq('customer_phone', phone).eq('is_voided', false).in('payment_status', ['Credit','Partial','credit','partial','Unpaid']).order('sale_date', { ascending: true });
         if (byPhone?.length) activeDebts = byPhone;
     }
     activeDebts = activeDebts.filter(d => (parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) > 0);
@@ -6668,16 +6337,14 @@ async function processIntaSendComplete({ invoiceId, amount, tx }) {
     }
 
     let newTotalDebt = 0;
-    const targetPhone = activeDebts[0]?.customer_phone || phone;
-    if (targetPhone) {
-        const { data: cust } = await supabase.from('customers').select('total_debt').eq('phone', targetPhone).single();
-        if (cust) { newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - totalApplied); await supabase.from('customers').update({ total_debt: newTotalDebt }).eq('phone', targetPhone); }
+    const tp = activeDebts[0]?.customer_phone || phone;
+    if (tp) {
+        const { data: cust } = await supabase.from('customers').select('total_debt').eq('phone', tp).single();
+        if (cust) { newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - totalApplied); await supabase.from('customers').update({ total_debt: newTotalDebt }).eq('phone', tp); }
     }
 
-    const receiptDataJson = totalApplied > 0 ? JSON.stringify({ customer: activeDebts[0]?.customer_name || 'IntaSend Customer', total: totalApplied, amount: totalApplied, method: 'M-Pesa (IntaSend)', code: invoiceId, receiptNumber: payRef, servedBy: 'INTASEND-AUTO', date: now.toLocaleString('en-KE'), items: [{ itemName: 'Debt Clearance', price: totalApplied, quantity: 1 }], remainingBalance: newTotalDebt }) : null;
-
+    const receiptDataJson = JSON.stringify({ customer: activeDebts[0]?.customer_name || 'IntaSend Customer', total: totalApplied, amount: totalApplied, method: 'M-Pesa (IntaSend)', code: invoiceId, receiptNumber: payRef, servedBy: 'INTASEND-AUTO', date: now.toLocaleString('en-KE'), items: [{ itemName: 'Debt Clearance', price: totalApplied, quantity: 1 }], remainingBalance: newTotalDebt });
     await supabase.from('c2b_payments').insert([{ phone, amount, mpesa_code: invoiceId, account_ref: accountRef, customer_name: activeDebts[0]?.customer_name || 'IntaSend Customer', status: remaining > 0 ? 'excess' : 'debt_cleared', amount_applied: totalApplied, amount_excess: remaining, receipt_number: payRef, receipt_data: receiptDataJson, created_at: now.toISOString() }]);
-
     log.info(`[INTASEND] ✅ Applied KES ${totalApplied} remaining KES ${newTotalDebt}`);
 }
 
@@ -6741,12 +6408,9 @@ app.post('/api/mpesa/webhook', async (req, res) => {
             await mpesaSet(invoiceId, { ...pending, status: 'confirmed', mpesa_code: invoiceId, amount, result_desc: 'Payment confirmed via IntaSend' });
         }
 
-        // Mark confirmed then run debt matching via shared helper
-        if (pending) {
-            await mpesaSet(invoiceId, { ...pending, status: 'confirmed', mpesa_code: invoiceId, amount, result_desc: 'Payment confirmed via IntaSend webhook' });
-        }
         log.info(`[INTASEND WEBHOOK] ✅ COMPLETE invoiceId=${invoiceId} KES=${amount} phone=${phone} ref=${accountRef}`);
-        await processIntaSendComplete({ invoiceId, amount, tx: pending || { phone: '0'+String(phone).replace(/^254/,''), context: { accountRef } } });
+        if (pending) await mpesaSet(invoiceId, { ...pending, status: 'confirmed', mpesa_code: invoiceId, amount, result_desc: 'Confirmed via IntaSend webhook' });
+        await processIntaSendComplete({ invoiceId, amount, tx: pending || { phone, context: { accountRef } } });
 
     } catch (err) {
         log.error('[INTASEND WEBHOOK ERROR]', err.message, err.stack?.split('\n')[1]?.trim());
