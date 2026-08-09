@@ -4419,23 +4419,21 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
 
     if (!Array.isArray(items) || items.length === 0)
         return res.status(400).json({ success: false, message: 'Cart is empty.' });
-    if (!['Cash', 'M-Pesa', 'Safaricom', 'Credit', 'Equity'].includes(paymentMethod))
+    if (!['Cash', 'M-Pesa', 'Safaricom', 'Credit'].includes(paymentMethod))
         return res.status(400).json({ success: false, message: 'Invalid payment method.' });
 
     // Normalise frontend dropdown values → canonical DB labels
     if (paymentMethod === 'Safaricom') paymentMethod = 'M-Pesa';
-    // 'Equity' kept through here; storedMethod below maps it to 'Equity Paybill' for DB
 
     const linkedPhone = (mpesaId && mpesaId.trim()) ? mpesaId.trim() : null;
 
-    if ((paymentMethod === 'M-Pesa' || paymentMethod === 'Credit' || paymentMethod === 'Equity') && !linkedPhone)
+    if ((paymentMethod === 'M-Pesa' || paymentMethod === 'Credit') && !linkedPhone)
         return res.status(400).json({ success: false, message: 'Phone number required.' });
 
-    // Both M-Pesa and Equity require a transaction reference code
-    if (paymentMethod === 'M-Pesa' || paymentMethod === 'Equity') {
+    // M-Pesa (Mobile Money) requires a transaction reference code
+    if (paymentMethod === 'M-Pesa') {
         if (!mpesaCode || !mpesaCode.trim()) {
-            const label = paymentMethod === 'Equity' ? 'Equity transaction reference' : 'M-Pesa Code';
-            return res.status(400).json({ success: false, message: `${label} required.` });
+            return res.status(400).json({ success: false, message: 'Mobile Money code required.' });
         }
 
         const sanitizedCode = mpesaCode.trim().toUpperCase();
@@ -4448,8 +4446,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
                 .maybeSingle();
 
             if (existingPayment) {
-                const label = paymentMethod === 'Equity' ? 'Equity transaction reference' : 'M-Pesa code';
-                return res.status(400).json({ success: false, message: `This ${label} has already been used.` });
+                return res.status(400).json({ success: false, message: 'This Mobile Money code has already been used.' });
             }
         }
     }
@@ -4507,8 +4504,7 @@ app.post('/api/sell/cart', requireAuth, requireSubscription, async (req, res) =>
         }
 
         // Determine stored payment method label for DB
-        const storedMethod = paymentMethod === 'Equity'             ? 'Equity Paybill'
-                           : (mpesaCode && mpesaCode.trim())        ? 'M-Pesa'
+        const storedMethod = (mpesaCode && mpesaCode.trim())        ? 'M-Pesa'
                            : (paymentMethod === 'M-Pesa' || isC2B) ? 'M-Pesa'
                            : (paymentMethod || 'Cash');
 
@@ -4986,7 +4982,7 @@ app.post('/api/sell', requireAuth, requireSubscription, validateBody({
 app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
     saleId:        { type: 'string', required: true },
     paymentAmount: { type: 'number', required: true, min: 0.01 },
-    paymentMethod: { type: 'string', required: true, enum: ['Cash', 'M-Pesa', 'Equity', 'Safaricom'] },
+    paymentMethod: { type: 'string', required: true, enum: ['Cash', 'M-Pesa', 'Safaricom'] },
 }), async (req, res) => {
     let { saleId, paymentAmount, paymentMethod, mpesaId } = req.body;
     const processedBy = req.user.name;
@@ -4994,7 +4990,6 @@ app.post('/api/clear-debt', requireAuth, requireSubscription, validateBody({
 
     // Normalise frontend method values to canonical DB labels
     if (paymentMethod === 'Safaricom') paymentMethod = 'M-Pesa';
-    if (paymentMethod === 'Equity')    paymentMethod = 'Equity Paybill';
 
     if (!saleId || !paymentAmount) return res.status(400).json({ success: false, message: 'Missing Sale ID or Amount.' });
 
