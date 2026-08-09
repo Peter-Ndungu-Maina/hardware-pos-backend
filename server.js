@@ -817,13 +817,7 @@ const apiLimiter = rateLimit({
 app.use('/api/', apiLimiter);
 app.use(log.middleware);          // structured JSON request logging
 app.use(sanitizeQuery);           // strip PostgREST injection chars from all query params
-// Skip the global JSON parser for /api/jenga/ipn.
-// Jenga sends callbacks as text/plain, not application/json. express.json()
-// consumes the request stream even when it doesn't parse it, so by the time
-// the route's own express.raw() runs the stream is already drained -- empty.
-// Bypassing it here lets the route read the raw bytes itself.
 app.use((req, res, next) => {
-    if (req.path === '/api/jenga/ipn') return next();
     express.json({ limit: '100kb' })(req, res, next);
 });
 // Bulk import is the only route that legitimately receives large bodies; apply 10mb only there.
@@ -6412,2467 +6406,320 @@ async function _applySubscriptionPayment(opts) {
     await refreshSubscriptionStatus();
 }
 
-app.post('/api/mpesa/stk-push', requireAuth, requireSubscription, async (req, res) => {
-    const { phone, amount, accountRef, context } = req.body;
-    let msisdn = String(phone).replace(/\s/g, '');
-    if (msisdn.startsWith('0'))       msisdn = '254' + msisdn.slice(1);
-    if (msisdn.startsWith('+'))       msisdn = msisdn.slice(1);
-    if (!/^2547\d{8}$/.test(msisdn)) return res.status(400).json({ success: false, message: 'Invalid phone number. Use format 07XXXXXXXX' });
-    const amountInt = Math.ceil(parseFloat(amount));
-    if (!amountInt || amountInt < 1) return res.status(400).json({ success: false, message: 'Invalid amount' });
-    try {
-        const token     = await getMpesaToken();
-        const timestamp = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-        const password  = Buffer.from(`${MPESA_SHORTCODE}${MPESA_PASSKEY}${timestamp}`).toString('base64');
-        // For Paybill: AccountReference appears on the customer's M-Pesa prompt as
-        // the account number. Use the invoice/receipt number so it matches the sale.
-        // For Till (BuyGoods): AccountReference is ignored by Safaricom but still sent.
-        const body = {
-            BusinessShortCode: MPESA_SHORTCODE, Password: password, Timestamp: timestamp,
-            TransactionType: MPESA_TRANSACTION_TYPE, Amount: amountInt,
-            PartyA: msisdn, PartyB: MPESA_SHORTCODE, PhoneNumber: msisdn,
-            CallBackURL: MPESA_CALLBACK_URL,
-            AccountReference: (accountRef || 'EliteHardware').substring(0, 12), // Safaricom max 12 chars
-            TransactionDesc: ('Payment ' + (accountRef || '')).substring(0, 13) // Safaricom max 13 chars
-        };
-        const stkRes  = await fetch(`${MPESA_BASE_URL}/mpesa/stkpush/v1/processrequest`, {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-        const stkData = await stkRes.json();
-        if (stkData.ResponseCode !== '0') return res.status(400).json({ success: false, message: stkData.errorMessage || stkData.ResponseDescription || 'STK push failed' });
-        // Persist to Supabase so server restarts don't lose pending transactions
-        await mpesaSet(stkData.CheckoutRequestID, {
-            status: 'pending', phone: msisdn, amount: amountInt,
-            context: context || {}, created_at: new Date().toISOString()
-        });
-        log.info(`[MPESA STK] ✅ Pending: ${stkData.CheckoutRequestID}`);
-        res.json({ success: true, checkoutRequestId: stkData.CheckoutRequestID, message: 'STK push sent.' });
-    } catch (err) {
-        log.error('[MPESA STK]', err.message);
-        res.status(500).json({ success: false, message: 'M-Pesa error: ' + err.message });
-    }
-});
-
-app.post('/api/mpesa/callback', requireSafaricomIP, requireWebhookSecret, async (req, res) => {
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
-    try {
-        // FIX HIGH-01/MED-01: Never log full callback body — it contains phone numbers and M-Pesa codes.
-        const body    = req.body?.Body?.stkCallback;
-        if (!body) { log.warn('[MPESA CALLBACK] Missing stkCallback in body'); return; }
-        log.info(`[MPESA CALLBACK] Received: checkoutId=${body.CheckoutRequestID} code=${body.ResultCode}`);
-        const checkId = body.CheckoutRequestID;
-        const code    = body.ResultCode;
-        const pending = await mpesaGet(checkId);
-        if (!pending) return;
-        if (code === 0) {
-            const items     = body.CallbackMetadata?.Item || [];
-            const get       = name => items.find(i => i.Name === name)?.Value;
-            const mpesaCode = get('MpesaReceiptNumber');
-            const amount    = get('Amount');
-            const phone     = get('PhoneNumber');
-            await mpesaSet(checkId, { ...pending, status: 'confirmed', mpesa_code: mpesaCode, amount, phone });
-            // FIX HIGH-01: Mask PII in logs — ODPC Kenya Data Protection Act compliance
-            const maskedPhone = phone    ? String(phone).slice(0, 5)    + '****' + String(phone).slice(-2)    : 'N/A';
-            const maskedCode  = mpesaCode ? String(mpesaCode).slice(0, 4) + '****'                             : 'N/A';
-            log.info(`[MPESA] ✅ Payment confirmed: ${maskedCode} KES ${amount} from ${maskedPhone}`);
-
-            // ── Billing subscription extension ───────────────────────────────
-            // If this STK push came from the billing page, context.billingPlan
-            // tells us exactly which plan was purchased. Extend the subscription
-            // immediately instead of waiting for the C2B vendor webhook.
-            const billingPlan = pending.context?.billingPlan;
-            if (billingPlan && ['monthly','annual','lifetime','annual_service'].includes(billingPlan)) {
-                log.info(`[MPESA] Billing STK confirmed — applying plan=${billingPlan} KES=${amount} mpesa=${mpesaCode}`);
-                try {
-                    await _applySubscriptionPayment({
-                        plan_type:  billingPlan,
-                        amount_kes: parseFloat(amount),
-                        mpesa_code: mpesaCode,
-                        phone,
-                        source:     'STK callback',
-                    });
-                    log.info(`[MPESA] ✅ Subscription extended via STK callback: plan=${billingPlan}`);
-                } catch (subErr) {
-                    log.error(`[MPESA] ⚠️ STK confirmed but subscription extension failed: ${subErr.message}`);
-                    // Payment is confirmed — don't lose it. Store for manual reconciliation.
-                    await supabase.from('subscription_payments').insert([{
-                        client_id:      CLIENT_ID,
-                        amount_kes:     parseFloat(amount),
-                        plan_type:      billingPlan,
-                        payment_method: 'M-Pesa STK (pending reconciliation)',
-                        mpesa_code:     mpesaCode,
-                        months_paid:    billingPlan === 'annual' ? 12 : (billingPlan === 'monthly' ? 1 : null),
-                        notes:          `STK confirmed but extension failed: ${subErr.message}. Manual reconciliation required.`,
-                        recorded_by:    'system',
-                    }]).then(({ error: e }) => { if (e) log.error(`[MPESA] Failed to store reconciliation row: ${e.message}`); });
-                }
-            }
-        } else if (code === 1037) {
-            log.info('[MPESA]⚠️ Sandbox timeout (1037) — keeping pending for manual test');
-        } else if (code === 1032) {
-            await mpesaSet(checkId, { ...pending, status: 'cancelled', result_desc: body.ResultDesc || 'Cancelled by user' });
-            log.info(`[MPESA]🚫 Cancelled by customer: ${checkId}`);
-        } else if (code === 1) {
-            await mpesaSet(checkId, { ...pending, status: 'insufficient_funds', result_desc: body.ResultDesc || 'Insufficient funds' });
-            log.info(`[MPESA]💸 Insufficient funds: ${checkId}`);
-        } else {
-            await mpesaSet(checkId, { ...pending, status: 'failed', result_desc: body.ResultDesc });
-            log.info(`[MPESA]❌ Payment failed (code ${code}): ${body.ResultDesc}`);
-        }
-    } catch (err) { log.error('[MPESA CALLBACK ERROR]', err.message); }
-});
-
-app.get('/api/mpesa/status/:checkoutId', requireAuth, async (req, res) => {
-    try {
-        // Prevent 304 caching — status changes and browser cache would hide updates
-        res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-        res.set('Pragma', 'no-cache');
-        const tx = await mpesaGet(req.params.checkoutId);
-        if (!tx) {
-            log.warn('STK status check — transaction not found', { checkoutId: req.params.checkoutId });
-            return res.status(404).json({ success: false, status: 'not_found', message: 'Transaction not found — may have expired or not yet saved' });
-        }
-        res.json({ success: true, status: tx.status, mpesaCode: tx.mpesa_code || null, amount: tx.amount, phone: tx.phone, resultDesc: tx.result_desc || null });
-    } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ── STK Query — ask Safaricom directly (fallback when callback unreachable) ──
-app.get('/api/mpesa/query/:checkoutId', requireAuth, async (req, res) => {
-    const checkoutId = req.params.checkoutId;
-    try {
-        const token     = await getMpesaToken();
-        const timestamp = new Date().toISOString().replace(/[-T:.Z]/g,'').slice(0,14);
-        const password  = Buffer.from(MPESA_SHORTCODE + MPESA_PASSKEY + timestamp).toString('base64');
-        const qRes = await fetch(MPESA_BASE_URL + '/mpesa/stkpushquery/v1/query', {
-            method: 'POST',
-            headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ BusinessShortCode: MPESA_SHORTCODE, Password: password, Timestamp: timestamp, CheckoutRequestID: checkoutId }),
-            signal: AbortSignal.timeout(10000)
-        });
-        const qData = await qRes.json();
-        log.info('[MPESA QUERY]', checkoutId, qData.ResultCode, qData.ResultDesc);
-        const rc = parseInt(qData.ResultCode);
-        const desc = qData.ResultDesc || '';
-        const pending = await mpesaGet(checkoutId);
-        if (rc === 0) {
-            if (pending && pending.status !== 'confirmed') await mpesaSet(checkoutId, { ...pending, status: 'confirmed' });
-            return res.json({ success: true, status: 'confirmed', resultDesc: desc });
-        }
-        if (rc === 1032) {
-            if (pending && pending.status === 'pending') await mpesaSet(checkoutId, { ...pending, status: 'cancelled', result_desc: desc });
-            return res.json({ success: true, status: 'cancelled', resultDesc: 'Customer cancelled the payment' });
-        }
-        if (rc === 1) {
-            if (pending && pending.status === 'pending') await mpesaSet(checkoutId, { ...pending, status: 'insufficient_funds', result_desc: desc });
-            return res.json({ success: true, status: 'insufficient_funds', resultDesc: 'Insufficient M-Pesa balance' });
-        }
-        if (rc === 1037 || (qData.errorCode && qData.errorCode === '500.001.1001'))
-            return res.json({ success: true, status: 'pending', resultDesc: desc });
-        if (pending && pending.status === 'pending') await mpesaSet(checkoutId, { ...pending, status: 'failed', result_desc: desc });
-        return res.json({ success: true, status: 'failed', resultDesc: desc });
-    } catch (err) {
-        log.error('[MPESA QUERY]', err.message);
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║                    JENGA API (EQUITY) INTEGRATION                           ║
+// ║                     INTASEND — M-PESA STK PUSH                              ║
 // ║                                                                              ║
-// ║  Two separate Jenga payment channels — each uses a DIFFERENT endpoint        ║
-// ║  and a DIFFERENT signature formula:                                          ║
+// ║  IntaSend wraps Daraja — no Safaricom or Jenga credentials needed here.     ║
+// ║  Flow:                                                                       ║
+// ║    1. POST /api/mpesa/stk-push  → IntaSend → customer gets M-Pesa prompt    ║
+// ║    2. Customer pays → IntaSend fires POST /api/mpesa/webhook                 ║
+// ║       state: PENDING → PROCESSING → COMPLETE | FAILED                       ║
+// ║    3. Frontend polls GET /api/mpesa/status/:invoiceId every 3 s              ║
 // ║                                                                              ║
-// ║  1. /api/jenga/stk-push  ← M-Pesa Wallet-Based STK (existing, untouched)    ║
-// ║     Endpoint : /api-checkout/mpesa-stk-push/v3.0/init                       ║
-// ║     Signature: orderRef + currency + msisdn + amount                         ║
-// ║     Settles to: Jenga wallet (then you pull to bank)                         ║
+// ║  Env vars:                                                                   ║
+// ║    INTASEND_PUBLISHABLE_KEY   — from IntaSend dashboard                      ║
+// ║    INTASEND_SECRET_KEY        — from IntaSend dashboard                      ║
+// ║    INTASEND_ENV=sandbox|live  — controls which IntaSend URL is used          ║
+// ║    INTASEND_WEBHOOK_CHALLENGE — set in IntaSend dashboard → Webhooks         ║
 // ║                                                                              ║
-// ║  2. /api/jenga/equity-stk-push  ← Equitel STK (NEW, this file)              ║
-// ║     Endpoint : /v3-apis/payment-api/v3.0/stkussdpush/initiate               ║
-// ║     Signature: accountNumber + payRef + mobileNumber + telco + amount + KES  ║
-// ║     Settles to: JENGA_EQUITY_ACCOUNT (your Equity Bank account number)       ║
-// ║     Works for: Equitel numbers only (01XXXXXXXXX)                            ║
-// ║                                                                              ║
-// ║  3. /api/jenga/ipn  ← Webhook for BOTH channels (IPN from Jenga HQ)         ║
-// ║     Matches payments to debts (FIFO) identical to Safaricom C2B              ║
-// ║     Also handles excess → stored for cashier to resolve as goods purchase    ║
+// ║  Register webhook in IntaSend dashboard:                                     ║
+// ║    URL: https://hardware-pos-backend.onrender.com/api/mpesa/webhook          ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
-const JENGA_API_KEY         = process.env.JENGA_API_KEY;
-const JENGA_MERCHANT_CODE   = process.env.JENGA_MERCHANT_CODE;
-const JENGA_CONSUMER_SECRET = process.env.JENGA_CONSUMER_SECRET;
+const INTASEND_STK_BASE      = process.env.INTASEND_ENV === 'live'
+    ? 'https://payment.intasend.com'
+    : 'https://sandbox.intasend.com';
+const INTASEND_STK_PUB       = process.env.INTASEND_PUBLISHABLE_KEY;
+const INTASEND_STK_SEC       = process.env.INTASEND_SECRET_KEY;
+const INTASEND_WEBHOOK_CHALLENGE = process.env.INTASEND_WEBHOOK_CHALLENGE || '';
 
-// JENGA_EQUITY_ACCOUNT: Your Equity Bank account number credited on Equitel STK payments.
-// This is NOT a paybill number — it is your actual Equity Bank account number e.g. 0170194290581
-// Add to .env: JENGA_EQUITY_ACCOUNT=<your account number>
-// Add to .env: JENGA_MERCHANT_NAME=<your business name, e.g. "Elite Hardware Ltd">
-const JENGA_EQUITY_ACCOUNT  = process.env.JENGA_EQUITY_ACCOUNT;
-const JENGA_MERCHANT_NAME   = process.env.JENGA_MERCHANT_NAME || 'Elite Hardware Ltd';
+log.info(`[INTASEND STK] ENV=${process.env.INTASEND_ENV || 'sandbox'} BASE=${INTASEND_STK_BASE}`);
+log.info(`[INTASEND STK] PUB_KEY=${INTASEND_STK_PUB ? '✅ set' : '❌ NOT SET — STK push will return 503'}`);
+log.info(`[INTASEND STK] SECRET=${INTASEND_STK_SEC  ? '✅ set' : '❌ NOT SET — STK push will return 503'}`);
 
-// Single base URL — UAT vs Live switched by JENGA_ENV
-const JENGA_BASE_URL = process.env.JENGA_ENV === 'live'
-    ? 'https://api.finserve.africa'
-    : 'https://uat.finserve.africa';
-
-// ── Startup diagnostic — printed once when server boots ───────────────────────
-// Check these values in your Render logs to confirm what the server actually sees.
-// If JENGA_ENV is not "live" your live credentials hit the UAT server → 401.
-log.info(`[JENGA CONFIG] ENV=${process.env.JENGA_ENV || '(not set — defaulting to UAT)'} BASE_URL=${JENGA_BASE_URL}`);
-log.info(`[JENGA CONFIG] MERCHANT_CODE=${process.env.JENGA_MERCHANT_CODE || '(NOT SET)'}`);
-log.info(`[JENGA CONFIG] API_KEY=${process.env.JENGA_API_KEY ? '✅ set' : '❌ NOT SET'}`);
-log.info(`[JENGA CONFIG] CONSUMER_SECRET=${process.env.JENGA_CONSUMER_SECRET ? '✅ set' : '❌ NOT SET'}`);
-log.info(`[JENGA CONFIG] EQUITY_ACCOUNT=${process.env.JENGA_EQUITY_ACCOUNT || '(NOT SET)'}`);
-log.info(`[JENGA CONFIG] MERCHANT_NAME=${process.env.JENGA_MERCHANT_NAME || '(NOT SET)'}`);
-log.info(`[JENGA CONFIG] CALLBACK_URL=${process.env.JENGA_CALLBACK_URL || '(NOT SET)'}`);
-
-if (!JENGA_API_KEY || !JENGA_MERCHANT_CODE || !JENGA_CONSUMER_SECRET) {
-    log.warn('⚠️  Missing Jenga credentials (JENGA_API_KEY / JENGA_MERCHANT_CODE / JENGA_CONSUMER_SECRET). Jenga routes disabled.');
-}
-if (!JENGA_EQUITY_ACCOUNT) {
-    log.warn('⚠️  JENGA_EQUITY_ACCOUNT not set — Equitel STK push (/api/jenga/equity-stk-push) will return 503.');
+if (!INTASEND_STK_PUB || !INTASEND_STK_SEC) {
+    log.warn('⚠️  INTASEND_PUBLISHABLE_KEY or INTASEND_SECRET_KEY not set — M-Pesa STK push will return 503.');
 }
 
-// ── Jenga Bearer Token Cache ───────────────────────────────────────────────────
-// Jenga V3 tokens expire at an ISO timestamp, not "seconds from now".
-let _jengaToken    = null;
-let _jengaTokenExp = 0;
+// ── POST /api/mpesa/stk-push ──────────────────────────────────────────────────
+app.post('/api/mpesa/stk-push', requireAuth, requireSubscription, async (req, res) => {
+    if (!INTASEND_STK_PUB || !INTASEND_STK_SEC)
+        return res.status(503).json({ success: false, message: 'IntaSend not configured. Set INTASEND_PUBLISHABLE_KEY and INTASEND_SECRET_KEY in .env' });
 
-async function getJengaToken() {
-    if (!JENGA_API_KEY || !JENGA_MERCHANT_CODE || !JENGA_CONSUMER_SECRET) {
-        throw new Error('Jenga credentials not configured in .env');
-    }
-    const now = Date.now();
-    if (_jengaToken && now < _jengaTokenExp - 5 * 60 * 1000) return _jengaToken;
+    const { phone, amount, accountRef, customerName = 'Walk-in Customer', context } = req.body;
 
-    const response = await fetch(`${JENGA_BASE_URL}/authentication/api/v3/authenticate/merchant`, {
-        method:  'POST',
-        headers: { 'Api-Key': JENGA_API_KEY, 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ merchantCode: JENGA_MERCHANT_CODE, consumerSecret: JENGA_CONSUMER_SECRET }),
-        signal:  AbortSignal.timeout(10000)
-    });
-
-    const text = await response.text();
-    if (!response.ok) {
-        log.error(`[JENGA AUTH] ❌ HTTP ${response.status} from ${JENGA_BASE_URL}. Body: ${text.substring(0, 400)}`);
-        throw new Error(`Jenga auth failed: HTTP ${response.status}`);
-    }
-    const data = JSON.parse(text);
-    if (!data.accessToken) {
-        log.error(`[JENGA AUTH] ❌ No accessToken in response: ${JSON.stringify(data).substring(0, 400)}`);
-        throw new Error('Jenga returned no accessToken');
-    }
-
-    _jengaToken    = data.accessToken;
-   // Ignore Jenga's timezone-confused date string. Force a strict 50-minute TTL.
-    _jengaTokenExp = now + 50 * 60 * 1000;
-    log.info('[JENGA] 🔑 Token refreshed');
-    return _jengaToken;
-}
-
-// ── Jenga Private Key (for signing) ───────────────────────────────────────────
-// FIX CRIT-03: Never store private keys as files in the project directory.
-// Encode your jenga-private.pem to base64 once:
-//   base64 -w0 jenga-private.pem   (Linux)
-//   base64 -i jenga-private.pem    (macOS)
-// Then set the result as JENGA_PRIVATE_KEY_B64 in your .env / Render env vars.
-// The actual .pem file should NOT be committed and should be deleted from disk.
-let JENGA_PRIVATE_KEY;
-const _jengaKeyB64 = process.env.JENGA_PRIVATE_KEY_B64;
-if (_jengaKeyB64) {
-    try {
-        JENGA_PRIVATE_KEY = Buffer.from(_jengaKeyB64, 'base64').toString('utf8');
-        log.info('[JENGA] ✅ Private key loaded from JENGA_PRIVATE_KEY_B64 env var.');
-    } catch (e) {
-        log.error('[JENGA] ❌ Failed to decode JENGA_PRIVATE_KEY_B64 — Jenga STK pushes will fail:', e.message);
-    }
-} else {
-    // Fallback: try reading from disk for local dev only.
-    // In production JENGA_PRIVATE_KEY_B64 must be set.
-    try {
-        JENGA_PRIVATE_KEY = fs.readFileSync('jenga-private.pem', 'utf8');
-        if (process.env.NODE_ENV === 'production') {
-            log.error('[JENGA] ❌ SECURITY: jenga-private.pem read from disk in PRODUCTION. Set JENGA_PRIVATE_KEY_B64 env var and delete the .pem file.');
-        } else {
-            log.warn('[JENGA] jenga-private.pem read from disk (dev only). Use JENGA_PRIVATE_KEY_B64 in production.');
-        }
-    } catch (e) {
-        log.warn('[JENGA] No private key found (JENGA_PRIVATE_KEY_B64 not set, jenga-private.pem not found) — Jenga STK pushes will fail.');
-    }
-}
-
-// ── Jenga Public Cert (for IPN verification) — cached once at startup ─────────
-// FIX CRIT-01/03: Load from JENGA_PUBLIC_CERT_B64 env var in production.
-// To encode: base64 -w0 jenga-public-equity.pem  (Linux) / base64 -i (macOS)
-let _jengaPublicCert = null;
-function getJengaPublicCert() {
-    if (_jengaPublicCert) return _jengaPublicCert;
-    const b64 = process.env.JENGA_PUBLIC_CERT_B64;
-    if (b64) {
-        try {
-            _jengaPublicCert = Buffer.from(b64, 'base64').toString('utf8');
-            log.info('[JENGA] ✅ Public cert loaded from JENGA_PUBLIC_CERT_B64 env var.');
-            return _jengaPublicCert;
-        } catch (e) {
-            log.error('[JENGA] ❌ Failed to decode JENGA_PUBLIC_CERT_B64:', e.message);
-            return null;
-        }
-    }
-    // Fallback: read from disk for local dev only
-    try {
-        _jengaPublicCert = fs.readFileSync('jenga-public-equity.pem', 'utf8');
-        if (process.env.NODE_ENV === 'production') {
-            log.error('[JENGA] ❌ SECURITY: jenga-public-equity.pem read from disk in PRODUCTION. Set JENGA_PUBLIC_CERT_B64 env var.');
-        } else {
-            log.warn('[JENGA] jenga-public-equity.pem read from disk (dev only). Use JENGA_PUBLIC_CERT_B64 in production.');
-        }
-        return _jengaPublicCert;
-    } catch (e) {
-        log.warn('[JENGA] jenga-public-equity.pem not found — IPN signature verification will be skipped.');
-        return null;
-    }
-}
-getJengaPublicCert(); // pre-load on startup
-
-// ── Shared FIFO debt-matching helper ─────────────────────────────────────────
-// Identical logic to Safaricom C2B confirmation — used by BOTH Jenga channels.
-// Matches by accountRef (invoice number the customer typed) first, then by phone.
-// Applies payment FIFO across all outstanding debts, then stores the result in
-// c2b_payments so the cashier dashboard and /api/c2b/resolve-goods work unchanged.
-//
-// params: { phone, amount, bankRef, accountRef, customerName, channel }
-//   channel: 'Equity Paybill' | 'Equitel STK' — used in receipt and log messages
-async function applyJengaPayment({ phone, amount, bankRef, accountRef, customerName, channel }) {
-    const now      = new Date();
-    const datePart = now.getFullYear().toString()
-                   + String(now.getMonth() + 1).padStart(2, '0')
-                   + String(now.getDate()).padStart(2, '0');
-    const timePart = String(now.getHours()).padStart(2, '0')
-                   + String(now.getMinutes()).padStart(2, '0')
-                   + String(now.getSeconds()).padStart(2, '0');
-    const payMethod = channel === 'Equitel STK' ? 'Equitel' : 'Equity Paybill';
-    const suffix    = channel === 'Equitel STK' ? 'EQT' : 'EQ';
-    const processor = 'JENGA-AUTO';
-
-    // ── 1. Duplicate guard (idempotency) ─────────────────────────────────────
-    if (bankRef) {
-        const { data: existingC2B } = await supabase
-            .from('c2b_payments')
-            .select('id')
-            .eq('mpesa_code', bankRef)
-            .maybeSingle();
-        if (existingC2B) {
-            log.warn(`[JENGA ${channel}] ⚠️ Duplicate ref blocked: ${bankRef}`);
-            return;
-        }
-    }
-
-    log.info(`[JENGA ${channel}] 💰 KES ${amount} from ${maskName(customerName)} (${bankRef}) acc="${accountRef}"`);
-
-    // ── 2. Find matching debts ────────────────────────────────────────────────
-    // Strategy A: exact invoice/receipt match on what the customer typed as account number
-    let activeDebts = [];
-    if (accountRef && accountRef.trim().length > 2) {
-        const { data: byInvoice } = await supabase
-            .from('Sales')
-            .select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
-            .or(`invoice_number.ilike.%${accountRef.trim()}%,receipt_number.ilike.%${accountRef.trim()}%`)
-            .eq('is_voided', false)
-            .in('payment_status', ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'])
-            .order('sale_date', { ascending: true });
-        if (byInvoice && byInvoice.length > 0) activeDebts = byInvoice;
-    }
-
-    // Strategy B: fallback — match by phone number (same as Safaricom C2B)
-    if (activeDebts.length === 0 && phone) {
-        const { data: byPhone } = await supabase
-            .from('Sales')
-            .select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
-            .eq('customer_phone', phone)
-            .eq('is_voided', false)
-            .in('payment_status', ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'])
-            .order('sale_date', { ascending: true });
-        if (byPhone && byPhone.length > 0) activeDebts = byPhone;
-    }
-
-    // Keep only rows with a genuine outstanding balance
-    activeDebts = activeDebts.filter(d =>
-        (parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) > 0
-    );
-
-    // ── 3. No debt found — but before marking unmatched, check if this is a
-    //    duplicate IPN for an STK push already handled by the STK callback.
-    //
-    //    ROOT CAUSE: Jenga fires TWO callbacks for every STK push:
-    //      a) STK callback  (body.telco present)        → handled first, sale marked Paid
-    //      b) IPN callback  (body.callbackType = 'IPN') → arrives ms later, finds no debt
-    //
-    //    The in-memory pending cache is the most reliable guard because it is
-    //    updated the instant the STK callback is processed — before any DB write.
-    //    The payments table check is a fallback for cases where the cache has expired.
-    if (activeDebts.length === 0) {
-    if (bankRef) {
-        // NEW: Check if this was an STK push initiated from the POS interface
-        // FIX CRIT-03: primaryRef is not in scope here (only computed later in the STK branch).
-        // Guard 1 should only look up by bankRef — which IS available at this point.
-        const pendingRow = await mpesaGet(bankRef);
-        
-        if (pendingRow && pendingRow.status === 'pending') {
-            // This is a legit sale in progress! 
-            // Mark the STK as confirmed so the frontend 'waiting' modal sees it.
-            await mpesaSet(bankRef, { 
-                ...pendingRow, 
-                status: 'confirmed', 
-                mpesa_code: bankRef, 
-                amount, 
-                phone 
-            });
-            log.info(`[JENGA] ✅ STK Session Confirmed for in-progress sale: ${bankRef}`);
-            return; // EXIT HERE. Do not mark as unmatched.
-        }
-   
-            // ── Guard 2: also check via transactionId cross-ref in cache ─────────
-            // Jenga's STK callback stores an _indexFor row keyed by jengaTxId.
-            // If bankRef resolves to a payRef that is confirmed, same conclusion.
-            const indexRow = await mpesaGet(bankRef);
-            if (indexRow?._indexFor) {
-                const primaryRow = await mpesaGet(indexRow._indexFor);
-                if (primaryRow?.status === 'confirmed') {
-                    log.info(`[JENGA ${channel}] ℹ️ bankRef=${bankRef} resolves to confirmed payRef — ignoring duplicate IPN.`);
-                    return;
-                }
-            }
-
-            // ── Guard 3: payments table fallback (covers cache-expired cases) ────
-            const { data: alreadyPaid } = await supabase
-                .from('payments')
-                .select('id')
-                .ilike('mpesa_code', `${bankRef}%`)
-                .maybeSingle();
-            if (alreadyPaid) {
-                log.info(`[JENGA ${channel}] ℹ️ bankRef=${bankRef} already in payments table — ignoring duplicate IPN.`);
-                return;
-            }
-
-            // ── Guard 4: c2b_payments dedup (prevents double-unmatched entries) ──
-            const { data: existingC2B } = await supabase
-                .from('c2b_payments')
-                .select('id')
-                .eq('mpesa_code', bankRef)
-                .maybeSingle();
-            if (existingC2B) {
-                log.info(`[JENGA ${channel}] ℹ️ bankRef=${bankRef} already in c2b_payments — ignoring duplicate.`);
-                return;
-            }
-        }
-
-        // ── Genuinely unmatched ───────────────────────────────────────────────
-        // All guards passed — no matching sale or debt found.
-        //
-        // Routing:
-        //   Safaricom/Equitel STK via Equity → jenga_stk_payments table
-        //     These are POS-initiated pushes. They belong in their own table,
-        //     completely separate from Remote Payments (c2b_payments).
-        //     The cashier resolves them via the Equity STK panel.
-        //
-        //   Equitel/M-Pesa Paybill IPN → c2b_payments table (existing behaviour)
-        //     These are walk-in customers paying manually to the paybill number.
-        //     The cashier resolves them via the Remote Payments panel.
-        const isSTK = channel === 'Safaricom STK via Equity' || channel === 'Equitel STK';
-        if (isSTK) {
-            await supabase.from('jenga_stk_payments').insert([{
-                phone,
-                amount,
-                bank_ref:      bankRef,
-                account_ref:   accountRef,
-                customer_name: customerName,
-                channel,
-                status:        'unmatched',
-                amount_applied: 0,
-                amount_excess:  amount,
-                created_at:    now.toISOString()
-            }]);
-            log.info(`[JENGA ${channel}] ⚠️ Unmatched STK: KES ${amount} from ${phone} — stored in jenga_stk_payments for cashier.`);
-        } else {
-            // Paybill IPN — goes to c2b_payments as before
-            await supabase.from('c2b_payments').insert([{
-                phone,
-                amount,
-                mpesa_code:     bankRef,
-                account_ref:    accountRef,
-                customer_name:  customerName,
-                status:         'unmatched',
-                amount_applied: 0,
-                amount_excess:  amount,
-                created_at:     now.toISOString()
-            }]);
-            log.info(`[JENGA ${channel}] ⚠️ Unmatched paybill IPN: KES ${amount} from ${phone} — stored in c2b_payments.`);
-        }
-        return;
-    }
-
-    // ── 4. Apply payment FIFO across all outstanding debts ────────────────────
-    let remaining    = Math.round(amount);
-    let totalApplied = 0;
-    let payRef       = null;
-
-    for (const debt of activeDebts) {
-        if (remaining <= 0) break;
-        const balance = Math.round(parseFloat(debt.total_amount) - parseFloat(debt.amount_paid || 0));
-        if (balance <= 0) continue;
-
-        const applyAmt = Math.min(remaining, balance);
-        // Snap to total when fully paid to eliminate legacy decimal drift
-        const newPaid  = applyAmt >= balance
-            ? parseFloat(debt.total_amount)
-            : parseFloat(debt.amount_paid || 0) + applyAmt;
-        const newStatus = newPaid >= parseFloat(debt.total_amount) - 0.01 ? 'Paid' : 'Partial';
-        payRef = `PAY-${datePart}-${timePart}-${suffix}`;
-
-        await supabase.from('Sales')
-            .update({ amount_paid: newPaid, payment_status: newStatus })
-            .eq('id', debt.id);
-
-        await supabase.from('payments').insert([{
-            sale_id:       debt.id,
-            amount:        applyAmt,
-            payment_method: payMethod,
-            mpesa_code:    bankRef ? `${bankRef}-${debt.id}` : null,
-            received_by:   processor,
-            customer_name: debt.customer_name || customerName,
-            created_at:    now.toISOString()
-        }]);
-
-        await supabase.from('debt_payments').insert([{
-            sale_id:        debt.id,
-            amount_paid:    applyAmt,
-            payment_method: payMethod,
-            mpesa_id:       bankRef,
-            processed_by:   processor,
-            customer_name:  debt.customer_name || customerName,
-            customer_phone: phone,
-            payment_date:   now.toISOString()
-        }]);
-
-        totalApplied += applyAmt;
-        remaining    -= applyAmt;
-    }
-
-    // ── 5. Update customer aggregate debt balance ─────────────────────────────
-    let newTotalDebt  = 0;
-    const targetPhone = activeDebts[0]?.customer_phone || phone;
-    if (targetPhone) {
-        const { data: cust } = await supabase
-            .from('customers')
-            .select('total_debt')
-            .eq('phone', targetPhone)
-            .single();
-        if (cust) {
-            newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - totalApplied);
-            await supabase.from('customers')
-                .update({ total_debt: newTotalDebt })
-                .eq('phone', targetPhone);
-        }
-    }
-
-    // ── 6. Build receipt JSON and save to c2b_payments ───────────────────────
-    // Same structure as Safaricom C2B so the cashier dashboard and receipt
-    // reprinting logic requires no changes.
-    let receiptDataJson = null;
-    if (totalApplied > 0) {
-        receiptDataJson = JSON.stringify({
-            customer:        activeDebts[0]?.customer_name || customerName,
-            total:           totalApplied,
-            amount:          totalApplied,
-            method:          payMethod,
-            code:            bankRef,
-            receiptNumber:   payRef,
-            servedBy:        processor,
-            date:            now.toLocaleString('en-KE'),
-            items: [{ itemName: `Debt Clearance - ${channel}`, price: totalApplied, quantity: 1 }],
-            remainingBalance: newTotalDebt
-        });
-    }
-
-    // 'excess' = money left over after all debts cleared → cashier links it as goods purchase
-    // 'debt_cleared' = all debt settled exactly or fully
-    const finalStatus = remaining > 0 ? 'excess' : 'debt_cleared';
-    const isSTKChannel = channel === 'Safaricom STK via Equity' || channel === 'Equitel STK';
-
-    if (isSTKChannel) {
-        // Jenga STK push — write to jenga_stk_payments, never to c2b_payments
-        await supabase.from('jenga_stk_payments').insert([{
-            phone,
-            amount,
-            bank_ref:       bankRef,
-            account_ref:    accountRef,
-            customer_name:  activeDebts[0]?.customer_name || customerName,
-            channel,
-            status:         finalStatus,
-            amount_applied: totalApplied,
-            amount_excess:  remaining,
-            receipt_number: payRef,
-            receipt_data:   receiptDataJson,
-            created_at:     now.toISOString()
-        }]);
-    } else {
-        // Paybill IPN (Equity Paybill / M-Pesa Paybill) — write to c2b_payments as before
-        await supabase.from('c2b_payments').insert([{
-            phone,
-            amount,
-            mpesa_code:     bankRef,
-            account_ref:    accountRef,
-            customer_name:  activeDebts[0]?.customer_name || customerName,
-            status:         finalStatus,
-            amount_applied: totalApplied,
-            amount_excess:  remaining,
-            receipt_number: payRef,
-            receipt_data:   receiptDataJson,
-            created_at:     now.toISOString()
-        }]);
-    }
-
-    if (remaining > 0) {
-        log.info(`[JENGA ${channel}] ℹ️ KES ${remaining} excess after debts — cashier can link as goods purchase`);
-    } else if (newTotalDebt > 0) {
-        log.info(`[JENGA ${channel}] ℹ️ Partial: KES ${totalApplied} applied, KES ${newTotalDebt} still owed`);
-    } else {
-        log.info(`[JENGA ${channel}] ✅ All debts cleared for ${maskName(customerName)}`);
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 1 — M-Pesa STK Push via Jenga (Wallet-Based Settlement)
-// Docs: https://developer.jengahq.io/guides/jenga-api/receive-money/mpesa-stk-push/wallet-based-settlement
-// Endpoint : POST /api-checkout/mpesa-stk-push/v3.0/init
-// Signature: orderRef + "KES" + msisdn + amount   (as a number, not string)
-// Settles to: Jenga wallet
-// ═══════════════════════════════════════════════════════════════════════════════
-// Keep /api/jenga/stk-push as an alias so any existing bookmarks or calls don't 404,
-// but internally it just delegates to the unified equity-stk-push handler below.
-app.post('/api/jenga/stk-push', requireAuth, requireSubscription, (req, res, next) => {
-    req.url = '/api/jenga/equity-stk-push';
-    next('route');
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// UNIFIED EQUITY STK PUSH — works for Safaricom (07xx) AND Equitel (01xx)
-//
-// Both use the SAME Jenga endpoint and the SAME signature formula:
-//   POST /v3-apis/payment-api/v3.0/stkussdpush/initiate
-//   Signature = accountNumber + payment.ref + payment.mobileNumber + payment.telco
-//             + payment.amount + payment.currency
-//   (amount MUST be a string: "500.00")
-//
-// The only difference between networks is the `telco` field in the payload:
-//   07xx (Safaricom) → telco: "Safaricom"  → customer gets M-Pesa STK prompt
-//   01xx (Equitel)   → telco: "Equitel"    → customer gets Equitel STK prompt
-//
-// Funds always settle to JENGA_EQUITY_ACCOUNT regardless of the customer's network.
-// The old /api/jenga/stk-push route now aliases here.
-// ═══════════════════════════════════════════════════════════════════════════════
-app.post('/api/jenga/equity-stk-push', requireAuth, requireSubscription, async (req, res) => {
-    if (!JENGA_PRIVATE_KEY)
-        return res.status(503).json({ success: false, message: 'jenga-private.pem not loaded.' });
-    if (!JENGA_EQUITY_ACCOUNT)
-        return res.status(503).json({ success: false, message: 'JENGA_EQUITY_ACCOUNT not set in .env' });
-
-    const { phone, amount, accountRef, customerName = 'Walk-in Customer' } = req.body;
-
-    // ── 1. Normalise to 254XXXXXXXXX (Jenga always wants international format) ──
     let msisdn = String(phone || '').replace(/\s/g, '');
     if (msisdn.startsWith('+'))  msisdn = msisdn.slice(1);
     if (msisdn.startsWith('0'))  msisdn = '254' + msisdn.slice(1);
+    if (!/^2547\d{8}$/.test(msisdn))
+        return res.status(400).json({ success: false, message: 'Invalid phone number. Use 07XXXXXXXX (Safaricom only).' });
 
-    if (!/^2547\d{8}$|^2541[0-9]\d{7}$/.test(msisdn))
-        return res.status(400).json({ success: false, message: 'Invalid phone. Use 07XXXXXXXX (Safaricom) or 01XXXXXXXX (Equitel).' });
-
-    // ── 2. Detect network → set correct telco string ─────────────────────────
-    // Jenga is strict: "Safaricom" or "Equitel" (exact casing, no typos)
-   const telco = (msisdn.startsWith('2541') || msisdn.startsWith('25476')) ? 'Equitel' : 'Safaricom';
     const paymentAmount = Math.ceil(parseFloat(amount));
     if (!paymentAmount || paymentAmount < 1)
-        return res.status(400).json({ success: false, message: 'Invalid amount' });
-
-    // ── 2. Jenga requires amount as a string with 2 decimal places ─────────────
-    const amountStr = paymentAmount.toFixed(2);
-
-    // ── 3. Payment reference: strict Jenga limits ────────────────────────────
-    // Equitel  → 6–12 alphanumeric chars  (docs: "Allowed length 6 to 12")
-    // Safaricom → max 6 alphanumeric chars (docs: "For now we support up to 6")
-    // Strategy: use last N digits of epoch ms, prefix with one letter.
-    //   Equitel:   E + last 11 digits = 12 chars  ✅
-    //   Safaricom: S + last 5 digits  =  6 chars  ✅
-    const payRef = telco === 'Equitel'
-        ? `E${Date.now().toString().slice(-11)}`   // 12 chars e.g. E71490012345
-        : `S${Date.now().toString().slice(-5)}`;   //  6 chars e.g. S12345
-
-    // ── 4. Transaction date (YYYY-MM-DD) ────────────────────────────────────────
-    const txDate    = new Date().toISOString().split('T')[0];
+        return res.status(400).json({ success: false, message: 'Invalid amount.' });
 
     try {
-        const token = await getJengaToken();
-
-        // ── 3. Signature formula (identical for Safaricom AND Equitel) ───────────
-        // accountNumber + payment.ref + payment.mobileNumber + payment.telco
-        //               + payment.amount + payment.currency
-        // amount MUST be the string "500.00" (2 decimal places) — NOT a number.
-        const dataToSign = `${JENGA_EQUITY_ACCOUNT}${payRef}${msisdn}${telco}${amountStr}KES`;
-        const signer     = crypto.createSign('SHA256');
-        signer.update(dataToSign);
-        signer.end();
-        const signature = signer.sign(JENGA_PRIVATE_KEY, 'base64');
-
-       // ── 4. Payload ────────────────────────────────────────────────────────────
-        // Prevent silent hangs if the env var is missing
-        const callbackBase = process.env.JENGA_CALLBACK_URL ;
+        const parts     = (customerName || 'Walk In').trim().split(' ');
+        const firstName = parts[0] || 'Walk';
+        const lastName  = parts.slice(1).join(' ') || 'In';
 
         const payload = {
-            merchant: {
-                accountNumber: JENGA_EQUITY_ACCOUNT,
-                countryCode:   'KE',
-                name:          JENGA_MERCHANT_NAME
-            },
-            payment: {
-                ref:          payRef,
-                amount:       amountStr,   // string, 2 d.p.
-                currency:     'KES',
-                telco:        telco,       // "Safaricom" or "Equitel"
-                mobileNumber: msisdn,      // 254XXXXXXXXX
-                date:         txDate,
-                callBackUrl:  `${callbackBase}/api/jenga/ipn`,
-                pushType:     'STK'        // STK = customer gets interactive prompt (Equitel STK / Safaricom USSD push)
-            }
+            public_key:   INTASEND_STK_PUB,
+            currency:     'KES',
+            method:       'M-PESA',
+            amount:       paymentAmount,
+            phone_number: msisdn,
+            first_name:   firstName,
+            last_name:    lastName,
+            email:        process.env.EMAIL_USER || 'pos@business.com',
+            api_ref:      (accountRef || 'SALE').replace(/[^a-zA-Z0-9\-_ ]/g, '').substring(0, 50),
+            host:         process.env.INTASEND_HOST || process.env.APP_BASE_URL || 'https://hardware-pos-frontend.pages.dev',
         };
 
-        log.info(`[JENGA STK] Initiating → ${msisdn.slice(0,5)}**** (${telco}) KES ${amountStr} ref=${payRef}`);
+        log.info(`[INTASEND STK] Initiating → ${msisdn} KES ${paymentAmount} ref=${payload.api_ref}`);
 
-       // ── 5. Send to Jenga ─────────────────────────────────────────────────────
-        const response = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
+        const response = await fetch(`${INTASEND_STK_BASE}/api/v1/payment/collection/`, {
             method:  'POST',
             headers: {
-                'Authorization': `Bearer ${token}`,
-                'Signature':     signature,
                 'Content-Type':  'application/json',
-                'Accept':        'application/json' // Explicitly demand JSON
+                'Authorization': `Bearer ${INTASEND_STK_SEC}`,
             },
             body:   JSON.stringify(payload),
-            signal: AbortSignal.timeout(20000)
+            signal: AbortSignal.timeout(15000),
         });
 
-       const text = await response.text();
-        log.info(`[JENGA STK] Raw response HTTP=${response.status} body=${text.substring(0, 500)}`); // ← ADD THIS LINE
+        const text = await response.text();
         let data;
-        try { data = JSON.parse(text); } catch (e) { throw new Error('Non-JSON from Jenga: ' + text.substring(0, 300)); }
+        try { data = JSON.parse(text); } catch (e) { throw new Error('Non-JSON from IntaSend: ' + text.substring(0, 300)); }
 
-       // code -1 = queued successfully. code 106201 / status false = rejected.
-        if (!response.ok || data.status === false || data.code === 106201) {
-
-            // ── AUTO-RETRY on expired token ───────────────────────────────────────
-            // Jenga returns 401 when the cached Bearer token has expired server-side.
-            // FIX: clear the cache, fetch a fresh token, and retry ONCE transparently.
-            // NEVER return 401 to the frontend — apiFetch treats any 401 as a user
-            // session logout and redirects to the login page.
-            if (response.status === 401 || data.code === 401) {
-                _jengaToken    = null;
-                _jengaTokenExp = 0;
-                log.warn('[JENGA STK] Token expired on Jenga side — clearing cache and retrying once with fresh token...');
-
-                try {
-                    const freshToken   = await getJengaToken();
-                    const retryResp    = await fetch(`${JENGA_BASE_URL}/v3-apis/payment-api/v3.0/stkussdpush/initiate`, {
-                        method:  'POST',
-                        headers: {
-                            'Authorization': `Bearer ${freshToken}`,
-                            'Signature':     signature,
-                            'Content-Type':  'application/json'
-                        },
-                        body:   JSON.stringify(payload),
-                        signal: AbortSignal.timeout(20000)
-                    });
-                    const retryText = await retryResp.text();
-                    let retryData;
-                    try { retryData = JSON.parse(retryText); } catch(e) { throw new Error('Non-JSON on retry: ' + retryText.substring(0,200)); }
-
-                    if (!retryResp.ok || retryData.status === false || retryData.code === 106201) {
-                        log.warn(`[JENGA STK] ❌ Retry also failed HTTP=${retryResp.status}: ${JSON.stringify(retryData)}`);
-                        return res.status(400).json({ success: false, message: retryData.message || 'STK push rejected by Jenga after token refresh', code: retryData.code });
-                    }
-
-                    // Retry succeeded — persist and continue as normal
-                    log.info(`[JENGA STK] ✅ Retry succeeded with fresh token ref=${payRef}`);
-                    const channelLabelR = telco === 'Equitel' ? 'EQUITEL_STK' : 'SAFARICOM_STK_VIA_EQUITY';
-                    await mpesaSet(payRef, {
-                        status:     'pending',
-                        phone:      msisdn,
-                        amount:     paymentAmount,
-                        context:    { accountRef, channel: channelLabelR, transactionId: retryData.transactionId },
-                        created_at: new Date().toISOString()
-                    });
-                    if (retryData.transactionId && retryData.transactionId !== payRef) {
-                        await mpesaSet(retryData.transactionId, { _indexFor: payRef, created_at: new Date().toISOString() });
-                    }
-                    return res.json({ success: true, payRef, transactionId: retryData.transactionId, message: 'STK push sent. Waiting for customer...' });
-
-                } catch (retryErr) {
-                    log.error('[JENGA STK] Retry after token refresh failed:', retryErr.message);
-                    return res.status(502).json({ success: false, message: 'Bank connection failed after token refresh. Please try again.' });
-                }
-            }
-
-            log.warn(`[JENGA STK] ❌ Rejected (${telco}) HTTP=${response.status} full response: ${JSON.stringify(data)}`);
-            return res.status(400).json({ success: false, message: data.message || 'STK push rejected by Jenga', code: data.code });
-        }
-
-        // ── 6. Persist under payRef (frontend polls /api/jenga/status/:payRef) ───
-        const channelLabel = telco === 'Equitel' ? 'EQUITEL_STK' : 'SAFARICOM_STK_VIA_EQUITY';
-        await mpesaSet(payRef, {
-            status:     'pending',
-            phone:      msisdn,
-            amount:     paymentAmount,
-            context:    { accountRef, channel: channelLabel, transactionId: data.transactionId },
-            created_at: new Date().toISOString()
-        });
-
-        // ── 7. Cross-reference index so IPN can map Jenga's transactionId → payRef ──
-        // Jenga's callback arrives with body.transactionReference = their transactionId,
-        // not our payRef. Without this the IPN can't find the pending row.
-        if (data.transactionId && data.transactionId !== payRef) {
-            await mpesaSet(data.transactionId, {
-                _indexFor:  payRef,       // the key the frontend polls
-                status:     'pending',
-                phone:      msisdn,
-                amount:     paymentAmount,
-                context:    { primaryRef: payRef }
+        if (!response.ok) {
+            log.warn(`[INTASEND STK] ❌ Rejected HTTP=${response.status}: ${JSON.stringify(data)}`);
+            return res.status(400).json({
+                success: false,
+                message: data?.errors?.[0] || data?.detail || data?.message || 'STK push failed',
+                raw:     data,
             });
         }
 
-        log.info(`[JENGA STK] ✅ Queued → ${msisdn} (${telco}) payRef=${payRef} jengaTxId=${data.transactionId}`);
+        const invoiceId = data?.invoice?.invoice_id || data?.id;
+        if (!invoiceId) {
+            log.warn('[INTASEND STK] ⚠️  No invoice_id in response:', data);
+            return res.status(502).json({ success: false, message: 'IntaSend did not return an invoice ID.' });
+        }
+
+        await mpesaSet(invoiceId, {
+            status:     'pending',
+            phone:      msisdn,
+            amount:     paymentAmount,
+            context:    { accountRef, channel: 'INTASEND_MPESA', ...(context || {}) },
+            created_at: new Date().toISOString(),
+        });
+
+        log.info(`[INTASEND STK] ✅ Queued → ${msisdn} KES ${paymentAmount} invoiceId=${invoiceId}`);
         return res.json({
             success:           true,
-            message:           `${telco} payment prompt queued for ${msisdn}. Customer will receive an STK push.`,
-            checkoutRequestId: payRef,        // frontend polls /api/jenga/status/:payRef
-            transactionId:     data.transactionId
+            message:           `M-Pesa STK push sent to ${phone}. Customer will receive a prompt.`,
+            checkoutRequestId: invoiceId,
+            invoiceId,
         });
 
     } catch (err) {
-        // Classify the error so the frontend shows a meaningful message
-        const isTimeout  = err.name === 'TimeoutError'  || err.code === 'UND_ERR_CONNECT_TIMEOUT'
-                        || err.name === 'AbortError'     || (err.message || '').toLowerCase().includes('timeout');
-        const isNetwork  = err.name === 'FetchError'    || (err.message || '').toLowerCase().includes('fetch failed')
-                        || (err.message || '').toLowerCase().includes('econnrefused')
-                        || (err.message || '').toLowerCase().includes('enotfound');
-        const isSandbox  = process.env.JENGA_ENV !== 'live';
-
-        if (isTimeout) {
-            const hint = isSandbox
-                ? 'Jenga UAT sandbox is not responding (known instability). Try again or switch to live env.'
-                : 'Jenga API timed out. Please try again in a moment.';
-            log.warn(`[JENGA STK] ⏱️ Request timed out after 45s (${isSandbox ? 'UAT sandbox' : 'LIVE'}) — ${err.message}`);
-            return res.status(504).json({ success: false, message: hint, code: 'TIMEOUT' });
-        }
-
-        if (isNetwork) {
-            log.error(`[JENGA STK] 🌐 Network error — ${err.message}`);
-            return res.status(502).json({ success: false, message: 'Could not reach Jenga API. Check your internet connection or try again.', code: 'NETWORK_ERROR' });
-        }
-
-        log.error('[JENGA STK ERROR]', err.message || err);
-        return res.status(500).json({ success: false, message: 'Jenga STK error: ' + err.message });
+        log.error('[INTASEND STK ERROR]', err.message);
+        return res.status(500).json({ success: false, message: 'STK push error: ' + err.message });
     }
 });
 
-// ── GET /api/jenga/status/:ref — frontend polling (works for both channels) ───
-// Returns same shape as /api/mpesa/status/:checkoutId for drop-in compatibility.
-app.get('/api/jenga/status/:ref', requireAuth, async (req, res) => {
+// ── GET /api/mpesa/status/:invoiceId ─────────────────────────────────────────
+// Frontend polls every 3 s. Webhook updates the pending_mpesa row when done.
+app.get('/api/mpesa/status/:invoiceId', requireAuth, async (req, res) => {
     try {
         res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.set('Pragma', 'no-cache');
-        const tx = await mpesaGet(req.params.ref);
-        if (!tx) return res.status(404).json({ success: false, status: 'not_found', message: 'Transaction not found' });
+        const tx = await mpesaGet(req.params.invoiceId);
+        if (!tx) return res.status(404).json({ success: false, status: 'not_found', message: 'Transaction not found or expired.' });
         return res.json({
             success:    true,
             status:     tx.status,
             mpesaCode:  tx.mpesa_code  || null,
             amount:     tx.amount,
             phone:      tx.phone,
-            channel:    tx.context?.channel || 'JENGA',
-            resultDesc: tx.result_desc || null
+            channel:    tx.context?.channel || 'INTASEND_MPESA',
+            resultDesc: tx.result_desc || null,
         });
     } catch (err) {
-        log.error('[API]', err.message);
-        return res.status(500).json({ success: false, message: 'Internal server error' });
+        log.error('[MPESA STATUS]', err.message);
+        return res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 3 — Jenga IPN Webhook (Instant Payment Notification)
-// Handles callbacks for BOTH M-Pesa-via-Jenga AND Equitel STK pushes.
-// Register this URL in Jenga HQ under Settings → IPNs.
-//
-// Payload shapes differ per channel:
-//   M-Pesa  (IPN): { callbackType, customer, transaction, bank }
-//   Equitel (callback): { status, code, transactionReference, telcoReference,
-//                         mobileNumber, debitedAmount, requestAmount, charge, currency, telco }
-//
-// After confirming payment, this handler runs the same FIFO debt-matching logic
-// as Safaricom C2B (/api/c2b/confirmation):
-//   - Match by invoice/receipt number (account ref the customer typed)
-//   - Fallback to phone number match
-//   - Apply FIFO across all outstanding debts
-//   - Store excess as 'unmatched' so cashier can resolve as a goods purchase
-//     via the existing /api/c2b/resolve-goods endpoint — no new routes needed
-// ═══════════════════════════════════════════════════════════════════════════════
-// Add /api/jenga/ipn to the subscription-exempt paths so it always processes
-if (!SUB_EXEMPT_PATHS.has('/api/jenga/ipn')) SUB_EXEMPT_PATHS.add('/api/jenga/ipn');
+// ── POST /api/mpesa/webhook ───────────────────────────────────────────────────
+// IntaSend fires this on every state change: PENDING → PROCESSING → COMPLETE | FAILED
+// Register in IntaSend dashboard → Webhooks → URL: /api/mpesa/webhook
+// States: PENDING, PROCESSING, COMPLETE, FAILED
+if (!SUB_EXEMPT_PATHS.has('/api/mpesa/webhook')) SUB_EXEMPT_PATHS.add('/api/mpesa/webhook');
 
-// ── JENGA WEBHOOK (Handles BOTH Independent Paybill IPNs & STK Callbacks) ──
-const _jengaRawParser = express.raw({ type: '*/*', limit: '64kb' });
-
-app.post('/api/jenga/ipn', _jengaRawParser, async (req, res) => {
-    log.info('[JENGA IPN] ⚡ Hit received — ip:', req.ip, 'content-type:', req.headers['content-type'], 'body-size:', req.headers['content-length'] ?? 'unknown');
-
-    // Always ACK immediately so Jenga doesn't retry
-    res.status(200).json({ status: 'Success', message: 'Received' });
+app.post('/api/mpesa/webhook', async (req, res) => {
+    res.status(200).json({ status: 'received' });
 
     try {
-        // Parse raw buffer regardless of what Content-Type Jenga sends
-        let body = {};
-        const rawBuf = req.body;
-        const rawStr = Buffer.isBuffer(rawBuf)
-            ? rawBuf.toString('utf8').trim()
-            : (typeof rawBuf === 'string' ? rawBuf.trim() : '');
+        const body = req.body || {};
+        log.info(`[INTASEND WEBHOOK] state=${body.state} invoice_id=${body.invoice_id} amount=${body.net_amount} ref=${body.api_ref}`);
 
-        if (!rawStr) {
-            log.warn('[JENGA WEBHOOK] Empty body received -- ignoring');
-            return;
-        }
-        try {
-            body = JSON.parse(rawStr);
-        } catch (parseErr) {
-            log.warn('[JENGA WEBHOOK] Body is not valid JSON -- raw:', rawStr.substring(0, 200));
+        // Verify challenge
+        if (INTASEND_WEBHOOK_CHALLENGE && body.challenge !== INTASEND_WEBHOOK_CHALLENGE) {
+            log.warn('[INTASEND WEBHOOK] ❌ Challenge mismatch — ignoring.');
             return;
         }
 
-        // Log ALL incoming headers so we can see exactly what Jenga sends.
-        // This is the only reliable way to find the real signature header name.
-        log.info('[JENGA WEBHOOK] Incoming headers:', JSON.stringify(req.headers));
-        log.info('[JENGA WEBHOOK] Received payload:', JSON.stringify(body).substring(0, 500));
+        const invoiceId = body.invoice_id;
+        if (!invoiceId) { log.warn('[INTASEND WEBHOOK] No invoice_id — ignoring.'); return; }
 
-        // Signature verification
-        // We check every plausible header name Jenga might use.
-        // Check the header log above after the next real callback to confirm the exact name,
-        // then trim this list to the one that matches.
-        const publicCert = getJengaPublicCert();
-        const rawSignature =
-            req.headers['signature']          ||
-            req.headers['x-jenga-signature']  ||
-            req.headers['x-signature']        ||
-            req.headers['authorization']      ||
-            req.headers['x-auth-signature']   ||
-            req.headers['x-callback-signature'] || '';
+        // Map FAILED state → specific frontend-friendly status
+        if (body.state === 'FAILED') {
+            const reason     = (body.failed_reason || '').toLowerCase();
+            const failedCode = String(body.failed_code || '');
+            let newStatus    = 'failed';
+            if (reason.includes('cancel') || reason.includes('reject') || failedCode === '1032') newStatus = 'cancelled';
+            else if (reason.includes('insufficient') || reason.includes('balance') || failedCode === '1')  newStatus = 'insufficient_funds';
+            else if (reason.includes('timeout') || reason.includes('expired') || failedCode === '1037')    newStatus = 'timeout';
 
-        if (publicCert) {
-            if (!rawSignature) {
-                // FIX: Jenga only signs C2B Paybill IPNs (callbackType === 'IPN').
-                // STK Push callbacks intentionally omit the signature — they are verified
-                // instead by matching transactionReference against our internal pending cache.
-                // Hard-blocking ALL unsigned callbacks was rejecting legitimate STK payments.
-                if (process.env.NODE_ENV === 'production') {
-                    if (body.callbackType === 'IPN') {
-                        log.error(`[JENGA IPN] ❌ CRITICAL: Missing signature on C2B IPN in PRODUCTION. Spoofed callback REJECTED from IP ${req.ip}`);
-                        return; // Block unsigned C2B paybill callbacks
-                    }
-                    // STK callbacks are unsigned by design — allow but log clearly
-                    log.warn(`[JENGA IPN] No signature on STK callback (expected) — proceeding via transactionReference matching. IP: ${req.ip}`);
-                } else {
-                    log.warn('[JENGA IPN] No signature header found (CRIT-01). Header names received: '
-                        + Object.keys(req.headers).join(', '));
-                    log.warn('[JENGA IPN] Sandbox/UAT detected — processing WITHOUT signature verification.');
-                }
-            } else {
-                // ── Signature header present — verify it ─────────────────────────────
-     
-                try {
-                    // Reconstruct the signed string Jenga uses for IPN callbacks.
-                    // For IPN (paybill): reference + amount + currency + mobileNumber
-                    // For STK callback: transactionReference + debitedAmount + currency + mobileNumber
-                    const tx   = body.transaction   || {};
-                    const cust = body.customer       || {};
-                    const ref  = tx.reference        || body.transactionReference || body.telcoReference || '';
-                    const amt  = tx.amount           || body.debitedAmount        || body.requestAmount  || '';
-                    const cur  = tx.currency         || body.currency             || 'KES';
-                    const mob  = cust.mobileNumber   || body.mobileNumber         || '';
-                    const dataToVerify = `${ref}${amt}${cur}${mob}`;
-
-                    log.info(`[JENGA IPN] Verifying signature. Data string: "${dataToVerify}"`);
-
-                    const verifier = crypto.createVerify('SHA256');
-                    verifier.update(dataToVerify);
-                    const isValid = verifier.verify(publicCert, rawSignature, 'base64');
-
-                    if (!isValid) {
-                        log.warn(`[JENGA IPN] ❌ SIGNATURE INVALID — spoofed callback REJECTED from IP ${req.ip}`);
-                        return; // Do not process — this is a forged callback
-                    }
-                    log.info('[JENGA IPN] ✅ Signature verified successfully.');
-                } catch (sigErr) {
-                    log.error('[JENGA IPN] ❌ Signature verification threw an error:', sigErr.message, '— callback rejected');
-                    return;
-                }
-            }
-        } else {
-            // ── No public cert loaded ──────────────────────────────────────────────
-            // Jenga only signs C2B Paybill IPNs (callbackType === 'IPN').
-            // STK Push callbacks are intentionally unsigned — they are verified
-            // by matching transactionReference against our internal pending cache.
-            //
-            // Decision matrix:
-            //   cert missing + callbackType=IPN  → BLOCK (unsigned paybill = spoofable)
-            //   cert missing + STK body          → ALLOW (no signature expected from Jenga)
-            //   cert missing + unknown body      → ALLOW with warning (fail open for unknown shapes)
-            if (body.callbackType === 'IPN') {
-                // C2B Paybill IPN with no cert — cannot verify, must block
-                log.error('[JENGA IPN] ❌ JENGA_PUBLIC_CERT_B64 not set — unsigned C2B IPN rejected in production. Set the cert to process paybill payments.');
-                return;
-            }
-            // STK callback (body.telco or body.transactionReference present) — cert not needed
-            log.warn('[JENGA IPN] ⚠️  No public cert loaded. STK callback allowed — will be verified via transactionReference matching.');
-        }
-        // ── End signature verification ──────────────────────────────────────────
-
-        // ── 1. ROUTE: INDEPENDENT PAYBILL 247247 PAYMENT (IPN) ──────────────
-        if (body.callbackType === 'IPN') {
-            const tx   = body.transaction || {};
-            const cust = body.customer    || {};
-
-            if ((tx.status || '').toUpperCase() !== 'SUCCESS') return;
-
-            const phone         = String(cust.mobileNumber || '').replace(/^254/, '0').replace(/^\+254/, '0');
-            const amount        = Math.round(parseFloat(tx.amount || 0));
-            const bankRef       = tx.reference  || null;   // M-Pesa code e.g. SH90HU7FO2
-            const rawAccountRef = tx.billNumber || null;   // What customer typed as account ref
-            const customerName  = cust.name || 'Jenga Paybill Customer';
-
-            const mode    = (tx.paymentMode || '').toUpperCase();
-            const channel = mode === 'EQUITEL' ? 'Equitel Paybill' : 'M-Pesa Paybill';
-
-            if (!amount || amount <= 0 || !bankRef) return;
-
-            // ── Account ref normalisation ─────────────────────────────────────────
-            // When a customer pays manually and types the Equity account number as
-            // the account reference, billNumber = JENGA_EQUITY_ACCOUNT.
-            // Discard it — fall through to phone-based debt matching instead.
-            const isAccountNumber = rawAccountRef &&
-                JENGA_EQUITY_ACCOUNT &&
-                rawAccountRef.trim().replace(/\s/g, '') === String(JENGA_EQUITY_ACCOUNT).trim().replace(/\s/g, '');
-
-            const accountRef = isAccountNumber ? null : rawAccountRef;
-
-            if (isAccountNumber) {
-                log.info(`[JENGA IPN] billNumber="${rawAccountRef}" matches JENGA_EQUITY_ACCOUNT — using phone matching only.`);
-            }
-
-            log.info(`[JENGA IPN] ${channel} KES ${amount} from ${maskName(customerName)}. accountRef="${accountRef || '(phone match)'}"`);
-
-            await applyJengaPayment({ phone, amount, bankRef, accountRef, customerName, channel });
+            const pending = await mpesaGet(invoiceId);
+            if (pending) await mpesaSet(invoiceId, { ...pending, status: newStatus, result_desc: body.failed_reason || 'Payment failed' });
+            log.info(`[INTASEND WEBHOOK] ❌ ${newStatus} invoiceId=${invoiceId} reason="${body.failed_reason}"`);
             return;
         }
 
-       // ── 2. ROUTE: OUTBOUND STK CALLBACK (Safaricom or Equitel via Equity account-based) ──
-        // Jenga sends this shape for both telcos:
-        // { status, code, transactionReference, telcoReference, mobileNumber,
-        //   debitedAmount, requestAmount, telco: "Safaricom"|"Equitel", ... }
-        if (body.telco || body.transactionReference) {
-            // Official Jenga STK callback codes (from Jenga API docs):
-            //   0 = PENDING
-            //   1 = FAILED
-            //   2 = AWAITING_THIRD_PARTY_SETTLEMENT (successful, manual settlement pending)
-            //   3 = COMPLETED/CREDITED (fully settled to merchant)
-            //   4 = AWAITING-SETTLEMENT (customer paid, merchant crediting delayed)
-            //   5 = CANCELLED (by user)
-            //   6 = CANCELLED
-            //   7 = REJECTED
-            //
-            // Codes 3 and 4: money is confirmed received -- apply the payment now.
-            // Code 2: third-party settlement pending -- still safe to credit customer
-            //         since Jenga guarantees the funds; treat as paid.
-            // Codes 0,1,5,6,7: not paid -- classify for the frontend polling response.
-            //
-            // body.status is unreliable across Jenga versions (boolean, string, int) --
-            // use body.code as the single source of truth.
-            const codeStr = String(body.code);
-            const isPaid = codeStr === '3' || codeStr === '4' || codeStr === '2';
-
-            const jengaTxId     = body.transactionReference || null;
-            const callbackTelco = body.telco || 'Unknown';
-
-            // Resolve cross-reference: jengaTxId -> our payRef
-            // We saved an index row under jengaTxId with _indexFor pointing to payRef.
-            let primaryRef = jengaTxId;
-            if (jengaTxId) {
-                const indexRow = await mpesaGet(jengaTxId);
-                if (indexRow?._indexFor) {
-                    primaryRef = indexRow._indexFor;
-                    log.info(`[JENGA IPN] Resolved jengaTxId=${jengaTxId} -> payRef=${primaryRef} (${callbackTelco})`);
-                }
-            }
-
-            if (!isPaid) {
-                // Map official codes directly -- no message-text guessing needed
-                let newStatus;
-                switch (codeStr) {
-                    case '5':
-                    case '6':  newStatus = 'cancelled';  break;
-                    case '7':  newStatus = 'failed';      break;  // REJECTED
-                    case '1':  {
-                        // Code 1 = FAILED -- check message text to sub-classify
-                        const msg = (
-                            (body.message      || '') + ' ' +
-                            (body.description  || '') + ' ' +
-                            (body.reason       || '')
-                        ).toLowerCase();
-                        if (msg.includes('insufficient') || msg.includes('balance') ||
-                            msg.includes('funds')        || msg.includes('limit')   ||
-                            msg.includes('exceed')       || msg.includes('not enough')) {
-                            newStatus = 'insufficient_funds';
-                        } else if (msg.includes('timeout') || msg.includes('timed out') ||
-                                   msg.includes('expired') || msg.includes('no response')) {
-                            newStatus = 'timeout';
-                        } else {
-                            newStatus = 'failed';
-                        }
-                        break;
-                    }
-                    default: newStatus = 'failed';
-                }
-
-                const resultDesc = body.message || body.description || `Payment not completed (code ${codeStr})`;
-                log.info(`[JENGA STK CB] ${callbackTelco} not paid: code=${codeStr} status=${newStatus} msg="${resultDesc}"`);
-
-                if (primaryRef) {
-                    const pending = await mpesaGet(primaryRef);
-                    if (pending) {
-                        await mpesaSet(primaryRef, { ...pending, status: newStatus, result_desc: resultDesc });
-                    }
-                }
-                return;
-            }
-
-
-            const phone        = String(body.mobileNumber || '').replace(/^(?:\+?254)/, '0');
-            const amount       = Math.round(parseFloat(body.debitedAmount || body.requestAmount || 0));
-            // FIX CRIT-04: telcoReference is the customer-visible bank/telco ref (shown on their statement).
-            // transactionReference is Jenga's internal ID — valid for dedup but NOT for customer reconciliation.
-            // We track which was used via _bankRefSource so cashiers know what to search for.
-            const telcoRef  = body.telcoReference || null;
-            const bankRef   = telcoRef || body.transactionReference || null;
-            const _bankRefSource = telcoRef ? 'telcoReference' : (body.transactionReference ? 'transactionReference_fallback' : null);
-            if (!telcoRef) log.warn(`[JENGA STK CB] telcoReference absent — using transactionReference as bankRef. Source: ${_bankRefSource}`);
-            const channel      = callbackTelco === 'Equitel' ? 'Equitel STK' : 'Safaricom STK via Equity';
-
-            if (!amount || amount <= 0 || !bankRef) return;
-
-            // Recover invoice accountRef from our pending row, then mark confirmed
-            let actualBillNumber = null;
-            if (primaryRef) {
-                const pending = await mpesaGet(primaryRef);
-                if (pending) {
-                    await mpesaSet(primaryRef, { ...pending, status: 'confirmed', mpesa_code: bankRef, amount, phone });
-                    actualBillNumber = pending.context?.accountRef || null;
-                }
-            }
-
-            log.info(`[JENGA STK CB] ${callbackTelco} confirmed: KES ${amount} from ${String(phone).slice(0,5)}**** bankRef=${String(bankRef).slice(0,4)}****`);
-            await applyJengaPayment({
-                phone, amount, bankRef,
-                accountRef: actualBillNumber,
-                customerName: `${callbackTelco} Customer`,
-                channel
-            });
+        // Only process COMPLETE
+        if (body.state !== 'COMPLETE') {
+            log.info(`[INTASEND WEBHOOK] state=${body.state} — skipping (not COMPLETE or FAILED)`);
             return;
         }
 
-        log.warn('[JENGA WEBHOOK] Unrecognised payload shape:', JSON.stringify(body).substring(0, 300));
+        // Duplicate guard
+        const { data: existingC2B } = await supabase.from('c2b_payments').select('id').eq('mpesa_code', invoiceId).maybeSingle();
+        if (existingC2B) { log.warn(`[INTASEND WEBHOOK] ⚠️  Duplicate invoiceId=${invoiceId} — already processed.`); return; }
 
-    } catch (err) {
-        log.error('[JENGA WEBHOOK ERROR]', err.message, err.stack?.split('\n')[1]?.trim());
-    }
-});
-// ╔══════════════════════════════════════════════════════════════╗
-// ║              DIGITAX WEBHOOK (ASYNC QUEUE)                   ║
-// ╚══════════════════════════════════════════════════════════════╝
-app.post('/api/digitax/callback', async (req, res) => {
-    // FIX HIGH-02: Verify shared webhook secret before processing any payload.
-    // Set DIGITAX_WEBHOOK_SECRET in your .env and register the same value in DigiTax HQ
-    // under Settings → Webhooks → Secret. Without this, anyone can forge KRA receipt data.
-    const digitaxWebhookSecret = process.env.DIGITAX_WEBHOOK_SECRET;
-    const receivedSecret = req.headers['x-digitax-secret'] || req.headers['x-webhook-secret']||req.query.secret;
-    if (digitaxWebhookSecret) {
-        if (!receivedSecret || receivedSecret !== digitaxWebhookSecret) {
-            log.warn(`[DIGITAX CB] ❌ Rejected — invalid or missing secret from IP ${req.ip}`);
-            // Return 200 to prevent DigiTax from logging failures, but do NOT process
-            return res.status(200).json({ received: false, reason: 'Invalid secret' });
-        }
-    } else if (process.env.NODE_ENV === 'production') {
-        log.error('[DIGITAX CB] ❌ DIGITAX_WEBHOOK_SECRET not set in PRODUCTION — all callbacks rejected for safety.');
-        return res.status(200).json({ received: false, reason: 'Server misconfiguration' });
-    }
+        const amount = Math.round(parseFloat(body.net_amount || body.value || 0));
+        const apiRef = body.api_ref || '';
 
-    // 1. Acknowledge receipt immediately so DigiTax doesn't retry
-    res.status(200).json({ received: true });
+        // Recover phone + accountRef from pending row
+        const pending    = await mpesaGet(invoiceId);
+        const phone      = pending?.phone ? String(pending.phone).replace(/^254/, '0') : '';
+        const accountRef = pending?.context?.accountRef || apiRef || null;
 
-    try {
-        const { event, data } = req.body;
-        if (!data) return;
-
-        log.info(`[DIGITAX WEBHOOK] Received event: ${event}`, { id: data.id || data.digitax_id });
-
-        // ── A. ITEM SYNC (Inventory) ───────────────────────────
-        if (event === 'item.sync') {
-            const digitaxItemId = data.id; // <ITEM_ID>
-            if (digitaxItemId) {
-                await supabase.from('Inventory')
-                    .update({ kra_registered: true })
-                    .eq('digitax_item_id', digitaxItemId);
-                log.info(`[DIGITAX WEBHOOK] ✅ Item ${digitaxItemId} marked as KRA Registered.`);
-            }
-        } 
-        
-        // ── B. SALE / CREDIT NOTE SYNC (Sales & Returns) ───────
-        else if (event === 'sale.sync') {
-            const digitaxSaleId = data.digitax_id; // <SALE_ID>
-            const etimsUrl      = data.etims_url;
-            const kraReceipt    = data.receipt_number || data.trader_invoice_number;
-            const etimsNo       = data.invoice_number;
-            const controlUnit   = data.serial_number;
-
-            if (digitaxSaleId && etimsUrl) {
-                // 1. Try updating a Sale
-                const { data: sale } = await supabase.from('Sales')
-                    .select('id').eq('digitax_sale_id', digitaxSaleId).maybeSingle();
-                
-                if (sale) {
-                    await supabase.from('Sales').update({
-                        'Kra_Receipt_No':      kraReceipt,
-                        'kra_qr_url':          etimsUrl,
-                        'E-tims_No':           etimsNo,
-                        'Control_unit_number': controlUnit
-                    }).eq('id', sale.id);
-                    log.info(`[DIGITAX WEBHOOK] ✅ Sale ${sale.id} verified by KRA.`);
-                }
-
-                // 2. Try updating a Return / Credit Note
-                const { data: ret } = await supabase.from('returns_log')
-                    .select('id').eq('kra_return_ref', digitaxSaleId).maybeSingle();
-                
-                if (ret) {
-                    await supabase.from('returns_log').update({
-                        kra_return_qr_url: etimsUrl,
-                        etims_no:          etimsNo
-                    }).eq('id', ret.id);
-                    log.info(`[DIGITAX WEBHOOK] ✅ Return/Credit Note ${ret.id} verified by KRA.`);
-                }
-            }
-        }
-    } catch (err) {
-        log.error('[DIGITAX WEBHOOK ERROR]', err.message);
-    }
-});
-// Clean up stale pending_mpesa rows older than 10 minutes every minute
-setInterval(async () => {
-    const cutoff = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-    await supabase.from('pending_mpesa').delete().lt('created_at', cutoff).eq('status', 'pending');
-}, 60 * 1000);
-app.post('/api/verify-payment', requireAuth, async (req, res) => {
-    const { mpesaCode, expectedAmount, isManualOverride } = req.body;
-    const code = mpesaCode?.toUpperCase().trim();
-
-    try {
-        // STEP 1: Check the 'payments' table first (Successes)
-        const { data: payment } = await supabase
-            .from('payments')
-            .select('*')
-            .eq('mpesa_receipt_number', code)
-            .single();
-
-        if (payment) {
-            if (parseFloat(payment.amount) < parseFloat(expectedAmount)) {
-                return res.status(400).json({ success: false, message: 'Amount mismatch in Payment records.' });
-            }
-            return res.json({ success: true, status: 'VERIFIED', message: 'Payment confirmed.' });
-        }
-
-        // STEP 2: Check the 'pending_mpesa' table (To see if it failed)
-        const { data: pending } = await supabase
-            .from('pending_mpesa')
-            .select('result_desc')
-            .eq('mpesa_receipt_number', code)
-            .single();
-
+        // Mark confirmed
         if (pending) {
-            return res.status(400).json({ 
-                success: false, 
-                message: `Transaction failed: ${pending.result_desc}. Do not release goods.` 
-            });
+            await mpesaSet(invoiceId, { ...pending, status: 'confirmed', mpesa_code: invoiceId, amount, result_desc: 'Payment confirmed via IntaSend' });
         }
 
-        // STEP 3: Manual Override for Network Delays
-        if (isManualOverride) {
-            if (!['admin', 'manager'].includes(req.user.role.toLowerCase())) {
-                return res.status(403).json({ success: false, message: 'Manager approval required for manual entry.' });
-            }
+        log.info(`[INTASEND WEBHOOK] ✅ COMPLETE invoiceId=${invoiceId} KES=${amount} phone=${phone} ref=${accountRef}`);
 
-            const { manager_id } = req.body;
-            if (!manager_id) {
-                return res.status(400).json({ success: false, message: 'manager_id is required for manual override. A manager must authorize this entry.' });
-            }
-
-            // Verify the manager_id exists and has manager/admin role
-            const { data: authorizer } = await supabase
-                .from('users')
-                .select('id, name, role')
-                .eq('id', manager_id)
-                .in('role', ['admin', 'manager'])
-                .single();
-
-            if (!authorizer) {
-                return res.status(403).json({ success: false, message: 'Invalid manager_id — authorizing manager not found or insufficient role.' });
-            }
-
-            // Full audit trail: who requested + who authorized
-            log.warn(`[MANUAL-PAYMENT] Code ${code} — requested by ${req.user.name} (${req.user.role}) — authorized by ${authorizer.name} (${authorizer.role}) — IP: ${req.ip}`);
-
-            return res.json({ 
-                success: true, 
-                status: 'PENDING_AUDIT', 
-                message: 'Manual entry accepted. Flagged for later reconciliation.',
-                authorizedBy: authorizer.name
-            });
-        }
-
-        res.status(404).json({ success: false, message: 'Code not found. If Safaricom is slow, get Manager override.' });
-
-    } catch (err) {
-        log.error('[VERIFY-ERROR]', err);
-        res.status(500).json({ success: false, message: 'Internal Server Error' });
-    }
-});
-// ╔══════════════════════════════════════════════════════════════╗
-// ║         C2B — REMOTE DEBT PAYMENTS VIA TILL NUMBER          ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-// ── Register C2B URLs with Safaricom (run once) ───────────────────────────────
-app.post('/api/c2b/register', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
-    try {
-        const token   = await getMpesaToken();
-        const secret  = process.env.WEBHOOK_SECRET; // 1. Grab your secret
-        const baseUrl = MPESA_CALLBACK_URL.replace('/api/mpesa/callback', ''); // Clean up the base URL
-        
-        const body    = {
-            ShortCode:       MPESA_SHORTCODE,
-            ResponseType:    'Completed',
-            // 2. Append ?secret= to both URLs!
-            ConfirmationURL: `${baseUrl}/api/c2b/confirmation?secret=${secret}`,
-            ValidationURL:   `${baseUrl}/api/c2b/validation?secret=${secret}`
-        };
-        const r    = await fetch(`${MPESA_BASE_URL}/mpesa/c2b/v1/registerurl`, {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-        const data = await r.json();
-        log.info('[C2B REGISTER]', data);
-        res.json({ success: true, data });
-    } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ── Safaricom C2B Validation (approve all payments) ───────────────────────────
-app.post('/api/c2b/validation', requireSafaricomIP, requireWebhookSecret, (req, res) => {
-    // FIX HIGH-01/MED-01: Never log the full C2B body — it contains MSISDN (phone) and names
-    log.info('[C2B VALIDATION] Received — approved');
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
-});
-
-// ── Safaricom C2B Confirmation (payment received) ─────────────────────────────
-app.post('/api/c2b/confirmation', requireSafaricomIP, requireWebhookSecret, async (req, res) => {
-    // Always ACK immediately so Safaricom doesn't retry
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
-
-    try {
-        const p            = req.body;
-        const phone        = String(p.MSISDN || '').replace(/^254/, '0');
-        const amount       = Math.round(parseFloat(p.TransAmount || 0));
-        const mpesaCode    = p.TransID       || null;
-        const accountRef   = p.BillRefNumber || null;
-        const firstName    = p.FirstName     || '';
-        const lastName     = p.LastName      || '';
-        const customerName = `${firstName} ${lastName}`.trim() || 'Unknown';
-
-        if (!phone || amount <= 0) return;
-
-        // ── DUPLICATE GUARD (Idempotency) ─────────────────────────────────────
-        if (mpesaCode) {
-            const { data: existingC2B } = await supabase
-                .from('c2b_payments')
-                .select('id')
-                .eq('mpesa_code', mpesaCode)
-                .maybeSingle();
-            
-            if (existingC2B) {
-                // FIX HIGH-01: Mask PII in logs
-                const maskedPhone2 = String(phone).slice(0,3) + '****' + String(phone).slice(-2);
-                log.warn(`[C2B] ⚠️ Duplicate M-Pesa code blocked: ${String(mpesaCode).slice(0,4)}**** from ${maskedPhone2}`);
-                return; // Safaricom already got the 200 OK, abort processing
-            }
-        }
-        // ──────────────────────────────────────────────────────────────────────
-
-        // FIX HIGH-01: Mask PII in logs (ODPC compliance)
-        const maskedPhoneC2B = String(phone).slice(0, 3) + '****' + String(phone).slice(-2);
-        const maskedCodeC2B  = mpesaCode ? String(mpesaCode).slice(0, 4) + '****' : 'N/A';
-        log.info(`[C2B] 💰 Received KES ${amount} from ${maskedPhoneC2B} (${maskedCodeC2B})`);
+        // ── FIFO debt matching (same logic as Safaricom C2B) ─────────────────
         const now      = new Date();
         const datePart = now.getFullYear().toString() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0');
         const timePart = String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0') + String(now.getSeconds()).padStart(2,'0');
 
-        // ── Find active debts for this phone (FIFO) ───────────────────────────
-        const { data: debts } = await supabase
-            .from('Sales')
-            .select('id, item_name, total_amount, amount_paid, customer_name')
-            .eq('customer_phone', phone)
-            .eq('is_voided', false)
-            .in('payment_status', ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'])
-            .order('sale_date', { ascending: true });
+        let activeDebts = [];
 
-        const activeDebts = (debts || []).filter(d =>
-            (parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) > 0
-        );
+        if (accountRef && accountRef.trim().length > 2) {
+            const { data: byInvoice } = await supabase.from('Sales').select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
+                .or(`invoice_number.ilike.%${accountRef.trim()}%,receipt_number.ilike.%${accountRef.trim()}%`)
+                .eq('is_voided', false).in('payment_status', ['Credit','Partial','credit','partial','Unpaid']).order('sale_date', { ascending: true });
+            if (byInvoice?.length) activeDebts = byInvoice;
+        }
 
-        // ── No debt — store as unmatched for cashier to handle ────────────────
-        if (activeDebts.length === 0) {
+        if (!activeDebts.length && phone) {
+            const { data: byPhone } = await supabase.from('Sales').select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
+                .eq('customer_phone', phone).eq('is_voided', false)
+                .in('payment_status', ['Credit','Partial','credit','partial','Unpaid']).order('sale_date', { ascending: true });
+            if (byPhone?.length) activeDebts = byPhone;
+        }
+
+        activeDebts = activeDebts.filter(d => (parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) > 0);
+
+        // No debt — store as unmatched for cashier to resolve as goods purchase
+        if (!activeDebts.length) {
             await supabase.from('c2b_payments').insert([{
-                phone, amount, mpesa_code: mpesaCode, account_ref: accountRef,
-                customer_name: customerName, status: 'unmatched',
-                amount_applied: 0, amount_excess: amount,
-                created_at: now.toISOString()
+                phone, amount, mpesa_code: invoiceId, account_ref: accountRef,
+                customer_name: 'IntaSend Customer', status: 'unmatched',
+                amount_applied: 0, amount_excess: amount, created_at: now.toISOString(),
             }]);
-            log.info(`[C2B]⚠️ No debts for ${phone} — stored as unmatched`);
+            log.info(`[INTASEND WEBHOOK] ⚠️  No debt matched ref="${accountRef}" phone="${phone}" — stored as unmatched`);
             return;
         }
 
-       // ── Has debt — apply FIFO first ───────────────────────────────────────
-        let remaining    = Math.round(amount);
-        let totalApplied = 0;
-        let payRef       = null;
-
+        // Apply FIFO
+        let remaining = amount, totalApplied = 0, payRef = null;
         for (const debt of activeDebts) {
             if (remaining <= 0) break;
             const balance  = Math.round(parseFloat(debt.total_amount) - parseFloat(debt.amount_paid || 0));
             if (balance <= 0) continue;
-
             const applyAmt = Math.min(remaining, balance);
-            
-            let newPaid;
-            if (applyAmt >= balance) {
-                newPaid = parseFloat(debt.total_amount); // Snaps to total, wiping legacy decimals
-            } else {
-                newPaid = parseFloat(debt.amount_paid || 0) + applyAmt;
-            }
-            
+            const newPaid  = applyAmt >= balance ? parseFloat(debt.total_amount) : parseFloat(debt.amount_paid || 0) + applyAmt;
             const newStatus = newPaid >= parseFloat(debt.total_amount) - 0.01 ? 'Paid' : 'Partial';
-            payRef = 'PAY-' + datePart + '-' + timePart + '-C2B';
-
-            await supabase.from('Sales').update({
-                amount_paid:    newPaid,
-                payment_status: newStatus
-            }).eq('id', debt.id);
-
+            payRef = `PAY-${datePart}-${timePart}-IS`;
+            await supabase.from('Sales').update({ amount_paid: newPaid, payment_status: newStatus }).eq('id', debt.id);
             await supabase.from('payments').insert([{
                 sale_id: debt.id, amount: applyAmt, payment_method: 'M-Pesa',
-                mpesa_code: mpesaCode ? `${mpesaCode.trim().toUpperCase()}-${debt.id}` : null, received_by: 'C2B-AUTO',
-                customer_name: debt.customer_name || customerName,
-                created_at: now.toISOString()
+                mpesa_code: `${invoiceId}-${debt.id}`, received_by: 'INTASEND-AUTO',
+                customer_name: debt.customer_name || 'IntaSend Customer', created_at: now.toISOString(),
             }]);
-
             await supabase.from('debt_payments').insert([{
                 sale_id: debt.id, amount_paid: applyAmt, payment_method: 'M-Pesa',
-                mpesa_id: mpesaCode, processed_by: 'C2B-AUTO',
-                customer_name: debt.customer_name || customerName,
-                customer_phone: phone, payment_date: now.toISOString()
+                mpesa_id: invoiceId, processed_by: 'INTASEND-AUTO',
+                customer_name: debt.customer_name || 'IntaSend Customer',
+                customer_phone: phone, payment_date: now.toISOString(),
             }]);
-
             totalApplied += applyAmt;
             remaining    -= applyAmt;
         }
-        // Update customer total_debt and capture the new balance
+
+        // Update customer aggregate debt
         let newTotalDebt = 0;
-        const { data: cust } = await supabase.from('customers').select('total_debt').eq('phone', phone).single();
-        if (cust) {
-            newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - totalApplied);
-            await supabase.from('customers').update({
-                total_debt: newTotalDebt
-            }).eq('phone', phone);
+        const targetPhone = activeDebts[0]?.customer_phone || phone;
+        if (targetPhone) {
+            const { data: cust } = await supabase.from('customers').select('total_debt').eq('phone', targetPhone).single();
+            if (cust) {
+                newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - totalApplied);
+                await supabase.from('customers').update({ total_debt: newTotalDebt }).eq('phone', targetPhone);
+            }
         }
 
-       // ── Build Receipt Data for Saving (NO INSTANT PRINT) ──────────────────
         let receiptDataJson = null;
         if (totalApplied > 0) {
-            const receiptData = {
-                customer: activeDebts[0]?.customer_name || customerName,
-                total: totalApplied,
-                amount: totalApplied,
-                method: 'M-Pesa',
-                code: mpesaCode,
-                receiptNumber: payRef,
-                servedBy: 'AUTO-C2B',
-                date: new Date().toLocaleString('en-KE'),
-                items: [{ itemName: 'Debt Clearance - Auto C2B', price: totalApplied, quantity: 1 }],
-                remainingBalance: newTotalDebt // <-- NEW: Saves balance to the receipt!
-            };
-            receiptDataJson = JSON.stringify(receiptData);
+            receiptDataJson = JSON.stringify({
+                customer: activeDebts[0]?.customer_name || 'IntaSend Customer',
+                total: totalApplied, amount: totalApplied, method: 'M-Pesa (IntaSend)',
+                code: invoiceId, receiptNumber: payRef, servedBy: 'INTASEND-AUTO',
+                date: now.toLocaleString('en-KE'),
+                items: [{ itemName: 'Debt Clearance - IntaSend', price: totalApplied, quantity: 1 }],
+                remainingBalance: newTotalDebt,
+            });
         }
 
-        // ── Store in c2b_payments ─────────────────────────────────────────────
-        const status = remaining > 0 ? 'excess' : 'debt_cleared';
+        const finalStatus = remaining > 0 ? 'excess' : 'debt_cleared';
         await supabase.from('c2b_payments').insert([{
-            phone, amount, mpesa_code: mpesaCode, account_ref: accountRef,
-            customer_name: activeDebts[0]?.customer_name || customerName,
-            status, amount_applied: totalApplied, amount_excess: remaining,
-            receipt_number: payRef,          // Store the reference
-            receipt_data: receiptDataJson,   // Store the JSON for re-printing later
-            created_at: now.toISOString()
+            phone, amount, mpesa_code: invoiceId, account_ref: accountRef,
+            customer_name: activeDebts[0]?.customer_name || 'IntaSend Customer',
+            status: finalStatus, amount_applied: totalApplied, amount_excess: remaining,
+            receipt_number: payRef, receipt_data: receiptDataJson, created_at: now.toISOString(),
         }]);
 
-        // ── Smarter Logging ───────────────────────────────────────────────────
-        if (remaining > 0) {
-            log.info(`[C2B]ℹ️ KES ${remaining} excess after clearing all debts — cashier to link to new goods`);
-        } else if (newTotalDebt > 0) {
-            log.info(`[C2B]ℹ️ Partial payment: KES ${totalApplied} applied. KES ${newTotalDebt} still owed by ${phone}`);
-        } else {
-            log.info(`[C2B]✅ All debts cleared for ${phone}`);
-        }
+        remaining > 0
+            ? log.info(`[INTASEND WEBHOOK] ℹ️  KES ${remaining} excess — cashier resolves as goods purchase`)
+            : log.info(`[INTASEND WEBHOOK] ✅ Debts cleared. Applied KES ${totalApplied} remaining KES ${newTotalDebt}`);
 
     } catch (err) {
-        log.error('[C2B CONFIRMATION ERROR]', err.message);
-    }
-});
-// ── Cashier marks unmatched/excess C2B as goods purchase ─────────────────────
-// ── Cashier marks unmatched/excess C2B as goods purchase ─────────────────────
-app.post('/api/c2b/resolve-goods', requireAuth, requireRole('admin', 'manager', 'cashier'), requireSubscription, async (req, res) => {
-    // FIX: Destructure amountApplied from req.body
-    const { c2bId, notes, customerName, receiptNumber, receiptData, amountApplied } = req.body;
-    if (!c2bId) return res.status(400).json({ success: false, message: 'c2bId required' });
-    
-    try {
-        const { data: c2b, error: fetchErr } = await supabase
-            .from('c2b_payments')
-            .select('*')
-            .eq('id', c2bId)
-            .single();
-        
-        if (fetchErr || !c2b) return res.status(404).json({ success: false, message: 'C2B payment not found' });
-
-        const applied = parseFloat(amountApplied || 0);
-        const currentTotalApplied = parseFloat(c2b.amount_applied || 0) + applied;
-        const totalPaid = parseFloat(c2b.amount || 0);
-        const excess = Math.max(0, totalPaid - currentTotalApplied); // Ensure non-negative
-
-        // Change to 'completed' when fully resolved (no excess) to hide from dashboard
-        const newStatus = excess > 0.01 ? 'excess' : 'completed';
-
-        const newNotes = c2b.notes ? `${c2b.notes} | ${notes}` : notes;
-
-        const { error } = await supabase.from('c2b_payments').update({
-            status:         newStatus,
-            amount_applied: currentTotalApplied,
-            amount_excess:  excess,
-            resolved_by:    req.user.name,
-            resolved_at:    new Date().toISOString(),
-            notes:          newNotes      || null,
-            customer_name:  customerName  || null,
-            receipt_number: receiptNumber || null,
-            receipt_data:   receiptData   ? JSON.stringify(receiptData) : null,
-        }).eq('id', c2bId);
-        
-        if (error) throw error;
-
-        res.json({ success: true, message: 'C2B payment resolved', excess });
-    } catch (err) {
-        log.error('[C2B RESOLVE ERROR]', err.message);
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+        log.error('[INTASEND WEBHOOK ERROR]', err.message, err.stack?.split('\n')[1]?.trim());
     }
 });
 
-// ── Cashier applies unmatched/excess C2B to a specific debtor (different number) ──
-app.post('/api/c2b/resolve-debt', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
-    const { c2bId, debtorPhone } = req.body;
-    if (!c2bId || !debtorPhone) return res.status(400).json({ success: false, message: 'c2bId and debtorPhone required' });
-    try {
-        // Get the C2B payment
-        const { data: c2b, error: c2bErr } = await supabase.from('c2b_payments').select('*').eq('id', c2bId).single();
-        if (c2bErr || !c2b) return res.status(404).json({ success: false, message: 'C2B payment not found' });
-
-        const amount = parseFloat(c2b.amount_excess > 0 ? c2b.amount_excess : c2b.amount);
-
-        // Find debts for the linked debtor phone — FIFO
-        const { data: debts } = await supabase
-            .from('Sales')
-            .select('id, item_name, total_amount, amount_paid, customer_name')
-            .eq('customer_phone', debtorPhone)
-            .eq('is_voided', false)
-            .in('payment_status', ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'])
-            .order('sale_date', { ascending: true });
-
-        const activeDebts = (debts || []).filter(d =>
-            (parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) > 0
-        );
-        if (!activeDebts.length) return res.status(404).json({ success: false, message: `No outstanding debts found for ${debtorPhone}` });
-
-       let remaining = Math.round(amount), totalApplied = 0;
-        const now      = new Date();
-        const datePart = now.getFullYear().toString() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0');
-        const timePart = String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0') + String(now.getSeconds()).padStart(2,'0');
-
-        for (const debt of activeDebts) {
-            if (remaining <= 0) break;
-            const balance   = Math.round(parseFloat(debt.total_amount) - parseFloat(debt.amount_paid || 0));
-            if (balance <= 0) continue;
-
-            const applyAmt  = Math.min(remaining, balance);
-            
-            let newPaid;
-            if (applyAmt >= balance) {
-                newPaid = parseFloat(debt.total_amount);
-            } else {
-                newPaid = parseFloat(debt.amount_paid || 0) + applyAmt;
-            }
-            
-            const newStatus = newPaid >= parseFloat(debt.total_amount) - 0.01 ? 'Paid' : 'Partial';
-            const payRef    = 'PAY-' + datePart + '-' + timePart + '-C2B';
-
-            await supabase.from('Sales').update({
-                amount_paid:    newPaid,
-                payment_status: newStatus
-            }).eq('id', debt.id);
-
-            await supabase.from('payments').insert([{
-                sale_id: debt.id, amount: applyAmt, payment_method: 'M-Pesa',
-                mpesa_code: c2b.mpesa_code ? `${c2b.mpesa_code.trim().toUpperCase()}-${debt.id}` : null, received_by: req.user.name,
-                customer_name: debt.customer_name, created_at: now.toISOString()
-            }]);
-
-            await supabase.from('debt_payments').insert([{
-                sale_id: debt.id, amount_paid: applyAmt, payment_method: 'M-Pesa',
-                mpesa_id: c2b.mpesa_code, processed_by: req.user.name,
-                customer_name: debt.customer_name, customer_phone: debtorPhone,
-                payment_date: now.toISOString()
-            }]);
-
-            totalApplied += applyAmt;
-            remaining    -= applyAmt;
-        }
-
-        // Update debtor's total_debt
-        const { data: cust } = await supabase.from('customers').select('total_debt').eq('phone', debtorPhone).single();
-        if (cust) await supabase.from('customers').update({
-            total_debt: Math.max(0, parseFloat(cust.total_debt || 0) - totalApplied)
-        }).eq('phone', debtorPhone);
-
-        // Mark C2B as resolved
-        await supabase.from('c2b_payments').update({
-            status: 'debt_payment', resolved_by: req.user.name,
-            resolved_at: now.toISOString(),
-            notes: `Linked to debtor ${debtorPhone} — KES ${totalApplied} applied`
-        }).eq('id', c2bId);
-
-        log.info(`[C2B DEBT] ✅ KES ${totalApplied} applied to ${debtorPhone} via C2B from ${c2b.phone}`);
-        res.json({ success: true, applied: totalApplied, remaining });
-    } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-app.post('/api/c2b/resolve-ignore', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
-    const { c2bId, notes } = req.body;
-    if (!c2bId) return res.status(400).json({ success: false, message: 'c2bId required' });
-    try {
-        const { error } = await supabase.from('c2b_payments').update({
-            status: 'ignored', resolved_by: req.user.name,
-            resolved_at: new Date().toISOString(), notes: notes || null
-        }).eq('id', c2bId);
-        if (error) throw error;
-        res.json({ success: true, message: 'Payment ignored' });
-    } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
+// Legacy alias — prevents 404 if old Daraja/Safaricom callback URLs are still registered
+app.post('/api/mpesa/callback', (req, res) => {
+    log.warn('[MPESA CALLBACK] Received on legacy Daraja callback route — this is no longer active.');
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
-app.post('/api/c2b/receipt-collected', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
-    const { c2bId } = req.body || {};
-    if (!c2bId) return res.status(400).json({ success: false, message: 'c2bId required' });
-    try {
-        const now = new Date().toISOString();
-        const { error } = await supabase.from('c2b_payments').update({
-            status: 'receipt_collected',
-            collected_by: req.user.name,
-            collected_at: now
-        }).eq('id', c2bId);
-        if (error) throw error;
-        res.json({ success: true, message: 'Receipt marked as collected' });
-    } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ── Get pending/recent C2B payments for dashboard ─────────────────────────────
-app.get('/api/c2b/payments', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
-    try {
-        const { data, error } = await supabase
-            .from('c2b_payments')
-            .select('*')
-            .neq('status', 'completed')  // Filter out completed entries so they don't appear in the panel
-            .order('created_at', { ascending: false });
-
-        if (error) throw error;
-        res.json(data || []);
-    } catch (err) {
-        log.error('[C2B PAYMENTS ERROR]', err.message);
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ── GET all supplier returns ──────────────────────────────────────────────────
-// ── POST confirm a pending supplier return ────────────────────────────────────
-app.post('/api/supplier-returns/:id/confirm', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
-    const { supplier_id, inventory_id, qty, total_value, item_name, reason } = req.body;
-    const processedBy = req.user.name;
-
-    try {
-        // Check it exists and is still pending
-        const { data: ret, error: fetchErr } = await supabase
-            .from('supplier_returns')
-            .select('id, balance_adjusted, supplier_name')
-            .eq('id', req.params.id).single();
-
-        if (fetchErr || !ret)
-            return res.status(404).json({ success: false, message: 'Return record not found.' });
-        if (ret.balance_adjusted)
-            return res.status(400).json({ success: false, message: 'This return has already been confirmed.' });
-
-        const qtyNum   = parseFloat(qty)        || 0;
-        const valNum   = parseFloat(total_value) || 0;
-
-        // ── Deduct stock ──────────────────────────────────────────────────────
-        if (inventory_id) {
-            const { data: invItem } = await supabase
-                .from('Inventory')
-                .select('stock_quantity, digitax_item_id, sub_unit, sub_unit_qty, sub_unit_price')
-                .eq('id', inventory_id).single();
-
-            if (invItem) {
-                const oldStock = parseInt(invItem.stock_quantity) || 0;
-                const newStock = Math.max(0, oldStock - qtyNum);
-
-                await supabase.from('Inventory')
-                    .update({ stock_quantity: newStock })
-                    .eq('id', inventory_id);
-
-                await supabase.from('audit_logs').insert([{
-                    performed_by: processedBy,
-                    action:       'SUPPLIER_RETURN',
-                    item_name:    item_name,
-                    old_stock:    oldStock,
-                    added_qty:    -qtyNum,
-                    new_stock:    newStock,
-                    details:      `SUPPLIER RETURN CONFIRMED: ${item_name} | Qty: -${qtyNum} | Reason: ${reason} | KES ${valNum.toFixed(2)} | By: ${processedBy}`,
-                    timestamp:    new Date().toISOString()
-                }]);
-
-                // ── Sync to DigiTax ───────────────────────────────────────────
-                if (invItem.digitax_item_id && DIGITAX_API_KEY) {
-                    try {
-                      const etimsQty = toEtimsQty(qtyNum, invItem);
-                        await syncStockWithEtims(
-                            invItem.digitax_item_id, etimsQty,
-                            `Supplier Return Confirmed — ${reason}`,
-                            '06', 'DEDUCT'
-                        );
-                        log.info('[eTIMS] ✅ Stock deducted in DigiTax on confirm', { item: item_name, qty: qtyNum });
-                    } catch (etimsErr) {
-                        log.warn('[eTIMS] DigiTax deduction failed on confirm', { item: item_name, error: etimsErr.message });
-                    }
-                }
-            }
-        }
-
-        // ── Reduce supplier balance ───────────────────────────────────────────
-        if (valNum > 0) {
-            await adjustSupplierBalance(
-                supplier_id, -valNum, processedBy,
-                `Supplier return confirmed — ${item_name} | KES ${valNum.toFixed(2)} deducted`
-            );
-        }
-
-        // ── Mark as confirmed ─────────────────────────────────────────────────
-        await supabase.from('supplier_returns')
-            .update({ balance_adjusted: true })
-            .eq('id', req.params.id);
-
-        log.info('[SUPPLIER RETURN] ✅ Confirmed', { id: req.params.id, item: item_name, qty: qtyNum, value: valNum });
-
-        res.json({
-            success: true,
-            message: `Return confirmed. ${qtyNum} units deducted from stock, KES ${valNum.toFixed(2)} deducted from ${ret.supplier_name} balance.`
-        });
-    } catch (err) {
-        log.error('[SUPPLIER RETURN CONFIRM] Error:', err);
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-app.get('/api/supplier-returns', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
-    const { from, to, supplier_id, page } = req.query;
-    const perPage = 20, pageNum = parseInt(page) || 1;
-    try {
-        let q = supabase.from('supplier_returns')
-            .select('*', { count: 'exact' })
-            .order('created_at', { ascending: false });
-        if (from)        q = q.gte('created_at', from + 'T00:00:00.000+03:00');
-        if (to)          q = q.lte('created_at', to   + 'T23:59:59.999+03:00');
-        if (supplier_id) q = q.eq('supplier_id', supplier_id);
-        const start = (pageNum - 1) * perPage;
-        const { data, count, error } = await q.range(start, start + perPage - 1);
-        if (error) throw error;
-        res.json({ returns: data||[], totalCount: count||0, totalPages: Math.ceil((count||0)/perPage), page: pageNum });
-    } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ── GET search purchase orders for supplier return form ───────────────────────
-app.get('/api/supplier-returns/search-po', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
-    const { q } = req.query;
-    if (!q) return res.status(400).json({ success: false, message: 'Query q is required.' });
-    try {
-        const { data, error } = await supabase
-            .from('purchase_orders')
-            .select('id, po_number, supplier_id, supplier_name, delivery_note, order_date, total_amount, status, purchase_order_items(id, item_name, qty_ordered, qty_received, unit_cost, inventory_id)')
-            .or(`supplier_name.ilike.%${q}%,po_number.ilike.%${q}%,delivery_note.ilike.%${q}%`)
-            .in('status', ['Received', 'Partial'])
-            .order('order_date', { ascending: false })
-            .limit(10);
-        if (error) throw error;
-
-        // For each PO, subtract quantities already returned to supplier
-        const poIds = (data || []).map(p => p.id);
-        let returnedMap = {};
-        if (poIds.length > 0) {
-            const { data: returns } = await supabase
-                .from('supplier_returns')
-                .select('po_id, item_name, qty_returned')
-                .in('po_id', poIds);
-            (returns || []).forEach(r => {
-                const key = r.po_id + '__' + r.item_name;
-                returnedMap[key] = (returnedMap[key] || 0) + (r.qty_returned || 0);
-            });
-        }
-
-        // Enrich items with returnable qty
-        const enriched = (data || []).map(po => ({
-            ...po,
-            purchase_order_items: (po.purchase_order_items || []).map(item => ({
-                ...item,
-                qty_already_returned: returnedMap[po.id + '__' + item.item_name] || 0,
-                qty_returnable: Math.max(0, (item.qty_received || 0) - (returnedMap[po.id + '__' + item.item_name] || 0))
-            })).filter(item => item.qty_returnable > 0)
-        })).filter(po => po.purchase_order_items.length > 0);
-
-        res.json(enriched);
-    } catch (err) {
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ── POST process supplier return ──────────────────────────────────────────────
-app.post('/api/supplier-returns', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
-    const {
-        po_id, supplier_id, supplier_name,
-        items,
-        return_reason,
-        supplier_credit_note,
-        adjust_balance,
-        notes
-    } = req.body;
-    const processedBy = req.user.name;
-
-    if (!po_id || !supplier_id || !items?.length)
-        return res.status(400).json({ success: false, message: 'po_id, supplier_id and items are required.' });
-
-    try {
-        let totalReturnValue = 0;
-        const returnRows = [];
-
-        for (const item of items) {
-            const qty      = parseFloat(item.qty_returned) || 0;
-            const unitCost = parseFloat(item.unit_cost)    || 0;
-            if (qty <= 0) continue;
-
-            const itemValue = parseFloat((qty * unitCost).toFixed(2));
-            totalReturnValue += itemValue;
-
-            if (adjust_balance) {
-                // ── CONFIRMED: supplier acknowledged return ───────────────────
-                // Only now do we: deduct stock, sync DigiTax, reduce balance
-                if (item.inventory_id) {
-                   const { data: invItem } = await supabase
-                        .from('Inventory')
-                        .select('stock_quantity, item_name, digitax_item_id, sub_unit, sub_unit_qty, sub_unit_price')
-                        .eq('id', item.inventory_id).single();
-
-                    if (invItem) {
-                        const oldStock = parseInt(invItem.stock_quantity) || 0;
-                        const newStock = Math.max(0, oldStock - qty);
-
-                        await supabase.from('Inventory')
-                            .update({ stock_quantity: newStock })
-                            .eq('id', item.inventory_id);
-
-                        await supabase.from('audit_logs').insert([{
-                            performed_by: processedBy,
-                            action:       'SUPPLIER_RETURN',
-                            item_name:    item.item_name,
-                            old_stock:    oldStock,
-                            added_qty:    -qty,
-                            new_stock:    newStock,
-                            details:      `SUPPLIER RETURN (CONFIRMED): ${item.item_name} | Qty: -${qty} | Reason: ${item.reason || return_reason} | PO: ${po_id} | Credit Note: ${supplier_credit_note || 'N/A'} | By: ${processedBy}`,
-                            timestamp:    new Date().toISOString()
-                        }]);
-
-                        // Sync stock deduction to DigiTax
-                        if (invItem.digitax_item_id && DIGITAX_API_KEY) {
-                            try {
-                                const etimsQty = toEtimsQty(qty, invItem);
-                                await syncStockWithEtims(
-                                    invItem.digitax_item_id, etimsQty,
-                                    `Supplier Return — ${po_id} | ${item.reason || return_reason}`,
-                                    '06', 'DEDUCT'
-                                );
-                                log.info('[eTIMS] ✅ Stock deducted in DigiTax for supplier return', {
-                                    item: item.item_name, qty
-                                });
-                            } catch (etimsErr) {
-                                log.warn('[eTIMS] DigiTax deduction failed (inventory still updated)', {
-                                    item: item.item_name, error: etimsErr.message
-                                });
-                            }
-                        } else if (!invItem.digitax_item_id) {
-                            log.warn('[eTIMS] Skipping DigiTax — item not registered with KRA', { item: item.item_name });
-                        }
-                    }
-                }
-            } else {
-                // ── PENDING: supplier not yet confirmed ───────────────────────
-                // Just record for tracking — no stock change, no DigiTax sync
-                log.info('[SUPPLIER RETURN] Recorded as PENDING — stock & DigiTax unchanged until supplier confirms', {
-                    item: item.item_name, qty
-                });
-                await supabase.from('audit_logs').insert([{
-                    performed_by: processedBy,
-                    action:       'SUPPLIER_RETURN_PENDING',
-                    item_name:    item.item_name,
-                    details:      `SUPPLIER RETURN (PENDING): ${item.item_name} | Qty: ${qty} | Reason: ${item.reason || return_reason} | PO: ${po_id} | Awaiting supplier credit note | By: ${processedBy}`,
-                    timestamp:    new Date().toISOString()
-                }]);
-            }
-
-            returnRows.push({
-                po_id,
-                supplier_id,
-                supplier_name,
-                item_name:            item.item_name,
-                inventory_id:         item.inventory_id || null,
-                qty_returned:         qty,
-                unit_cost:            unitCost,
-                total_return_value:   itemValue,
-                return_reason:        item.reason || return_reason,
-                supplier_credit_note: supplier_credit_note || null,
-                balance_adjusted:     !!adjust_balance,
-                processed_by:         processedBy,
-                notes:                notes || null,
-                created_at:           new Date().toISOString()
-            });
-        }
-
-        if (!returnRows.length)
-            return res.status(400).json({ success: false, message: 'No valid items to return.' });
-
-        const { error: retErr } = await supabase.from('supplier_returns').insert(returnRows);
-        if (retErr) throw retErr;
-
-        // Only reduce supplier balance when confirmed
-        if (adjust_balance && totalReturnValue > 0) {
-            await adjustSupplierBalance(
-                supplier_id, -totalReturnValue, processedBy,
-                `Supplier return credit — ${return_reason} | ${returnRows.map(r => r.item_name).join(', ')} | PO: ${po_id} | KES ${totalReturnValue.toFixed(2)} deducted`
-            );
-        }
-
-        log.info('[SUPPLIER RETURN] ✅ Processed', {
-            supplier: supplier_name, items: returnRows.length,
-            totalValue: totalReturnValue,
-            status: adjust_balance ? 'CONFIRMED' : 'PENDING'
-        });
-
-        const statusMsg = adjust_balance
-            ? `Stock deducted, supplier balance reduced by KES ${totalReturnValue.toFixed(2)} and KRA notified.`
-            : `Recorded as pending — stock and balance unchanged until supplier confirms.`;
-
-        res.json({
-            success: true,
-            message: `${returnRows.length} item(s) return recorded for ${supplier_name}. ${statusMsg}`,
-            totalReturnValue,
-            balanceAdjusted: !!adjust_balance
-        });
-    } catch (err) {
-        log.error('[SUPPLIER RETURN] Error:', err);
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ============================================================
-//  STOCK WRITE-OFF — damaged/expired/stolen goods
-//  Reduces stock, notifies KRA via SUBTRACT, logs as expense
-//  NOT a sale — no receipt, no revenue
-// ============================================================
-app.post('/api/inventory/:id/write-off', requireAuth, requireRole('admin', 'manager'), requireSubscription, async (req, res) => {
-    const { id } = req.params;
-    const { qty, reason, reason_detail, expense_category } = req.body;
-    const userName = req.user.name;
-
-    const writeOffQty = parseFloat(qty) || 0;
-    if (writeOffQty <= 0)
-        return res.status(400).json({ success: false, message: 'Quantity must be greater than 0.' });
-
-    const validReasons = ['damaged', 'expired', 'theft', 'breakage', 'other'];
-    if (!validReasons.includes(reason))
-        return res.status(400).json({ success: false, message: `Reason must be one of: ${validReasons.join(', ')}` });
-
-    try {
-       // Fetch item details
-        const { data: item, error: fetchErr } = await supabase
-            .from('Inventory')
-            .select('id, item_name, stock_quantity, cost_price, category, unit, digitax_item_id, kra_registered, sub_unit, sub_unit_qty, sub_unit_price')
-            .eq('id', id).single();
-
-        if (fetchErr || !item)
-            return res.status(404).json({ success: false, message: 'Item not found.' });
-
-        const oldStock  = parseInt(item.stock_quantity) || 0;
-        if (writeOffQty > oldStock)
-            return res.status(400).json({
-                success: false,
-                message: `Cannot write off ${writeOffQty} — only ${oldStock} in stock.`
-            });
-
-        const newStock     = oldStock - writeOffQty;
-        const costPerUnit  = parseFloat(item.cost_price) || 0;
-        const totalCostLost = parseFloat((writeOffQty * costPerUnit).toFixed(2));
-
-        // ── 1. Update inventory ───────────────────────────────────────────────
-        const { error: updateErr } = await supabase
-            .from('Inventory')
-            .update({ stock_quantity: newStock })
-            .eq('id', id);
-        if (updateErr) throw updateErr;
-
-        // ── 2. Audit log ──────────────────────────────────────────────────────
-        const reasonLabel = {
-            damaged:  'Damaged on shelf',
-            expired:  'Expired / past sell-by',
-            theft:    'Theft / shrinkage',
-            breakage: 'Breakage in store',
-            other:    'Other write-off'
-        }[reason] || reason;
-
-        await supabase.from('audit_logs').insert([{
-            performed_by: userName,
-            action:       'STOCK_WRITEOFF',
-            item_name:    item.item_name,
-            old_stock:    oldStock,
-            added_qty:    -writeOffQty,
-            new_stock:    newStock,
-            details:      `WRITE-OFF: ${item.item_name} | Qty: -${writeOffQty} | Reason: ${reasonLabel}${reason_detail ? ' — ' + reason_detail : ''} | Cost lost: KES ${totalCostLost.toFixed(2)} | By: ${userName}`,
-            timestamp:    new Date().toISOString()
-        }]);
-
-        // ── 3. Record as expense (cost of goods lost) ─────────────────────────
-        const expCat = expense_category || 'Stock Write-offs';
-        await supabase.from('expenses').insert([{
-            description:  `Stock write-off: ${item.item_name} × ${writeOffQty} units (${reasonLabel})${reason_detail ? ' — ' + reason_detail : ''}`,
-            category:     expCat,
-            amount:       totalCostLost,
-            spent_by:     userName,
-            expense_date: nowEATIso()
-        }]);
-
-        // ── 4. Notify KRA via DigiTax SUBTRACT ───────────────────────────────
-        // Movement type '05' = write-off/adjustment (not a sale, not a return)
-        let kraNotified = false;
-        if (item.digitax_item_id && DIGITAX_API_KEY) {
-            try {
-                const etimsQty = toEtimsQty(writeOffQty, item);
-                const syncResult = await syncStockWithEtims(
-                item.digitax_item_id,      // The ID linked to DigiTax
-                etimsQty,                  // Converted sub-unit amount damaged               // The amount damaged (e.g., 2)
-                `Stock write-off: ${reasonLabel}${reason_detail ? ' — ' + reason_detail : ''}`, // Description
-                '05',                      // KRA Movement Type 05 = "Waste/Write-off"
-                'DEDUCT'                      // Correct direction: Removes from KRA balance
-            );
-                kraNotified = !!syncResult;
-                if (kraNotified) {
-                    log.info('[eTIMS] ✅ Stock write-off synced to KRA', {
-                        item: item.item_name, qty: writeOffQty, reason
-                    });
-                } else {
-                    log.warn('[eTIMS] ❌ Write-off stock deduction failed in DigiTax', {
-                        item: item.item_name, qty: writeOffQty
-                    });
-                }
-            } catch (etimsErr) {
-                log.warn('[eTIMS] Write-off DigiTax error (stock still updated)', {
-                    item: item.item_name, error: etimsErr.message
-                });
-            }
-        } else if (!item.digitax_item_id) {
-            log.warn('[eTIMS] Write-off: item not registered with KRA — no DigiTax sync', {
-                item: item.item_name
-            });
-        }
-
-        await logActivity(ACT.STOCK_WRITE_OFF, userName, { item: item?.item_name, qty: writeOffQty, reason: req.body.reason, cost_lost: totalCostLost }, { role: req.user?.role, ip: req.ip, target_id: req.params.id, target_name: item?.item_name });
-        res.json({
-            success:      true,
-            message:      `${writeOffQty} unit(s) of "${item.item_name}" written off. KES ${totalCostLost.toFixed(2)} recorded as expense.${kraNotified ? ' ✅ KRA notified.' : ' ⚠ KRA sync pending — item may not be registered.'}`,
-            oldStock,
-            newStock,
-            totalCostLost,
-            kraNotified,
-            expense_category: expCat
-        });
-    } catch (err) {
-        log.error('[STOCK WRITE-OFF] Error:', err);
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-
-// ============================================================
-//  ACCOUNTING MODULE — Double-entry bookkeeping
-//  Balance Sheet · Income Statement · M-Pesa Reconciliation
-// ============================================================
-
-// ── GET Balance Sheet ─────────────────────────────────────────────────────────
-
-// ── GET /api/activity-log — queryable audit log ───────────────────────────────
-app.get('/api/activity-log', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
-    const { action, from, to, performed_by, page } = req.query;
-    const perPage = 50;
-    const pageNum = parseInt(page) || 1;
-    const fromISO = from ? `${from}T00:00:00.000+03:00` : null;
-    const toISO   = to   ? `${to}T23:59:59.999+03:00`   : null;
-
-    try {
-        let q = supabase.from('activity_log')
-            .select('*', { count: 'exact' })
-            .order('created_at', { ascending: false });
-
-        if (action)       q = q.eq('action', action);
-        if (performed_by) q = q.ilike('performed_by', `%${performed_by}%`);
-        if (fromISO)      q = q.gte('created_at', fromISO);
-        if (toISO)        q = q.lte('created_at', toISO);
-
-        const start = (pageNum - 1) * perPage;
-        const { data, count, error } = await q.range(start, start + perPage - 1);
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            logs:       data || [],
-            totalCount: count || 0,
-            totalPages: Math.ceil((count || 0) / perPage),
-            page:       pageNum,
-            actions:    Object.values(ACT), // send all known action types for filter dropdowns
-        });
-    } catch (err) {
-        log.error('[ActivityLog]', err.message);
-        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-app.get('/api/accounting/balance-sheet', requireAuth, requireRole('admin','manager'), async (req, res) => {
-    try {
-        // Pull live figures from operational tables
-        const [
-            { data: debtors },
-            { data: stockData },
-            { data: suppliers },
-            { data: salesData },
-            { data: expData },
-            { data: poData }
-        ] = await Promise.all([
-            supabase.from('Sales').select('total_amount, amount_paid').eq('is_voided', false).in('payment_status', ['Credit','Partial']),
-            supabase.from('Inventory').select('stock_quantity, cost_price'),
-            supabase.from('suppliers').select('balance'),
-            // Fetch all non-voided sales with cost fields to compute real COGS & realized revenue
-            supabase.from('Sales').select('total_amount, amount_paid, cost_price, quantity_sold, payment_status').eq('is_voided', false),
-            supabase.from('expenses').select('amount'),
-            supabase.from('purchase_orders').select('total_amount, amount_paid').in('status', ['Sent','Partial','Received'])
-        ]);
-
-        // Debtors = sum of outstanding balances
-        const debtorsTotal = (debtors||[]).reduce((s,d) =>
-            s + Math.max(0, (parseFloat(d.total_amount)||0) - (parseFloat(d.amount_paid)||0)), 0);
-
-        // Stock at cost
-        const stockValue = (stockData||[]).reduce((s,i) =>
-            s + (parseFloat(i.stock_quantity)||0) * (parseFloat(i.cost_price)||0), 0);
-
-        // Supplier payables — use outstanding PO balances as source of truth
-        // (sum of what's still owed on Sent/Partial/Received POs)
-        const poPayables = (poData||[]).reduce((s, po) => {
-            const owed = (parseFloat(po.total_amount)||0) - (parseFloat(po.amount_paid)||0);
-            return s + Math.max(0, owed);
-        }, 0);
-        // Fall back to supplier.balance sum if no PO data available
-        const supplierBalanceTotal = (suppliers||[]).reduce((s,sup) =>
-            s + Math.max(0, parseFloat(sup.balance)||0), 0);
-        const payablesTotal = poPayables > 0 ? poPayables : supplierBalanceTotal;
-
-        // Realized revenue & real COGS
-        // Revenue: only what was collected (amount_paid) — unpaid credit excluded
-        // COGS: sum cost_price directly — it stores the total line cost per sale row
-        let realizedSales = 0, totalCogs = 0;
-        (salesData||[]).forEach(sale => {
-            const paid = parseFloat(sale.amount_paid || 0);
-            const cost = parseFloat(sale.cost_price  || 0); // total line cost — no qty multiply
-            realizedSales += paid;
-            totalCogs     += cost;
-        });
-
-        // Cash estimate: realized revenue minus all expenses
-        const totalExp = (expData||[]).reduce((s,e) => s + (parseFloat(e.amount)||0), 0);
-        const cashEst  = Math.max(0, realizedSales - totalExp);
-
-        // VAT payable (16/116 of realized revenue)
-        const vatPayable = realizedSales * 0.16 / 1.16;
-
-        // Net Profit = Collected Revenue − Full COGS − Expenses
-        const curProfit = realizedSales - totalCogs - totalExp;
-
-        res.json({
-            success: true,
-            data: {
-                cash:              cashEst,
-                mpesa:             0,          // manual entry — no bank feed yet
-                debtors:           debtorsTotal,
-                stock:             stockValue,
-                fixed_assets:      0,          // manual entry
-                payables:          payablesTotal,
-                vat_payable:       vatPayable,
-                retained_earnings: 0,          // from journal entries
-                current_profit:    curProfit
-            }
-        });
-    } catch(err) {
-        log.error('[Balance Sheet]', err.message);
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ── GET Income Statement ──────────────────────────────────────────────────────
-app.get('/api/accounting/income-statement', requireAuth, requireRole('admin','manager'), async (req, res) => {
-    const { from, to } = req.query;
-    const fromISO = from ? `${from}T00:00:00.000+03:00` : '2020-01-01T00:00:00.000+03:00';
-    const toISO   = to   ? `${to}T23:59:59.999+03:00`   : new Date().toISOString();
-
-    try {
-        const [
-            { data: sales },
-            { data: expenses },
-            { data: stockData },
-            { data: poData }
-        ] = await Promise.all([
-            supabase.from('Sales').select('total_amount, amount_paid, cost_price, quantity_sold, payment_status')
-                .eq('is_voided', false).gte('sale_date', fromISO).lte('sale_date', toISO),
-            supabase.from('expenses').select('amount, category')
-                .gte('expense_date', fromISO).lte('expense_date', toISO),
-            supabase.from('Inventory').select('stock_quantity, cost_price'),
-            supabase.from('purchase_orders').select('total_amount')
-                .in('status', ['Received','Partial']).gte('created_at', fromISO).lte('created_at', toISO)
-        ]);
-
-        const grossSales  = (sales||[]).reduce((s,sale) => s + (parseFloat(sale.total_amount)||0), 0);
-        const creditUnpaid = (sales||[]).filter(s => ['Credit','Partial'].includes(s.payment_status))
-            .reduce((s,sale) => s + Math.max(0, (parseFloat(sale.total_amount)||0) - (parseFloat(sale.amount_paid)||0)), 0);
-        const netRevenue  = grossSales - creditUnpaid;
-
-        // COGS: sum cost_price directly — it stores the total line cost per sale row
-        const cogs = (sales||[]).reduce((s,sale) =>
-            s + (parseFloat(sale.cost_price)||0), 0);
-
-        const stockValue   = (stockData||[]).reduce((s,i) => s + (parseFloat(i.stock_quantity)||0)*(parseFloat(i.cost_price)||0), 0);
-        const purchases    = (poData||[]).reduce((s,po) => s + (parseFloat(po.total_amount)||0), 0);
-
-        const grossProfit  = netRevenue - cogs;
-
-        // Expenses by category
-        const expByCat = {};
-        (expenses||[]).forEach(e => {
-            const cat = e.category || 'General';
-            expByCat[cat] = (expByCat[cat]||0) + (parseFloat(e.amount)||0);
-        });
-        const totalExpenses = Object.values(expByCat).reduce((s,v) => s+v, 0);
-        const netProfit     = grossProfit - totalExpenses;
-
-        res.json({
-            success: true,
-            data: {
-                gross_sales:      grossSales,
-                credit_unpaid:    creditUnpaid,
-                net_revenue:      netRevenue,
-                opening_stock:    stockValue,   // simplified — use closing stock as proxy
-                purchases,
-                closing_stock:    stockValue,
-                cogs,
-                gross_profit:     grossProfit,
-                expenses_by_cat:  expByCat,
-                total_expenses:   totalExpenses,
-                net_profit:       netProfit
-            }
-        });
-    } catch (err) {
-        log.error('[Income Statement]', err.message);
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ── GET M-Pesa Reconciliation ─────────────────────────────────────────────────
-app.get('/api/accounting/reconcile', requireAuth, requireRole('admin','manager'), async (req, res) => {
-    // Support both ?date=YYYY-MM-DD (legacy daily) and ?from=YYYY-MM-DD&to=YYYY-MM-DD (range)
-    const { date, from, to, filter } = req.query;
-    const fromDate  = from  || date || null;
-    const toDate    = to    || date || null;
-    const fromISO   = fromDate ? `${fromDate}T00:00:00.000+03:00` : null;
-    const toISO     = toDate   ? `${toDate}T23:59:59.999+03:00`   : null;
-
-    try {
-        // Pull from c2b_payments table — Safaricom C2B paybill only.
-        // Jenga STK payments are completely separate and never appear here.
-        // Exclude any historical Jenga STK rows that may have been written before this fix
-        // by filtering out rows where customer_name ends in 'Customer' AND channel is STK-shaped.
-        let q = supabase.from('c2b_payments')
-            .select('*')
-            .not('customer_name', 'in', '("Safaricom Customer","Equitel Customer")')
-            .order('created_at', { ascending: false });
-        if (fromISO) q = q.gte('created_at', fromISO).lte('created_at', toISO);
-        if (filter && filter !== 'all') q = q.eq('status', filter);
-
-        const { data: c2bTxns, error: c2bErr } = await q;
-        if (c2bErr) throw c2bErr;
-
-        // Also pull M-Pesa from payments table (STK push only)
-        // We must exclude any payments whose mpesa_code already appears in c2b_payments
-        // to avoid double-counting C2B payments that were reconciled and created a payments record.
-        let pq = supabase.from('payments').select('*').eq('payment_method', 'M-Pesa').order('created_at', { ascending: false });
-        if (fromISO) pq = pq.gte('created_at', fromISO).lte('created_at', toISO);
-        const { data: allMpesaPayments } = await pq;
-
-        // Build a set of all mpesa_codes that came in via C2B (use ALL c2b records, not just date-filtered)
-        const { data: allC2BCodes } = await supabase.from('c2b_payments').select('mpesa_code');
-        const c2bCodeSet = new Set((allC2BCodes || []).map(r => r.mpesa_code).filter(Boolean));
-
-        // Only keep payments whose mpesa_code is NOT in c2b_payments (i.e. genuine STK push)
-        const stkPayments = (allMpesaPayments || []).filter(p => !p.mpesa_code || !c2bCodeSet.has(p.mpesa_code));
-
-        // Total M-Pesa received through POS — C2B only (STK excluded to avoid double-count)
-        // C2B amounts are the source of truth; STK payments linked to C2B are already counted
-        const c2bTotal  = (c2bTxns||[]).reduce((s,p) => s + (parseFloat(p.amount)||0), 0);
-        const stkTotal  = stkPayments.reduce((s,p) => s + (parseFloat(p.amount)||0), 0);
-        const totalMpesaPos = c2bTotal + stkTotal;
-
-        // Combine and shape for frontend
-        const transactions = [
-            ...(c2bTxns||[]).map(t => ({
-                id:           t.id,
-                customer_name: t.customer_name,
-                phone:        t.phone,
-                mpesa_code:   t.mpesa_code,
-                account_ref:  t.account_ref,
-                amount:       t.amount,
-                amount_excess: t.amount_excess || 0,
-                status:       t.status,
-                created_at:   t.created_at,
-                source:       'C2B'
-            })),
-            ...(stkPayments||[]).map(p => ({
-                id:           p.id,
-                customer_name: p.customer_name,
-                phone:        null,
-                mpesa_code:   p.mpesa_code,
-                account_ref:  null,
-                amount:       p.amount,
-                amount_excess: 0,
-                status:       'matched',   // STK push payments are always linked to a sale
-                created_at:   p.created_at,
-                source:       'STK'
-            }))
-        ].sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
-
-        const unmatchedCount = (c2bTxns||[]).filter(t => ['unmatched','excess'].includes(t.status)).length;
-
-        res.json({
-            success:          true,
-            transactions,
-            total_mpesa_pos:  totalMpesaPos,
-            unmatched_count:  unmatchedCount
-        });
-    } catch (err) {
-        log.error('[Reconcile]', err.message);
-        log.error('[API]', err.message); res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ── GET Jenga STK Payments (Equity Mobile — completely separate from Remote/C2B) ─
-// Returns entries from jenga_stk_payments table only.
-// These are POS-initiated Safaricom/Equitel STK pushes routed through Equity Bank.
-// They are NEVER mixed with c2b_payments (Remote M-Pesa Payments panel).
-app.get('/api/jenga/stk-payments', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
-    const { date, from, to, filter } = req.query;
-    const fromDate = from || date || null;
-    const toDate   = to   || date || null;
-    const fromISO  = fromDate ? `${fromDate}T00:00:00.000+03:00` : null;
-    const toISO    = toDate   ? `${toDate}T23:59:59.999+03:00`   : null;
-    try {
-        let q = supabase.from('jenga_stk_payments')
-            .select('*')
-            .order('created_at', { ascending: false });
-        if (fromISO) q = q.gte('created_at', fromISO).lte('created_at', toISO);
-        if (filter && filter !== 'all') q = q.eq('status', filter);
-        const { data, error } = await q;
-        if (error) throw error;
-        const unmatchedCount = (data||[]).filter(t => ['unmatched','excess'].includes(t.status)).length;
-        res.json({ success: true, transactions: data || [], unmatched_count: unmatchedCount });
-    } catch (err) {
-        log.error('[JENGA STK PAYMENTS]', err.message);
-        res.status(500).json({ success: false, message: 'An internal server error occurred.' });
-    }
-});
-
-// ============================================================
 //  DIGITAX RECONCILIATION — Cross-check POS vs KRA
 //  GET /api/digitax/reconcile?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
 //
