@@ -6279,6 +6279,9 @@ app.get('/api/mpesa/status/:invoiceId', requireAuth, async (req, res) => {
                 });
                 if (checkRes.ok) {
                     const d     = await checkRes.json();
+                    if (!d?.invoice?.state && !d?.state) {
+                        log.warn(`[INTASEND STATUS CHECK] Unexpected response shape invoiceId=${invoiceId} raw=${JSON.stringify(d)}`);
+                    }
                     log.info(`[INTASEND STATUS CHECK] invoiceId=${invoiceId} state=${d?.invoice?.state || d?.state} failed_reason=${d?.invoice?.failed_reason || ''}`);
                     const state  = (d?.invoice?.state || d?.state || 'PENDING').toUpperCase();
                     const reason = (d?.invoice?.failed_reason || d?.failed_reason || '').toLowerCase();
@@ -6303,6 +6306,9 @@ app.get('/api/mpesa/status/:invoiceId', requireAuth, async (req, res) => {
                         return res.json({ success: true, status: newStatus, mpesaCode: null, amount: tx.amount, phone: tx.phone, channel: 'INTASEND_MPESA', resultDesc });
                     }
                     // PENDING / PROCESSING — fall through
+                } else {
+                    const errText = await checkRes.text().catch(() => '');
+                    log.warn(`[INTASEND STATUS CHECK] HTTP ${checkRes.status} invoiceId=${invoiceId} body=${errText.substring(0,300)}`);
                 }
             } catch (e) {
                 log.warn(`[INTASEND STATUS CHECK] API call failed: ${e.message}`);
