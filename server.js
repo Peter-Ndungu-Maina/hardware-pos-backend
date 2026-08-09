@@ -6220,6 +6220,8 @@ app.post('/api/mpesa/stk-push', requireAuth, requireSubscription, async (req, re
             });
         }
 
+        log.info(`[INTASEND STK] Raw creation response: ${JSON.stringify(data)}`);
+
         const invoiceId = data?.invoice?.invoice_id || data?.id;
         if (!invoiceId) {
             log.warn('[INTASEND STK] ⚠️  No invoice_id in response:', data);
