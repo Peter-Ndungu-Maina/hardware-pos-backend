@@ -6268,8 +6268,13 @@ app.get('/api/mpesa/status/:invoiceId', requireAuth, async (req, res) => {
         // Still pending — query IntaSend directly (covers sandbox + webhook delays)
         if (INTASEND_STK_SEC) {
             try {
-                const checkRes = await fetch(`${INTASEND_STK_BASE}/api/v1/payment/collection/${invoiceId}/`, {
-                    headers: { 'Authorization': `Bearer ${INTASEND_STK_SEC}` },
+                const checkRes = await fetch(`${INTASEND_STK_BASE}/api/v1/payment/status/`, {
+                    method:  'POST',
+                    headers: {
+                        'Content-Type':  'application/json',
+                        'Authorization': `Bearer ${INTASEND_STK_SEC}`,
+                    },
+                    body:    JSON.stringify({ public_key: INTASEND_STK_PUB, invoice_id: invoiceId }),
                     signal:  AbortSignal.timeout(8000),
                 });
                 if (checkRes.ok) {
