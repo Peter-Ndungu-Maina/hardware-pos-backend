@@ -6525,27 +6525,161 @@ app.post('/api/mpesa/stk-push', requireAuth, requireSubscription, async (req, re
 });
 
 // ── GET /api/mpesa/status/:invoiceId ─────────────────────────────────────────
-// Frontend polls every 3 s. Webhook updates the pending_mpesa row when done.
+// Frontend polls every 3 s. When IntaSend webhook fires it updates the
+// pending_mpesa row. But in sandbox the webhook may be delayed or not
+// reachable — so this endpoint also queries IntaSend directly when the
+// local row is still 'pending' after 30 s, as a belt-and-suspenders fallback.
 app.get('/api/mpesa/status/:invoiceId', requireAuth, async (req, res) => {
     try {
         res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.set('Pragma', 'no-cache');
-        const tx = await mpesaGet(req.params.invoiceId);
+
+        const { invoiceId } = req.params;
+        const tx = await mpesaGet(invoiceId);
         if (!tx) return res.status(404).json({ success: false, status: 'not_found', message: 'Transaction not found or expired.' });
+
+        // If already resolved locally just return it
+        if (tx.status !== 'pending') {
+            return res.json({
+                success:    true,
+                status:     tx.status,
+                mpesaCode:  tx.mpesa_code  || null,
+                amount:     tx.amount,
+                phone:      tx.phone,
+                channel:    tx.context?.channel || 'INTASEND_MPESA',
+                resultDesc: tx.result_desc || null,
+            });
+        }
+
+        // Still pending — check directly with IntaSend API
+        // This covers sandbox where webhook may not reach Render,
+        // and production where webhook could be delayed.
+        // IntaSend: GET /api/v1/payment/collection/:invoice_id/
+        if (INTASEND_STK_SEC && INTASEND_STK_PUB) {
+            try {
+                const checkRes = await fetch(`${INTASEND_STK_BASE}/api/v1/payment/collection/${invoiceId}/`, {
+                    method:  'GET',
+                    headers: { 'Authorization': `Bearer ${INTASEND_STK_SEC}` },
+                    signal:  AbortSignal.timeout(8000),
+                });
+                if (checkRes.ok) {
+                    const checkData = await checkRes.json();
+                    const state     = checkData?.invoice?.state || checkData?.state || 'PENDING';
+                    const reason    = (checkData?.invoice?.failed_reason || checkData?.failed_reason || '').toLowerCase();
+                    const failCode  = String(checkData?.invoice?.failed_code || checkData?.failed_code || '');
+
+                    if (state === 'COMPLETE') {
+                        const amount = Math.round(parseFloat(checkData?.invoice?.net_amount || checkData?.net_amount || tx.amount || 0));
+                        await mpesaSet(invoiceId, { ...tx, status: 'confirmed', mpesa_code: invoiceId, amount, result_desc: 'Confirmed via IntaSend API' });
+                        log.info(`[INTASEND STATUS CHECK] ✅ COMPLETE invoiceId=${invoiceId} KES=${amount}`);
+
+                        // Fire full debt-matching async (don't await — return fast to frontend)
+                        setImmediate(() => processIntaSendComplete({ invoiceId, amount, tx }).catch(e => log.error('[INTASEND ASYNC MATCH]', e.message)));
+
+                        return res.json({ success: true, status: 'confirmed', mpesaCode: invoiceId, amount, phone: tx.phone, channel: 'INTASEND_MPESA', resultDesc: 'Payment confirmed' });
+
+                    } else if (state === 'FAILED') {
+                        let newStatus = 'failed';
+                        if (reason.includes('cancel') || reason.includes('reject') || failCode === '1032') newStatus = 'cancelled';
+                        else if (reason.includes('insufficient') || reason.includes('balance'))           newStatus = 'insufficient_funds';
+                        else if (reason.includes('timeout') || reason.includes('expired') || failCode === '1037') newStatus = 'timeout';
+
+                        const resultDesc = checkData?.invoice?.failed_reason || checkData?.failed_reason || 'Payment failed';
+                        await mpesaSet(invoiceId, { ...tx, status: newStatus, result_desc: resultDesc });
+                        log.info(`[INTASEND STATUS CHECK] ❌ ${newStatus} invoiceId=${invoiceId}`);
+                        return res.json({ success: true, status: newStatus, mpesaCode: null, amount: tx.amount, phone: tx.phone, channel: 'INTASEND_MPESA', resultDesc });
+                    }
+                    // PENDING / PROCESSING — fall through and return pending below
+                }
+            } catch (checkErr) {
+                log.warn(`[INTASEND STATUS CHECK] IntaSend API unreachable: ${checkErr.message}`);
+            }
+        }
+
+        // Still pending
         return res.json({
             success:    true,
-            status:     tx.status,
-            mpesaCode:  tx.mpesa_code  || null,
+            status:     'pending',
+            mpesaCode:  null,
             amount:     tx.amount,
             phone:      tx.phone,
             channel:    tx.context?.channel || 'INTASEND_MPESA',
-            resultDesc: tx.result_desc || null,
+            resultDesc: null,
         });
+
     } catch (err) {
         log.error('[MPESA STATUS]', err.message);
         return res.status(500).json({ success: false, message: 'An internal server error occurred.' });
     }
 });
+
+// ── Shared IntaSend COMPLETE processor ───────────────────────────────────────
+// Called from both the webhook and the status-check fallback above.
+// Runs FIFO debt matching, updates Sales/payments/debt_payments/customers.
+async function processIntaSendComplete({ invoiceId, amount, tx }) {
+    // Duplicate guard
+    const { data: existingC2B } = await supabase.from('c2b_payments').select('id').eq('mpesa_code', invoiceId).maybeSingle();
+    if (existingC2B) { log.warn(`[INTASEND] Duplicate invoiceId=${invoiceId} — skipping`); return; }
+
+    const phone      = tx?.phone ? String(tx.phone).replace(/^254/, '0') : '';
+    const accountRef = tx?.context?.accountRef || null;
+    const now        = new Date();
+    const datePart   = now.getFullYear().toString() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0');
+    const timePart   = String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0') + String(now.getSeconds()).padStart(2,'0');
+
+    let activeDebts = [];
+    if (accountRef?.trim().length > 2) {
+        const { data: byInvoice } = await supabase.from('Sales')
+            .select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
+            .or(`invoice_number.ilike.%${accountRef.trim()}%,receipt_number.ilike.%${accountRef.trim()}%`)
+            .eq('is_voided', false).in('payment_status', ['Credit','Partial','credit','partial','Unpaid'])
+            .order('sale_date', { ascending: true });
+        if (byInvoice?.length) activeDebts = byInvoice;
+    }
+    if (!activeDebts.length && phone) {
+        const { data: byPhone } = await supabase.from('Sales')
+            .select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
+            .eq('customer_phone', phone).eq('is_voided', false)
+            .in('payment_status', ['Credit','Partial','credit','partial','Unpaid'])
+            .order('sale_date', { ascending: true });
+        if (byPhone?.length) activeDebts = byPhone;
+    }
+    activeDebts = activeDebts.filter(d => (parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) > 0);
+
+    if (!activeDebts.length) {
+        await supabase.from('c2b_payments').insert([{ phone, amount, mpesa_code: invoiceId, account_ref: accountRef, customer_name: 'IntaSend Customer', status: 'unmatched', amount_applied: 0, amount_excess: amount, created_at: now.toISOString() }]);
+        log.info(`[INTASEND] ⚠️  Unmatched ref="${accountRef}" phone="${phone}"`);
+        return;
+    }
+
+    let remaining = amount, totalApplied = 0, payRef = null;
+    for (const debt of activeDebts) {
+        if (remaining <= 0) break;
+        const balance  = Math.round(parseFloat(debt.total_amount) - parseFloat(debt.amount_paid || 0));
+        if (balance <= 0) continue;
+        const applyAmt = Math.min(remaining, balance);
+        const newPaid  = applyAmt >= balance ? parseFloat(debt.total_amount) : parseFloat(debt.amount_paid || 0) + applyAmt;
+        const newStatus = newPaid >= parseFloat(debt.total_amount) - 0.01 ? 'Paid' : 'Partial';
+        payRef = `PAY-${datePart}-${timePart}-IS`;
+        await supabase.from('Sales').update({ amount_paid: newPaid, payment_status: newStatus }).eq('id', debt.id);
+        await supabase.from('payments').insert([{ sale_id: debt.id, amount: applyAmt, payment_method: 'M-Pesa', mpesa_code: `${invoiceId}-${debt.id}`, received_by: 'INTASEND-AUTO', customer_name: debt.customer_name || 'IntaSend Customer', created_at: now.toISOString() }]);
+        await supabase.from('debt_payments').insert([{ sale_id: debt.id, amount_paid: applyAmt, payment_method: 'M-Pesa', mpesa_id: invoiceId, processed_by: 'INTASEND-AUTO', customer_name: debt.customer_name || 'IntaSend Customer', customer_phone: phone, payment_date: now.toISOString() }]);
+        totalApplied += applyAmt; remaining -= applyAmt;
+    }
+
+    let newTotalDebt = 0;
+    const targetPhone = activeDebts[0]?.customer_phone || phone;
+    if (targetPhone) {
+        const { data: cust } = await supabase.from('customers').select('total_debt').eq('phone', targetPhone).single();
+        if (cust) { newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - totalApplied); await supabase.from('customers').update({ total_debt: newTotalDebt }).eq('phone', targetPhone); }
+    }
+
+    const receiptDataJson = totalApplied > 0 ? JSON.stringify({ customer: activeDebts[0]?.customer_name || 'IntaSend Customer', total: totalApplied, amount: totalApplied, method: 'M-Pesa (IntaSend)', code: invoiceId, receiptNumber: payRef, servedBy: 'INTASEND-AUTO', date: now.toLocaleString('en-KE'), items: [{ itemName: 'Debt Clearance', price: totalApplied, quantity: 1 }], remainingBalance: newTotalDebt }) : null;
+
+    await supabase.from('c2b_payments').insert([{ phone, amount, mpesa_code: invoiceId, account_ref: accountRef, customer_name: activeDebts[0]?.customer_name || 'IntaSend Customer', status: remaining > 0 ? 'excess' : 'debt_cleared', amount_applied: totalApplied, amount_excess: remaining, receipt_number: payRef, receipt_data: receiptDataJson, created_at: now.toISOString() }]);
+
+    log.info(`[INTASEND] ✅ Applied KES ${totalApplied} remaining KES ${newTotalDebt}`);
+}
 
 // ── POST /api/mpesa/webhook ───────────────────────────────────────────────────
 // IntaSend fires this on every state change: PENDING → PROCESSING → COMPLETE | FAILED
@@ -6607,102 +6741,12 @@ app.post('/api/mpesa/webhook', async (req, res) => {
             await mpesaSet(invoiceId, { ...pending, status: 'confirmed', mpesa_code: invoiceId, amount, result_desc: 'Payment confirmed via IntaSend' });
         }
 
+        // Mark confirmed then run debt matching via shared helper
+        if (pending) {
+            await mpesaSet(invoiceId, { ...pending, status: 'confirmed', mpesa_code: invoiceId, amount, result_desc: 'Payment confirmed via IntaSend webhook' });
+        }
         log.info(`[INTASEND WEBHOOK] ✅ COMPLETE invoiceId=${invoiceId} KES=${amount} phone=${phone} ref=${accountRef}`);
-
-        // ── FIFO debt matching (same logic as Safaricom C2B) ─────────────────
-        const now      = new Date();
-        const datePart = now.getFullYear().toString() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0');
-        const timePart = String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0') + String(now.getSeconds()).padStart(2,'0');
-
-        let activeDebts = [];
-
-        if (accountRef && accountRef.trim().length > 2) {
-            const { data: byInvoice } = await supabase.from('Sales').select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
-                .or(`invoice_number.ilike.%${accountRef.trim()}%,receipt_number.ilike.%${accountRef.trim()}%`)
-                .eq('is_voided', false).in('payment_status', ['Credit','Partial','credit','partial','Unpaid']).order('sale_date', { ascending: true });
-            if (byInvoice?.length) activeDebts = byInvoice;
-        }
-
-        if (!activeDebts.length && phone) {
-            const { data: byPhone } = await supabase.from('Sales').select('id, item_name, total_amount, amount_paid, customer_name, customer_phone')
-                .eq('customer_phone', phone).eq('is_voided', false)
-                .in('payment_status', ['Credit','Partial','credit','partial','Unpaid']).order('sale_date', { ascending: true });
-            if (byPhone?.length) activeDebts = byPhone;
-        }
-
-        activeDebts = activeDebts.filter(d => (parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0)) > 0);
-
-        // No debt — store as unmatched for cashier to resolve as goods purchase
-        if (!activeDebts.length) {
-            await supabase.from('c2b_payments').insert([{
-                phone, amount, mpesa_code: invoiceId, account_ref: accountRef,
-                customer_name: 'IntaSend Customer', status: 'unmatched',
-                amount_applied: 0, amount_excess: amount, created_at: now.toISOString(),
-            }]);
-            log.info(`[INTASEND WEBHOOK] ⚠️  No debt matched ref="${accountRef}" phone="${phone}" — stored as unmatched`);
-            return;
-        }
-
-        // Apply FIFO
-        let remaining = amount, totalApplied = 0, payRef = null;
-        for (const debt of activeDebts) {
-            if (remaining <= 0) break;
-            const balance  = Math.round(parseFloat(debt.total_amount) - parseFloat(debt.amount_paid || 0));
-            if (balance <= 0) continue;
-            const applyAmt = Math.min(remaining, balance);
-            const newPaid  = applyAmt >= balance ? parseFloat(debt.total_amount) : parseFloat(debt.amount_paid || 0) + applyAmt;
-            const newStatus = newPaid >= parseFloat(debt.total_amount) - 0.01 ? 'Paid' : 'Partial';
-            payRef = `PAY-${datePart}-${timePart}-IS`;
-            await supabase.from('Sales').update({ amount_paid: newPaid, payment_status: newStatus }).eq('id', debt.id);
-            await supabase.from('payments').insert([{
-                sale_id: debt.id, amount: applyAmt, payment_method: 'M-Pesa',
-                mpesa_code: `${invoiceId}-${debt.id}`, received_by: 'INTASEND-AUTO',
-                customer_name: debt.customer_name || 'IntaSend Customer', created_at: now.toISOString(),
-            }]);
-            await supabase.from('debt_payments').insert([{
-                sale_id: debt.id, amount_paid: applyAmt, payment_method: 'M-Pesa',
-                mpesa_id: invoiceId, processed_by: 'INTASEND-AUTO',
-                customer_name: debt.customer_name || 'IntaSend Customer',
-                customer_phone: phone, payment_date: now.toISOString(),
-            }]);
-            totalApplied += applyAmt;
-            remaining    -= applyAmt;
-        }
-
-        // Update customer aggregate debt
-        let newTotalDebt = 0;
-        const targetPhone = activeDebts[0]?.customer_phone || phone;
-        if (targetPhone) {
-            const { data: cust } = await supabase.from('customers').select('total_debt').eq('phone', targetPhone).single();
-            if (cust) {
-                newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - totalApplied);
-                await supabase.from('customers').update({ total_debt: newTotalDebt }).eq('phone', targetPhone);
-            }
-        }
-
-        let receiptDataJson = null;
-        if (totalApplied > 0) {
-            receiptDataJson = JSON.stringify({
-                customer: activeDebts[0]?.customer_name || 'IntaSend Customer',
-                total: totalApplied, amount: totalApplied, method: 'M-Pesa (IntaSend)',
-                code: invoiceId, receiptNumber: payRef, servedBy: 'INTASEND-AUTO',
-                date: now.toLocaleString('en-KE'),
-                items: [{ itemName: 'Debt Clearance - IntaSend', price: totalApplied, quantity: 1 }],
-                remainingBalance: newTotalDebt,
-            });
-        }
-
-        const finalStatus = remaining > 0 ? 'excess' : 'debt_cleared';
-        await supabase.from('c2b_payments').insert([{
-            phone, amount, mpesa_code: invoiceId, account_ref: accountRef,
-            customer_name: activeDebts[0]?.customer_name || 'IntaSend Customer',
-            status: finalStatus, amount_applied: totalApplied, amount_excess: remaining,
-            receipt_number: payRef, receipt_data: receiptDataJson, created_at: now.toISOString(),
-        }]);
-
-        remaining > 0
-            ? log.info(`[INTASEND WEBHOOK] ℹ️  KES ${remaining} excess — cashier resolves as goods purchase`)
-            : log.info(`[INTASEND WEBHOOK] ✅ Debts cleared. Applied KES ${totalApplied} remaining KES ${newTotalDebt}`);
+        await processIntaSendComplete({ invoiceId, amount, tx: pending || { phone: '0'+String(phone).replace(/^254/,''), context: { accountRef } } });
 
     } catch (err) {
         log.error('[INTASEND WEBHOOK ERROR]', err.message, err.stack?.split('\n')[1]?.trim());
