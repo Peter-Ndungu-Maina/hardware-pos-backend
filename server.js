@@ -6273,10 +6273,10 @@ app.get('/api/mpesa/status/:invoiceId', requireAuth, async (req, res) => {
                 const checkRes = await fetch(`${INTASEND_STK_BASE}/api/v1/payment/status/`, {
                     method:  'POST',
                     headers: {
-                        'Content-Type':  'application/json',
+                        'Content-Type':  'application/x-www-form-urlencoded',
                         'Authorization': `Bearer ${INTASEND_STK_SEC}`,
                     },
-                    body:    JSON.stringify({ public_key: INTASEND_STK_PUB, invoice_id: invoiceId }),
+                    body:    new URLSearchParams({ public_key: INTASEND_STK_PUB, invoice_id: invoiceId }).toString(),
                     signal:  AbortSignal.timeout(8000),
                 });
                 if (checkRes.ok) {
