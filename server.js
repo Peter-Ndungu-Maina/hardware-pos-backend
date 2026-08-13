@@ -1296,6 +1296,46 @@ function pick(obj, keys) {
     return keys.reduce((acc, k) => { if (k in obj) acc[k] = obj[k]; return acc; }, {});
 }
 
+// ── Activity Log — records security-relevant events to activity_log table ────
+// Falls back to a no-op if the table doesn't exist yet (non-breaking).
+const ACT = {
+    LOGIN_SUCCESS:        'LOGIN_SUCCESS',
+    LOGIN_FAILED:         'LOGIN_FAILED',
+    MFA_SETUP:            'MFA_SETUP',
+    SALE_COMPLETED:       'SALE_COMPLETED',
+    SALE_CREDIT:          'SALE_CREDIT',
+    SALE_VOIDED:          'SALE_VOIDED',
+    SALE_EDITED:          'SALE_EDITED',
+    SUBSCRIPTION_PAYMENT: 'SUBSCRIPTION_PAYMENT',
+    INTASEND_CHECKOUT:    'INTASEND_CHECKOUT',
+    SUPPLIER_PAYMENT:     'SUPPLIER_PAYMENT',
+    EMPLOYEE_CREATED:     'EMPLOYEE_CREATED',
+    PIN_RESET_REQUESTED:  'PIN_RESET_REQUESTED',
+    CREDIT_LIMIT_CHANGED: 'CREDIT_LIMIT_CHANGED',
+    EXPENSE_ADDED:        'EXPENSE_ADDED',
+    EXCHANGE_PROCESSED:   'EXCHANGE_PROCESSED',
+    DB_CLEANUP:           'DB_CLEANUP',
+    BACKUP_CREATED:       'BACKUP_CREATED',
+};
+
+async function logActivity(action, performedBy, details = {}, meta = {}) {
+    try {
+        await supabase.from('activity_log').insert([{
+            action,
+            performed_by: performedBy || 'system',
+            details,
+            role:         meta.role    || null,
+            ip:           meta.ip      || null,
+            target_id:    meta.target_id   || null,
+            target_name:  meta.target_name || null,
+            created_at:   new Date().toISOString(),
+        }]);
+    } catch (err) {
+        // Never throw — activity logging must never break the main request flow
+        log.warn(`[ACT LOG] Failed to log action=${action}: ${err.message}`);
+    }
+}
+
 // ── Subscription admin API routes ────────────────────────────────────────────
 
 // GET /api/subscription/status
