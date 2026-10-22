@@ -6463,6 +6463,157 @@ app.post('/api/mpesa/callback', (req, res) => {
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  REMOTE PAYMENTS PANEL  —  /api/c2b/*                                        ║
+// ║  Backs the "Remote M-Pesa Payments" panel on the dashboard and the           ║
+// ║  inventory C2B checkout. Rows live in `c2b_payments` and are written by      ║
+// ║  processIntaSendComplete() (statuses: unmatched | excess | debt_cleared).    ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+const C2B_OPEN_STATUSES = ['unmatched', 'excess', 'ignored'];
+
+// `notes` / `resolved_at` may not exist on older copies of the table — retry without them.
+async function c2bUpdate(id, fields, extra = {}) {
+    let r = await supabase.from('c2b_payments').update({ ...fields, ...extra }).eq('id', id);
+    if (r.error && /column/i.test(r.error.message || '')) r = await supabase.from('c2b_payments').update(fields).eq('id', id);
+    return r;
+}
+
+// GET /api/c2b/payments — last 7 days, plus anything still waiting to be resolved
+app.get('/api/c2b/payments', requireAuth, async (req, res) => {
+    try {
+        res.set('Cache-Control', 'no-store');
+        const since = new Date(Date.now() - 7 * 86400000).toISOString();
+        const { data, error } = await supabase.from('c2b_payments').select('*')
+            .or(`created_at.gte.${since},status.in.(unmatched,excess,goods_purchase)`)
+            .order('created_at', { ascending: false }).limit(200);
+        if (error) throw error;
+        res.json(data || []);
+    } catch (err) {
+        log.error('[C2B LIST]', err.message);
+        res.status(500).json({ success: false, message: 'Could not load remote payments.' });
+    }
+});
+
+// POST /api/c2b/resolve-ignore  { c2bId, notes }
+app.post('/api/c2b/resolve-ignore', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { c2bId, notes } = req.body || {};
+        if (!c2bId) return res.status(400).json({ success: false, message: 'Missing payment id.' });
+        const { data: row } = await supabase.from('c2b_payments').select('id,status').eq('id', c2bId).maybeSingle();
+        if (!row) return res.status(404).json({ success: false, message: 'Payment not found.' });
+        if (!C2B_OPEN_STATUSES.includes(row.status))
+            return res.status(409).json({ success: false, message: `Payment is already ${row.status}.` });
+        const { error } = await c2bUpdate(c2bId, { status: 'ignored' }, { notes: notes || null, resolved_at: new Date().toISOString() });
+        if (error) throw error;
+        log.info(`[C2B IGNORE] payment ${c2bId} ignored by ${req.user.name}`);
+        res.json({ success: true });
+    } catch (err) {
+        log.error('[C2B IGNORE]', err.message);
+        res.status(500).json({ success: false, message: 'Could not update payment.' });
+    }
+});
+
+// POST /api/c2b/resolve-debt  { c2bId, debtorPhone } — apply the unallocated money to that customer's debts (oldest first)
+app.post('/api/c2b/resolve-debt', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    const { c2bId, debtorPhone } = req.body || {};
+    if (!c2bId || !debtorPhone) return res.status(400).json({ success: false, message: 'Missing payment id or debtor phone.' });
+
+    let claimed = null;
+    try {
+        // Atomically claim the row so a double-click can't apply it twice
+        const { data: row } = await supabase.from('c2b_payments').select('*').eq('id', c2bId).maybeSingle();
+        if (!row) return res.status(404).json({ success: false, message: 'Payment not found.' });
+        if (!C2B_OPEN_STATUSES.includes(row.status))
+            return res.status(409).json({ success: false, message: `Payment is already ${row.status}.` });
+        const { data: lock } = await supabase.from('c2b_payments').update({ status: 'processing' })
+            .eq('id', c2bId).eq('status', row.status).select('id');
+        if (!lock?.length) return res.status(409).json({ success: false, message: 'Payment is being processed already.' });
+        claimed = row;
+
+        const available = Math.round(parseFloat(row.amount_excess > 0 ? row.amount_excess : row.amount) || 0);
+        const { data: debts } = await supabase.from('Sales')
+            .select('id,total_amount,amount_paid,customer_name,customer_phone')
+            .eq('customer_phone', String(debtorPhone).trim()).eq('is_voided', false)
+            .in('payment_status', ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'])
+            .order('sale_date', { ascending: true });
+        const active = (debts || []).filter(d => parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0) > 0);
+        if (!active.length) {
+            await supabase.from('c2b_payments').update({ status: row.status }).eq('id', c2bId);
+            return res.status(400).json({ success: false, message: 'No outstanding debt found for that phone number.' });
+        }
+
+        const now = new Date();
+        const stamp = now.getFullYear() + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0')
+                    + '-' + String(now.getHours()).padStart(2, '0') + String(now.getMinutes()).padStart(2, '0') + String(now.getSeconds()).padStart(2, '0');
+        const payRef = `PAY-${stamp}-C2B`;
+        let remaining = available, applied = 0;
+
+        for (const d of active) {
+            if (remaining <= 0) break;
+            const bal = Math.round(parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0));
+            if (bal <= 0) continue;
+            const apply   = Math.min(remaining, bal);
+            const newPaid = apply >= bal ? parseFloat(d.total_amount) : parseFloat(d.amount_paid || 0) + apply;
+            await supabase.from('Sales').update({ amount_paid: newPaid, payment_status: newPaid >= parseFloat(d.total_amount) - 0.01 ? 'Paid' : 'Partial' }).eq('id', d.id);
+            await supabase.from('payments').insert([{ sale_id: d.id, amount: apply, payment_method: 'M-Pesa', mpesa_code: `${row.mpesa_code}-${d.id}`, received_by: req.user.name, customer_name: d.customer_name || row.customer_name, created_at: now.toISOString() }]);
+            await supabase.from('debt_payments').insert([{ sale_id: d.id, amount_paid: apply, payment_method: 'M-Pesa', mpesa_id: row.mpesa_code, processed_by: req.user.name, customer_name: d.customer_name || row.customer_name, customer_phone: String(debtorPhone).trim(), payment_date: now.toISOString() }]);
+            applied += apply; remaining -= apply;
+        }
+
+        let newTotalDebt = 0;
+        const { data: cust } = await supabase.from('customers').select('total_debt').eq('phone', String(debtorPhone).trim()).maybeSingle();
+        if (cust) { newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - applied); await supabase.from('customers').update({ total_debt: newTotalDebt }).eq('phone', String(debtorPhone).trim()); }
+
+        const receipt = JSON.stringify({ customer: active[0].customer_name || row.customer_name || 'Customer', total: applied, amount: applied, method: 'M-Pesa', code: row.mpesa_code, receiptNumber: payRef, servedBy: req.user.name, date: now.toLocaleString('en-KE'), items: [{ itemName: 'Debt Clearance', price: applied, quantity: 1 }], remainingBalance: newTotalDebt });
+        const { error } = await c2bUpdate(c2bId, {
+            status: remaining > 0 ? 'excess' : 'debt_cleared',
+            amount_applied: parseFloat(row.amount_applied || 0) + applied,
+            amount_excess: remaining,
+            customer_name: active[0].customer_name || row.customer_name,
+            receipt_number: payRef, receipt_data: receipt
+        }, { resolved_at: now.toISOString() });
+        if (error) throw error;
+
+        log.info(`[C2B DEBT] ✅ KES ${applied} of ${row.mpesa_code} applied to ${debtorPhone}, left over KES ${remaining}`);
+        res.json({ success: true, applied, remaining, receiptNumber: payRef });
+    } catch (err) {
+        log.error('[C2B DEBT]', err.message);
+        if (claimed) { try { await supabase.from('c2b_payments').update({ status: claimed.status }).eq('id', c2bId); } catch (_) {} }
+        res.status(500).json({ success: false, message: 'Could not apply payment to debt.' });
+    }
+});
+
+// POST /api/c2b/resolve-goods — called by the inventory page after it has rung up the sale
+// body: { c2bId, notes, customerName, receiptNumber, receiptData:[items], amountApplied }
+app.post('/api/c2b/resolve-goods', requireAuth, async (req, res) => {
+    try {
+        const { c2bId, notes, customerName, receiptNumber, receiptData, amountApplied } = req.body || {};
+        const used = parseFloat(amountApplied);
+        if (!c2bId || !used || used <= 0) return res.status(400).json({ success: false, message: 'Missing payment id or amount.' });
+        const { data: row } = await supabase.from('c2b_payments').select('*').eq('id', c2bId).maybeSingle();
+        if (!row) return res.status(404).json({ success: false, message: 'Payment not found.' });
+        if (!C2B_OPEN_STATUSES.includes(row.status))
+            return res.status(409).json({ success: false, message: `Payment is already ${row.status}.` });
+        const available = parseFloat(row.amount_excess > 0 ? row.amount_excess : row.amount) || 0;
+        if (used > available + 0.01)
+            return res.status(400).json({ success: false, message: `Sale total KES ${used} is more than the KES ${available} received.` });
+        const left = Math.max(0, Math.round((available - used) * 100) / 100);
+        const { error } = await c2bUpdate(c2bId, {
+            status: left > 0 ? 'excess' : 'goods_purchase',
+            amount_applied: parseFloat(row.amount_applied || 0) + used,
+            amount_excess: left,
+            customer_name: customerName || row.customer_name,
+            receipt_number: receiptNumber || null,
+            receipt_data: typeof receiptData === 'string' ? receiptData : JSON.stringify(receiptData || [])
+        }, { notes: notes || null, resolved_at: new Date().toISOString() });
+        if (error) throw error;
+        res.json({ success: true, remaining: left });
+    } catch (err) {
+        log.error('[C2B GOODS]', err.message);
+        res.status(500).json({ success: false, message: 'Could not record the goods sale.' });
+    }
+});
+
 //  DIGITAX RECONCILIATION — Cross-check POS vs KRA
 //  GET /api/digitax/reconcile?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
 //
