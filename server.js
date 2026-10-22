@@ -6330,6 +6330,17 @@ async function processIntaSendComplete({ invoiceId, amount, tx }) {
     const { data: existingC2B } = await supabase.from('c2b_payments').select('id').eq('mpesa_code', invoiceId).maybeSingle();
     if (existingC2B) { log.warn(`[INTASEND] Duplicate invoiceId=${invoiceId} — skip`); return; }
 
+    // Any STK push started from the POS (cart checkout OR the dashboard "Clear Debt" modal)
+    // is recorded by the screen that started it: the cart through /api/sell/cart and the
+    // debt modal through /api/clear-debt, both using this invoiceId as the M-Pesa code.
+    // Auto-applying it to the customer's debts here as well would count the same money twice
+    // (e.g. KES 10 paid for goods ALSO clearing a KES 10 debt). Only payments that were NOT
+    // started from the POS (no pending_mpesa context) are auto-matched to debts below.
+    if (tx?.context?.channel === 'INTASEND_MPESA' || tx?.context?.saleId || tx?.context?.source || tx?.context?.purpose) {
+        log.info(`[INTASEND] invoiceId=${invoiceId} was started from the POS — recorded by the screen that sent it, not auto-applied to debts`);
+        return;
+    }
+
     const phone      = tx?.phone ? String(tx.phone).replace(/^254/, '0') : '';
     const accountRef = tx?.context?.accountRef || null;
     const now        = new Date();
@@ -6453,6 +6464,341 @@ app.post('/api/mpesa/webhook', async (req, res) => {
 app.post('/api/mpesa/callback', (req, res) => {
     log.warn('[MPESA CALLBACK] Received on legacy Daraja callback route — this is no longer active.');
     res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+});
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  REMOTE PAYMENTS PANEL  —  /api/c2b/*                                        ║
+// ║  Backs the "Remote M-Pesa Payments" panel on the dashboard and the           ║
+// ║  inventory C2B checkout. Rows live in `c2b_payments` and are written by      ║
+// ║  processIntaSendComplete() (statuses: unmatched | excess | debt_cleared).    ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+const C2B_OPEN_STATUSES = ['unmatched', 'excess', 'ignored'];
+
+// `notes` / `resolved_at` may not exist on older copies of the table — retry without them.
+async function c2bUpdate(id, fields, extra = {}) {
+    let r = await supabase.from('c2b_payments').update({ ...fields, ...extra }).eq('id', id);
+    if (r.error && /column/i.test(r.error.message || '')) r = await supabase.from('c2b_payments').update(fields).eq('id', id);
+    return r;
+}
+
+// GET /api/c2b/payments — last 7 days, plus anything still waiting to be resolved
+app.get('/api/c2b/payments', requireAuth, async (req, res) => {
+    try {
+        res.set('Cache-Control', 'no-store');
+        const since = new Date(Date.now() - 7 * 86400000).toISOString();
+        const { data, error } = await supabase.from('c2b_payments').select('*')
+            .or(`created_at.gte.${since},status.in.(unmatched,excess,goods_purchase)`)
+            .order('created_at', { ascending: false }).limit(200);
+        if (error) throw error;
+        res.json(data || []);
+    } catch (err) {
+        log.error('[C2B LIST]', err.message);
+        res.status(500).json({ success: false, message: 'Could not load remote payments.' });
+    }
+});
+
+// POST /api/c2b/resolve-ignore  { c2bId, notes }
+app.post('/api/c2b/resolve-ignore', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { c2bId, notes } = req.body || {};
+        if (!c2bId) return res.status(400).json({ success: false, message: 'Missing payment id.' });
+        const { data: row } = await supabase.from('c2b_payments').select('id,status').eq('id', c2bId).maybeSingle();
+        if (!row) return res.status(404).json({ success: false, message: 'Payment not found.' });
+        if (!C2B_OPEN_STATUSES.includes(row.status))
+            return res.status(409).json({ success: false, message: `Payment is already ${row.status}.` });
+        const { error } = await c2bUpdate(c2bId, { status: 'ignored' }, { notes: notes || null, resolved_at: new Date().toISOString() });
+        if (error) throw error;
+        log.info(`[C2B IGNORE] payment ${c2bId} ignored by ${req.user.name}`);
+        res.json({ success: true });
+    } catch (err) {
+        log.error('[C2B IGNORE]', err.message);
+        res.status(500).json({ success: false, message: 'Could not update payment.' });
+    }
+});
+
+// POST /api/c2b/resolve-debt  { c2bId, debtorPhone } — apply the unallocated money to that customer's debts (oldest first)
+app.post('/api/c2b/resolve-debt', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    const { c2bId, debtorPhone } = req.body || {};
+    if (!c2bId || !debtorPhone) return res.status(400).json({ success: false, message: 'Missing payment id or debtor phone.' });
+
+    let claimed = null;
+    try {
+        // Atomically claim the row so a double-click can't apply it twice
+        const { data: row } = await supabase.from('c2b_payments').select('*').eq('id', c2bId).maybeSingle();
+        if (!row) return res.status(404).json({ success: false, message: 'Payment not found.' });
+        if (!C2B_OPEN_STATUSES.includes(row.status))
+            return res.status(409).json({ success: false, message: `Payment is already ${row.status}.` });
+        const { data: lock } = await supabase.from('c2b_payments').update({ status: 'processing' })
+            .eq('id', c2bId).eq('status', row.status).select('id');
+        if (!lock?.length) return res.status(409).json({ success: false, message: 'Payment is being processed already.' });
+        claimed = row;
+
+        const available = Math.round(parseFloat(row.amount_excess > 0 ? row.amount_excess : row.amount) || 0);
+        const { data: debts } = await supabase.from('Sales')
+            .select('id,total_amount,amount_paid,customer_name,customer_phone')
+            .eq('customer_phone', String(debtorPhone).trim()).eq('is_voided', false)
+            .in('payment_status', ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'])
+            .order('sale_date', { ascending: true });
+        const active = (debts || []).filter(d => parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0) > 0);
+        if (!active.length) {
+            await supabase.from('c2b_payments').update({ status: row.status }).eq('id', c2bId);
+            return res.status(400).json({ success: false, message: 'No outstanding debt found for that phone number.' });
+        }
+
+        const now = new Date();
+        const stamp = now.getFullYear() + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0')
+                    + '-' + String(now.getHours()).padStart(2, '0') + String(now.getMinutes()).padStart(2, '0') + String(now.getSeconds()).padStart(2, '0');
+        const payRef = `PAY-${stamp}-C2B`;
+        let remaining = available, applied = 0;
+
+        for (const d of active) {
+            if (remaining <= 0) break;
+            const bal = Math.round(parseFloat(d.total_amount) - parseFloat(d.amount_paid || 0));
+            if (bal <= 0) continue;
+            const apply   = Math.min(remaining, bal);
+            const newPaid = apply >= bal ? parseFloat(d.total_amount) : parseFloat(d.amount_paid || 0) + apply;
+            await supabase.from('Sales').update({ amount_paid: newPaid, payment_status: newPaid >= parseFloat(d.total_amount) - 0.01 ? 'Paid' : 'Partial' }).eq('id', d.id);
+            await supabase.from('payments').insert([{ sale_id: d.id, amount: apply, payment_method: 'M-Pesa', mpesa_code: `${row.mpesa_code}-${d.id}`, received_by: req.user.name, customer_name: d.customer_name || row.customer_name, created_at: now.toISOString() }]);
+            await supabase.from('debt_payments').insert([{ sale_id: d.id, amount_paid: apply, payment_method: 'M-Pesa', mpesa_id: row.mpesa_code, processed_by: req.user.name, customer_name: d.customer_name || row.customer_name, customer_phone: String(debtorPhone).trim(), payment_date: now.toISOString() }]);
+            applied += apply; remaining -= apply;
+        }
+
+        let newTotalDebt = 0;
+        const { data: cust } = await supabase.from('customers').select('total_debt').eq('phone', String(debtorPhone).trim()).maybeSingle();
+        if (cust) { newTotalDebt = Math.max(0, parseFloat(cust.total_debt || 0) - applied); await supabase.from('customers').update({ total_debt: newTotalDebt }).eq('phone', String(debtorPhone).trim()); }
+
+        const receipt = JSON.stringify({ customer: active[0].customer_name || row.customer_name || 'Customer', total: applied, amount: applied, method: 'M-Pesa', code: row.mpesa_code, receiptNumber: payRef, servedBy: req.user.name, date: now.toLocaleString('en-KE'), items: [{ itemName: 'Debt Clearance', price: applied, quantity: 1 }], remainingBalance: newTotalDebt });
+        const { error } = await c2bUpdate(c2bId, {
+            status: remaining > 0 ? 'excess' : 'debt_cleared',
+            amount_applied: parseFloat(row.amount_applied || 0) + applied,
+            amount_excess: remaining,
+            customer_name: active[0].customer_name || row.customer_name,
+            receipt_number: payRef, receipt_data: receipt
+        }, { resolved_at: now.toISOString() });
+        if (error) throw error;
+
+        log.info(`[C2B DEBT] ✅ KES ${applied} of ${row.mpesa_code} applied to ${debtorPhone}, left over KES ${remaining}`);
+        res.json({ success: true, applied, remaining, receiptNumber: payRef });
+    } catch (err) {
+        log.error('[C2B DEBT]', err.message);
+        if (claimed) { try { await supabase.from('c2b_payments').update({ status: claimed.status }).eq('id', c2bId); } catch (_) {} }
+        res.status(500).json({ success: false, message: 'Could not apply payment to debt.' });
+    }
+});
+
+// POST /api/c2b/resolve-goods — called by the inventory page after it has rung up the sale
+// body: { c2bId, notes, customerName, receiptNumber, receiptData:[items], amountApplied }
+app.post('/api/c2b/resolve-goods', requireAuth, async (req, res) => {
+    try {
+        const { c2bId, notes, customerName, receiptNumber, receiptData, amountApplied } = req.body || {};
+        const used = parseFloat(amountApplied);
+        if (!c2bId || !used || used <= 0) return res.status(400).json({ success: false, message: 'Missing payment id or amount.' });
+        const { data: row } = await supabase.from('c2b_payments').select('*').eq('id', c2bId).maybeSingle();
+        if (!row) return res.status(404).json({ success: false, message: 'Payment not found.' });
+        if (!C2B_OPEN_STATUSES.includes(row.status))
+            return res.status(409).json({ success: false, message: `Payment is already ${row.status}.` });
+        const available = parseFloat(row.amount_excess > 0 ? row.amount_excess : row.amount) || 0;
+        if (used > available + 0.01)
+            return res.status(400).json({ success: false, message: `Sale total KES ${used} is more than the KES ${available} received.` });
+        const left = Math.max(0, Math.round((available - used) * 100) / 100);
+        const { error } = await c2bUpdate(c2bId, {
+            status: left > 0 ? 'excess' : 'goods_purchase',
+            amount_applied: parseFloat(row.amount_applied || 0) + used,
+            amount_excess: left,
+            customer_name: customerName || row.customer_name,
+            receipt_number: receiptNumber || null,
+            receipt_data: typeof receiptData === 'string' ? receiptData : JSON.stringify(receiptData || [])
+        }, { notes: notes || null, resolved_at: new Date().toISOString() });
+        if (error) throw error;
+        res.json({ success: true, remaining: left });
+    } catch (err) {
+        log.error('[C2B GOODS]', err.message);
+        res.status(500).json({ success: false, message: 'Could not record the goods sale.' });
+    }
+});
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  ACCOUNTING  —  /api/accounting/*   (admin + manager)                        ║
+// ║  Reports are DERIVED from the live tables (Sales, payments, Inventory,       ║
+// ║  expenses, suppliers, purchase_orders, c2b_payments, pending_mpesa) — there  ║
+// ║  is no separate journal. Cash / M-Pesa / stock figures are estimates.        ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+const ACCT_CREDIT_STATUSES = ['Credit', 'Partial', 'credit', 'partial', 'Unpaid'];
+const acctR2 = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+
+const ACCT_DEFAULT_ACCOUNTS = [
+    { code:'1000', name:'Cash in Hand',        type:'Asset',     balance:0 },
+    { code:'1010', name:'M-Pesa Float',        type:'Asset',     balance:0 },
+    { code:'1100', name:'Trade Debtors',       type:'Asset',     balance:0 },
+    { code:'1200', name:'Stock / Inventory',   type:'Asset',     balance:0 },
+    { code:'1500', name:'Fixed Assets',        type:'Asset',     balance:0 },
+    { code:'2000', name:'Supplier Payables',   type:'Liability', balance:0 },
+    { code:'2100', name:'VAT Payable',         type:'Liability', balance:0 },
+    { code:'3000', name:"Owner's Capital",     type:'Equity',    balance:0 },
+    { code:'3100', name:'Retained Earnings',   type:'Equity',    balance:0 },
+    { code:'4000', name:'Sales Revenue',       type:'Revenue',   balance:0 },
+    { code:'5000', name:'Cost of Goods Sold',  type:'Expense',   balance:0 },
+    { code:'5100', name:'Operating Expenses',  type:'Expense',   balance:0 },
+];
+
+/** Read every row of a query (Supabase returns max 1000 per request). */
+async function acctFetchAll(buildQuery, pageSize = 1000, maxPages = 80) {
+    let rows = [];
+    for (let p = 0; p < maxPages; p++) {
+        const { data, error } = await buildQuery().range(p * pageSize, (p + 1) * pageSize - 1);
+        if (error) throw error;
+        rows = rows.concat(data || []);
+        if (!data || data.length < pageSize) break;
+    }
+    return rows;
+}
+const acctDayStart = d => `${d}T00:00:00.000+03:00`;
+const acctDayEnd   = d => `${d}T23:59:59.999+03:00`;
+const acctValidDate = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
+
+async function acctStockValue() {
+    const items = await acctFetchAll(() => supabase.from('Inventory').select('id,stock_quantity,cost_price').order('id'));
+    return acctR2(items.reduce((s, i) => s + Math.max(0, parseFloat(i.stock_quantity) || 0) * (parseFloat(i.cost_price) || 0), 0));
+}
+
+async function acctIncomeStatement(from, to) {
+    const sales = await acctFetchAll(() => supabase.from('Sales')
+        .select('id,total_amount,amount_paid,cost_price').eq('is_voided', false)
+        .gte('sale_date', acctDayStart(from)).lte('sale_date', acctDayEnd(to)).order('id'));
+    const expenses = await acctFetchAll(() => supabase.from('expenses')
+        .select('id,amount,category').gte('expense_date', acctDayStart(from)).lte('expense_date', acctDayEnd(to)).order('id'));
+    const { data: pos } = await supabase.from('purchase_orders')
+        .select('total_amount,status').gte('order_date', from).lte('order_date', to).in('status', ['Received', 'Partial']);
+
+    let gross = 0, paid = 0, cogs = 0;
+    for (const s of sales) {
+        gross += parseFloat(s.total_amount) || 0;
+        paid  += parseFloat(s.amount_paid)  || 0;
+        cogs  += parseFloat(s.cost_price)   || 0;   // already the TOTAL line cost
+    }
+    const creditUnpaid = Math.max(0, gross - paid);
+    const byCat = {};
+    let totalExp = 0;
+    for (const e of expenses) {
+        const cat = (e.category || 'Other').trim() || 'Other';
+        const amt = parseFloat(e.amount) || 0;
+        byCat[cat] = acctR2((byCat[cat] || 0) + amt);
+        totalExp += amt;
+    }
+    const purchases    = acctR2((pos || []).reduce((s, p) => s + (parseFloat(p.total_amount) || 0), 0));
+    const closingStock = await acctStockValue();
+    const openingStock = Math.max(0, acctR2(closingStock - purchases + cogs));   // balancing figure: opening + purchases − closing = COGS
+    const grossProfit  = acctR2(paid - cogs);
+    return {
+        gross_sales: acctR2(gross), credit_unpaid: acctR2(creditUnpaid), net_revenue: acctR2(paid),
+        opening_stock: openingStock, purchases, closing_stock: closingStock, cogs: acctR2(cogs),
+        gross_profit: grossProfit, expenses_by_cat: byCat, total_expenses: acctR2(totalExp),
+        net_profit: acctR2(grossProfit - totalExp)
+    };
+}
+
+app.get('/api/accounting/accounts', requireAuth, requireRole('admin', 'manager'), (req, res) => {
+    res.json({ success: true, accounts: ACCT_DEFAULT_ACCOUNTS });
+});
+// Chart of accounts is fixed; the page calls this only when the list above is empty.
+app.post('/api/accounting/accounts/seed', requireAuth, requireRole('admin', 'manager'), (req, res) => {
+    res.json({ success: true, seeded: 0 });
+});
+
+app.get('/api/accounting/income-statement', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { from, to } = req.query;
+        if (!acctValidDate(from) || !acctValidDate(to)) return res.status(400).json({ success: false, message: 'from and to must be YYYY-MM-DD.' });
+        res.json({ success: true, data: await acctIncomeStatement(from, to) });
+    } catch (err) {
+        log.error('[ACCT IS]', err.message);
+        res.status(500).json({ success: false, message: 'Could not build the income statement.' });
+    }
+});
+
+app.get('/api/accounting/balance-sheet', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const now   = new Date();
+        const ymd   = d => d.toISOString().split('T')[0];
+        const from  = ymd(new Date(now.getFullYear(), now.getMonth(), 1));
+        const to    = ymd(new Date(now.getFullYear(), now.getMonth() + 1, 0));
+
+        const [debtSales, payments, expenses, suppliers, stock, monthIS] = await Promise.all([
+            acctFetchAll(() => supabase.from('Sales').select('id,total_amount,amount_paid').eq('is_voided', false).in('payment_status', ACCT_CREDIT_STATUSES).order('id')),
+            acctFetchAll(() => supabase.from('payments').select('id,amount,payment_method').order('id')),
+            acctFetchAll(() => supabase.from('expenses').select('id,amount').order('id')),
+            acctFetchAll(() => supabase.from('suppliers').select('id,balance').order('id')),
+            acctStockValue(),
+            acctIncomeStatement(from, to)
+        ]);
+
+        const debtors  = debtSales.reduce((s, r) => s + Math.max(0, (parseFloat(r.total_amount) || 0) - (parseFloat(r.amount_paid) || 0)), 0);
+        let cashIn = 0, mpesa = 0;
+        for (const p of payments) {
+            const m = String(p.payment_method || '');
+            if (/cash/i.test(m)) cashIn += parseFloat(p.amount) || 0;
+            else if (/m-?pesa|safaricom|mobile|intasend/i.test(m)) mpesa += parseFloat(p.amount) || 0;
+        }
+        const spent    = expenses.reduce((s, e) => s + (parseFloat(e.amount) || 0), 0);
+        const payables = suppliers.reduce((s, r) => s + Math.max(0, parseFloat(r.balance) || 0), 0);
+        const vat      = monthIS.net_revenue * 0.16 / 1.16;      // VAT-inclusive prices, this month's collected sales
+
+        const cash        = acctR2(cashIn - spent);              // estimate: cash received − expenses paid
+        const fixed       = 0;
+        const assets      = cash + mpesa + debtors + stock + fixed;
+        const liabilities = payables + vat;
+        const equity      = assets - liabilities;
+        res.json({ success: true, data: {
+            cash, mpesa: acctR2(mpesa), debtors: acctR2(debtors), stock, fixed_assets: fixed,
+            payables: acctR2(payables), vat_payable: acctR2(vat),
+            current_profit: monthIS.net_profit,
+            retained_earnings: acctR2(equity - monthIS.net_profit)
+        }});
+    } catch (err) {
+        log.error('[ACCT BS]', err.message);
+        res.status(500).json({ success: false, message: 'Could not build the balance sheet.' });
+    }
+});
+
+// GET /api/accounting/reconcile?from=&to=&filter=all|matched|unmatched|excess
+app.get('/api/accounting/reconcile', requireAuth, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { from, to, filter = 'all' } = req.query;
+        if (!acctValidDate(from) || !acctValidDate(to)) return res.status(400).json({ success: false, message: 'from and to must be YYYY-MM-DD.' });
+        const a = acctDayStart(from), b = acctDayEnd(to);
+
+        const [c2b, stk, pays] = await Promise.all([
+            acctFetchAll(() => supabase.from('c2b_payments').select('*').gte('created_at', a).lte('created_at', b).order('id')),
+            acctFetchAll(() => supabase.from('pending_mpesa').select('*').eq('status', 'confirmed').gte('created_at', a).lte('created_at', b).order('checkout_id')),
+            acctFetchAll(() => supabase.from('payments').select('id,amount,payment_method').gte('created_at', a).lte('created_at', b).order('id'))
+        ]);
+
+        const c2bIds = new Set(c2b.map(r => r.mpesa_code));
+        let txns = c2b.map(r => ({ ...r, source: 'C2B' }));
+        for (const r of stk) {
+            if (c2bIds.has(r.checkout_id)) continue;           // already shown as a C2B row
+            txns.push({
+                id: r.checkout_id, source: 'STK', status: 'matched', amount: r.amount, phone: r.phone ? String(r.phone).replace(/^254/, '0') : '',
+                customer_name: r.context?.accountRef || '', account_ref: r.context?.accountRef || '', mpesa_code: r.checkout_id,
+                created_at: r.created_at, amount_excess: 0
+            });
+        }
+        txns.sort((x, y) => String(y.created_at || '').localeCompare(String(x.created_at || '')));
+
+        const groups = {
+            matched:   ['matched', 'debt_cleared', 'goods_purchase', 'debt_payment', 'completed'],
+            unmatched: ['unmatched'],
+            excess:    ['excess']
+        };
+        if (groups[filter]) txns = txns.filter(t => groups[filter].includes(t.status));
+
+        const totalPos = pays.filter(p => /m-?pesa|safaricom|mobile|intasend/i.test(String(p.payment_method || '')))
+                             .reduce((s, p) => s + (parseFloat(p.amount) || 0), 0);
+        res.json({ success: true, transactions: txns, total_mpesa_pos: acctR2(totalPos) });
+    } catch (err) {
+        log.error('[ACCT RECON]', err.message);
+        res.status(500).json({ success: false, message: 'Could not load reconciliation data.' });
+    }
 });
 
 //  DIGITAX RECONCILIATION — Cross-check POS vs KRA
