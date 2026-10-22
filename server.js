@@ -6330,11 +6330,14 @@ async function processIntaSendComplete({ invoiceId, amount, tx }) {
     const { data: existingC2B } = await supabase.from('c2b_payments').select('id').eq('mpesa_code', invoiceId).maybeSingle();
     if (existingC2B) { log.warn(`[INTASEND] Duplicate invoiceId=${invoiceId} — skip`); return; }
 
-    // Payments started from the dashboard "Clear Debt" modal carry context.saleId.
-    // The modal records them itself through POST /api/clear-debt (using this invoiceId
-    // as the M-Pesa code), so auto-applying here too would credit the debt twice.
-    if (tx?.context?.saleId) {
-        log.info(`[INTASEND] invoiceId=${invoiceId} was started from the debt modal (sale ${tx.context.saleId}) — left for /api/clear-debt to record`);
+    // Any STK push started from the POS (cart checkout OR the dashboard "Clear Debt" modal)
+    // is recorded by the screen that started it: the cart through /api/sell/cart and the
+    // debt modal through /api/clear-debt, both using this invoiceId as the M-Pesa code.
+    // Auto-applying it to the customer's debts here as well would count the same money twice
+    // (e.g. KES 10 paid for goods ALSO clearing a KES 10 debt). Only payments that were NOT
+    // started from the POS (no pending_mpesa context) are auto-matched to debts below.
+    if (tx?.context?.channel === 'INTASEND_MPESA' || tx?.context?.saleId || tx?.context?.source || tx?.context?.purpose) {
+        log.info(`[INTASEND] invoiceId=${invoiceId} was started from the POS — recorded by the screen that sent it, not auto-applied to debts`);
         return;
     }
 
