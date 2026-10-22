@@ -1296,46 +1296,6 @@ function pick(obj, keys) {
     return keys.reduce((acc, k) => { if (k in obj) acc[k] = obj[k]; return acc; }, {});
 }
 
-// ── Activity Log — records security-relevant events to activity_log table ────
-// Falls back to a no-op if the table doesn't exist yet (non-breaking).
-const ACT = {
-    LOGIN_SUCCESS:        'LOGIN_SUCCESS',
-    LOGIN_FAILED:         'LOGIN_FAILED',
-    MFA_SETUP:            'MFA_SETUP',
-    SALE_COMPLETED:       'SALE_COMPLETED',
-    SALE_CREDIT:          'SALE_CREDIT',
-    SALE_VOIDED:          'SALE_VOIDED',
-    SALE_EDITED:          'SALE_EDITED',
-    SUBSCRIPTION_PAYMENT: 'SUBSCRIPTION_PAYMENT',
-    INTASEND_CHECKOUT:    'INTASEND_CHECKOUT',
-    SUPPLIER_PAYMENT:     'SUPPLIER_PAYMENT',
-    EMPLOYEE_CREATED:     'EMPLOYEE_CREATED',
-    PIN_RESET_REQUESTED:  'PIN_RESET_REQUESTED',
-    CREDIT_LIMIT_CHANGED: 'CREDIT_LIMIT_CHANGED',
-    EXPENSE_ADDED:        'EXPENSE_ADDED',
-    EXCHANGE_PROCESSED:   'EXCHANGE_PROCESSED',
-    DB_CLEANUP:           'DB_CLEANUP',
-    BACKUP_CREATED:       'BACKUP_CREATED',
-};
-
-async function logActivity(action, performedBy, details = {}, meta = {}) {
-    try {
-        await supabase.from('activity_log').insert([{
-            action,
-            performed_by: performedBy || 'system',
-            details,
-            role:         meta.role    || null,
-            ip:           meta.ip      || null,
-            target_id:    meta.target_id   || null,
-            target_name:  meta.target_name || null,
-            created_at:   new Date().toISOString(),
-        }]);
-    } catch (err) {
-        // Never throw — activity logging must never break the main request flow
-        log.warn(`[ACT LOG] Failed to log action=${action}: ${err.message}`);
-    }
-}
-
 // ── Subscription admin API routes ────────────────────────────────────────────
 
 // GET /api/subscription/status
@@ -6369,6 +6329,14 @@ app.get('/api/mpesa/status/:invoiceId', requireAuth, async (req, res) => {
 async function processIntaSendComplete({ invoiceId, amount, tx }) {
     const { data: existingC2B } = await supabase.from('c2b_payments').select('id').eq('mpesa_code', invoiceId).maybeSingle();
     if (existingC2B) { log.warn(`[INTASEND] Duplicate invoiceId=${invoiceId} — skip`); return; }
+
+    // Payments started from the dashboard "Clear Debt" modal carry context.saleId.
+    // The modal records them itself through POST /api/clear-debt (using this invoiceId
+    // as the M-Pesa code), so auto-applying here too would credit the debt twice.
+    if (tx?.context?.saleId) {
+        log.info(`[INTASEND] invoiceId=${invoiceId} was started from the debt modal (sale ${tx.context.saleId}) — left for /api/clear-debt to record`);
+        return;
+    }
 
     const phone      = tx?.phone ? String(tx.phone).replace(/^254/, '0') : '';
     const accountRef = tx?.context?.accountRef || null;
