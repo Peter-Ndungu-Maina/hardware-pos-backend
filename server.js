@@ -8593,4 +8593,11 @@ if (process.env.NODE_ENV === 'production' || process.env.MPESA_ENV === 'live') {
 // If you have not run it yet, execute the SQL above in your Supabase project's SQL Editor.
 log.info('[MIGRATION] quantity_sold migration is handled via Supabase SQL Editor — no runtime DDL needed.');
 
+// ── AI assistant (ask-your-data, restock, debt reminders, delivery notes, flags, M-Pesa matching) ──
+try {
+    require('./ai-assistant')({ app, express, supabase, requireAuth, requireRole, log });
+} catch (e) {
+    log.error('[AI] Assistant failed to load — the rest of the server is unaffected: ' + e.message);
+}
+
 app.listen(PORT, () => log.info(`🚀 Elite Hardware POS running on http://localhost:${PORT}`));
