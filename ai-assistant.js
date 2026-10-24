@@ -35,7 +35,7 @@ module.exports = function mountAI({ app, express, supabase, requireAuth, require
     const PROVIDER   = GEMINI_KEY ? 'gemini' : CLAUDE_KEY ? 'claude' : 'none';
     const AI_KEY     = GEMINI_KEY || CLAUDE_KEY;
     const CLAUDE_MODEL  = process.env.AI_MODEL || 'claude-sonnet-5-5';
-    const GEMINI_MODELS = [...new Set([process.env.GEMINI_MODEL || 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'])];
+    const GEMINI_MODELS = [...new Set([process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.6-flash'])];
     const AI_MODEL   = PROVIDER === 'gemini' ? GEMINI_MODELS.join(' → ') : CLAUDE_MODEL;
     const DAILY_LIMIT = parseInt(process.env.AI_DAILY_LIMIT || '200', 10);
     const BUSINESS = process.env.BUSINESS_NAME || 'Elite Hardware';
@@ -111,13 +111,18 @@ module.exports = function mountAI({ app, express, supabase, requireAuth, require
         if (json) generationConfig.response_mime_type = 'application/json';
         let lastErr;
         for (const model of GEMINI_MODELS) {
-            const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+            let r, raw;
+            for (const think of [true, false]) {   // ask for minimal thinking (much faster); retry without if the model rejects the setting
+                const gc = think ? { ...generationConfig, thinkingConfig: { thinkingLevel: 'low' } } : generationConfig;
+                r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
                 method: 'POST',
                 headers: { 'x-goog-api-key': GEMINI_KEY, 'content-type': 'application/json' },
-                body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig }),
+                body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig: gc }),
                 signal: AbortSignal.timeout(22000)
-            });
-            const raw = await r.text();
+                });
+                raw = await r.text();
+                if (r.status !== 400 || !think) break;
+            }
             let data; try { data = JSON.parse(raw); } catch { data = null; }
             if (!r.ok) {
                 lastErr = httpErr(r.status, data?.error?.message || raw.slice(0, 200));
