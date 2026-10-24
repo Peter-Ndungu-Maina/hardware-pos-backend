@@ -35,7 +35,7 @@ module.exports = function mountAI({ app, express, supabase, requireAuth, require
     const PROVIDER   = GEMINI_KEY ? 'gemini' : CLAUDE_KEY ? 'claude' : 'none';
     const AI_KEY     = GEMINI_KEY || CLAUDE_KEY;
     const CLAUDE_MODEL  = process.env.AI_MODEL || 'claude-sonnet-5-5';
-    const GEMINI_MODELS = [...new Set([process.env.GEMINI_MODEL || 'gemini-3.8-flash', 'gemini-3.5-flash-lite'])];
+    const GEMINI_MODELS = [...new Set([process.env.GEMINI_MODEL || 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'])];
     const AI_MODEL   = PROVIDER === 'gemini' ? GEMINI_MODELS.join(' → ') : CLAUDE_MODEL;
     const DAILY_LIMIT = parseInt(process.env.AI_DAILY_LIMIT || '200', 10);
     const BUSINESS = process.env.BUSINESS_NAME || 'Elite Hardware';
@@ -85,7 +85,7 @@ module.exports = function mountAI({ app, express, supabase, requireAuth, require
         if (err.code === 'LIMIT') return res.status(429).json({ success: false, message: `Daily AI limit (${DAILY_LIMIT} requests) reached. It resets at midnight.` });
         if (err.code === 'RATE')  return res.status(429).json({ success: false, message: 'The free AI quota is used up for now. Wait a minute and try again, or try again tomorrow.' });
         if (err.code === 'BADKEY') return res.status(502).json({ success: false, message: 'The AI key was rejected. Check GEMINI_API_KEY on the server.' });
-        return fail(res, err, tag, 'The AI service could not answer right now. Please try again.');
+        return fail(res, err, tag, 'The AI service could not answer right now (' + String(err.message || 'unknown').replace(/AIza[\w-]+/g, '***').slice(0, 160) + '). Please try again.');
     }
     const httpErr = (status, msg) => {
         const e = new Error(`AI HTTP ${status}: ${msg}`);
