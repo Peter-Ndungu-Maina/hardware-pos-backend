@@ -115,7 +115,7 @@ module.exports = function mountAI({ app, express, supabase, requireAuth, require
                 method: 'POST',
                 headers: { 'x-goog-api-key': GEMINI_KEY, 'content-type': 'application/json' },
                 body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig }),
-                signal: AbortSignal.timeout(60000)
+                signal: AbortSignal.timeout(22000)
             });
             const raw = await r.text();
             let data; try { data = JSON.parse(raw); } catch { data = null; }
@@ -140,7 +140,7 @@ module.exports = function mountAI({ app, express, supabase, requireAuth, require
             method: 'POST',
             headers: { 'x-api-key': CLAUDE_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
             body: JSON.stringify({ model: CLAUDE_MODEL, max_tokens, system: json ? system + '\nReply with JSON only.' : system, messages: msgs }),
-            signal: AbortSignal.timeout(60000)
+            signal: AbortSignal.timeout(22000)
         });
         const raw = await r.text();
         let data; try { data = JSON.parse(raw); } catch { throw new Error('Non-JSON from Anthropic: ' + raw.slice(0, 200)); }
@@ -321,7 +321,9 @@ Each turn reply with ONE JSON object and nothing else:
   {"answer":"..."}                                              ← when you can answer.
 The answer must lead with the result, then 2-4 short supporting points, in plain language (you may use **bold**).`;
             const used = [], collected = [];
+            const t0 = Date.now();
             for (let round = 1; round <= 3; round++) {
+                if (Date.now() - t0 > 45000) return res.json({ success: true, answer: 'The AI is slow right now. Please ask again in a minute.', tools_used: used });
                 const mustAnswer = round === 3;
                 const prompt = JSON.stringify({ conversation_so_far: history, question, data_collected: collected,
                     ...(mustAnswer ? { instruction: 'You must give the final {"answer": ...} now with what you have.' } : {}) });
