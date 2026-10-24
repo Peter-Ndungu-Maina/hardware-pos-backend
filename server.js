@@ -108,6 +108,22 @@ if (!supabaseUrl || !supabaseKey || !JWT_SECRET) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+// ── Activity log helper (audit trail). Never throws: a logging failure must not break login or sales. ──
+const ACT = new Proxy({}, { get: (_, k) => String(k) });
+async function logActivity(action, performedBy, details = {}, meta = {}) {
+    try {
+        const row = {
+            performed_by: performedBy || 'system',
+            action: String(action),
+            item_name: meta.target_name || details.item || null,
+            details: typeof details === 'string' ? details : JSON.stringify({ ...details, role: meta.role, ip: meta.ip, target_id: meta.target_id }),
+            timestamp: new Date().toISOString()
+        };
+        const { error } = await supabase.from('audit_logs').insert([row]);
+        if (error) log.warn('[ACTIVITY LOG] ' + error.message);
+    } catch (e) { log.warn('[ACTIVITY LOG] ' + e.message); }
+}
+
 // ============================================================
 //  TOKEN BLOCKLIST — immediate session revocation
 //  Stores { token_prefix → expiry_timestamp }
